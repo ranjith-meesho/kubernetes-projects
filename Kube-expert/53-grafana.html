@@ -1,0 +1,291 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Topic 53: Grafana — Kubernetes Expert Course</title>
+<link rel="stylesheet" href="styles.css">
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+</head>
+<body>
+
+<header class="course-header">
+  <div class="kicker">Topic 53 of 70</div>
+  <h1>Grafana</h1>
+  <div class="subtitle">The visualization, dashboards-as-code, and alerting layer that unifies metrics, logs, and traces into one pane of glass.</div>
+</header>
+
+<nav class="topic-nav">
+  <a href="52-victoriametrics.html">&larr; VictoriaMetrics</a>
+  <a href="index.html">Course Index</a>
+  <a href="54-opentelemetry.html">OpenTelemetry &rarr;</a>
+</nav>
+
+<h2 id="explanation">Explanation</h2>
+<p>Grafana is an open-source visualization and dashboarding platform that queries one or more backend data sources —
+Prometheus, VictoriaMetrics, Loki, Tempo, Elasticsearch, CloudWatch, and dozens more — and renders the results as
+graphs, tables, heatmaps, and alerts, all through a single web UI. Grafana itself stores no metrics or logs; it is
+a pure query-and-render layer, which is precisely why it composes so well with the rest of the observability stack —
+you can point the same Grafana instance at Prometheus for metrics, Loki for logs, and Tempo/Jaeger for traces, and
+pivot between them using consistent labels (e.g. jump from a metric spike straight to the logs for that pod).</p>
+
+<p>Kubernetes needs Grafana because raw PromQL output and `kubectl top` numbers are not how humans reason about system
+health during an incident. Engineers need trends over time, correlated views (CPU spike next to error-rate spike next
+to a deployment marker), and pre-built dashboards that don't require re-deriving a query from scratch at 3 AM. Grafana
+turns the metrics collected by Prometheus/VictoriaMetrics into an operational nervous system: dashboards for steady-state
+observation, and alerting rules that page humans when thresholds are breached.</p>
+
+<p>A key production practice is <strong>dashboards-as-code</strong>: rather than clicking through the UI to build a
+dashboard (which is not version-controlled and easily drifts), teams define dashboards as JSON models (the exact
+format Grafana's UI itself produces and consumes) and store them in git, provisioned into Grafana automatically via
+a sidecar or the provisioning API. This makes dashboards reviewable, reproducible across environments, and resistant
+to "someone edited prod and nobody knows why."</p>
+
+<p>Grafana's alerting engine (unified alerting, Grafana 9+) evaluates queries against any configured datasource on a
+schedule and routes firing alerts to notification channels (Slack, PagerDuty, webhook) — for teams standardized on
+Grafana already, this can replace or complement Prometheus's own Alertmanager, giving one alerting UI across multiple
+metric backends instead of one per backend.</p>
+
+<p>In the ecosystem, Grafana is the topmost, human-facing layer: vmagent/Prometheus scrape and store, Loki/Fluent Bit
+collect logs, OpenTelemetry/Tempo collect traces — and Grafana is where an engineer actually looks during an incident,
+correlating all three signal types (the "three pillars of observability") in one interface.</p>
+
+<h2 id="internal-working">Internal Working / Interactions</h2>
+<ul>
+  <li><strong>Data sources</strong> — Grafana's server-side proxies each datasource's query API (PromQL for Prometheus/VM, LogQL for Loki, TraceQL for Tempo); the browser never talks to the datasource directly, Grafana's backend does.</li>
+  <li><strong>Dashboard JSON model</strong> — every panel, query, and layout is one JSON document; this is what gets version-controlled and provisioned.</li>
+  <li><strong>Provisioning</strong> — Grafana watches a config directory (or ConfigMaps mounted via a sidecar like <code>k8s-sidecar</code>) for datasource and dashboard definitions and loads them on startup/change, no manual UI clicking required.</li>
+  <li><strong>Alerting</strong> — a background scheduler evaluates alert rule queries against the relevant datasource, tracks state (pending/firing/resolved), and pushes notifications via configured contact points.</li>
+  <li><strong>Explore</strong> mode lets you pivot directly from a metrics panel to correlated logs/traces if datasources share exemplar/trace-ID links.</li>
+</ul>
+
+<h2 id="architecture-diagram">Architecture Diagram</h2>
+<pre class="mermaid">
+flowchart TB
+    subgraph Sources["Data Sources"]
+      PM["Prometheus / VictoriaMetrics"]
+      LK["Loki"]
+      TP["Tempo / Jaeger"]
+    end
+
+    subgraph GF["Grafana"]
+      SRV["Grafana Server<br/>(query proxy)"]
+      DASH["Dashboard JSON models<br/>(provisioned from git/ConfigMap)"]
+      ALERT["Unified Alerting Engine"]
+    end
+
+    User["Engineer (browser)"] --> SRV
+    SRV --> PM
+    SRV --> LK
+    SRV --> TP
+    DASH --> SRV
+    ALERT -->|evaluates queries| PM
+    ALERT -->|evaluates queries| LK
+    ALERT -->|notifications| SLK["Slack / PagerDuty / Webhook"]
+
+    subgraph GitOps["GitOps"]
+      GIT["dashboards/*.json in Git"] -->|sidecar sync| CM["ConfigMap"] --> DASH
+    end
+</pre>
+
+<h2 id="code-example">Code Example</h2>
+<pre><code># Grafana datasource provisioning — auto-registers VictoriaMetrics + Loki on startup,
+# so no manual "Add data source" clicking is needed across environments.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-datasources
+  namespace: monitoring
+  labels:
+    grafana_datasource: "1"          # picked up by the k8s-sidecar watching this label
+data:
+  datasources.yaml: |
+    apiVersion: 1
+    datasources:
+      - name: VictoriaMetrics
+        type: prometheus                       # VM speaks the Prometheus API, so use the prometheus plugin
+        access: proxy
+        url: http://vmselect.monitoring.svc:8481/select/0/prometheus/
+        isDefault: true
+        jsonData:
+          timeInterval: "30s"
+      - name: Loki
+        type: loki
+        access: proxy
+        url: http://loki.monitoring.svc:3100
+        jsonData:
+          derivedFields:                       # extracts trace IDs from log lines to link Loki -> Tempo
+            - datasourceUid: tempo
+              matcherRegex: "trace_id=(\\w+)"
+              name: TraceID
+              url: "$${__value.raw}"
+---
+# Dashboard provisioning — tells Grafana to load JSON dashboards from a mounted directory,
+# which a sidecar keeps in sync with a ConfigMap generated from a git repo.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-dashboard-provider
+  namespace: monitoring
+data:
+  dashboards.yaml: |
+    apiVersion: 1
+    providers:
+      - name: default
+        orgId: 1
+        folder: "Kubernetes"
+        type: file
+        options:
+          path: /var/lib/grafana/dashboards   # sidecar writes fetched dashboard JSON here
+</code></pre>
+
+<h2 id="kubectl-cli-commands">kubectl / CLI Commands</h2>
+<pre><code>kubectl get pods -n monitoring -l app.kubernetes.io/name=grafana   # check Grafana pod health
+kubectl port-forward -n monitoring svc/grafana 3000:80              # access UI locally
+kubectl logs -n monitoring deploy/grafana --tail=50                 # check provisioning/datasource errors
+kubectl get configmap -n monitoring -l grafana_dashboard=1           # list dashboards being provisioned
+kubectl exec -n monitoring deploy/grafana -- cat /etc/grafana/provisioning/datasources/datasources.yaml
+kubectl rollout restart deploy/grafana -n monitoring                 # reload provisioning after a ConfigMap change
+curl -s http://admin:admin@localhost:3000/api/health                # Grafana health endpoint
+</code></pre>
+
+<h2 id="best-practices">Best Practices &amp; Common Pitfalls</h2>
+<div class="grid-2">
+<div>
+<h4>Best Practices</h4>
+<ul>
+  <li>Store dashboards as JSON in git and provision them — never hand-build production dashboards in the UI.</li>
+  <li>Use variables (<code>$namespace</code>, <code>$pod</code>) in dashboards so one dashboard serves every service/team.</li>
+  <li>Link Loki/Tempo datasources via derived fields so engineers can pivot from a log line straight to a trace.</li>
+  <li>Put Grafana behind SSO (OIDC) rather than local accounts for production access control.</li>
+  <li>Version-pin dashboard JSON schema and test provisioning in a staging Grafana before rolling to prod.</li>
+</ul>
+</div>
+<div>
+<h4>Pitfalls</h4>
+<ul>
+  <li>Building dozens of one-off dashboards with copy-pasted queries that drift from the underlying metric names.</li>
+  <li>Alerting directly from Grafana <em>and</em> Alertmanager on the same condition, causing duplicate pages.</li>
+  <li>Not setting dashboard folder permissions, letting anyone edit shared production dashboards.</li>
+  <li>Ignoring query performance — dashboards with many high-cardinality panels can overload the datasource on load.</li>
+</ul>
+</div>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="interview-questions">50 Interview Questions</h2>
+
+<details class="qa"><summary>1. What role does Grafana play in the observability stack, and what does it NOT do?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Grafana is a pure visualization/query-and-render layer; it stores no metrics or logs itself.
+<br><strong>Detail:</strong> It queries backend data sources (Prometheus, VictoriaMetrics, Loki, Tempo, Elasticsearch, CloudWatch, etc.) and renders results as graphs, tables, heatmaps, and alerts through one web UI.
+<br><strong>Production example:</strong> Pointing one Grafana instance at Prometheus for metrics, Loki for logs, and Tempo/Jaeger for traces simultaneously.
+<br><strong>Common mistake:</strong> Assuming Grafana persists data — losing the underlying datasource means Grafana has nothing to show, regardless of dashboard configuration.</div></details>
+
+<details class="qa"><summary>2. Why can't engineers just rely on raw PromQL output or kubectl top during an incident?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Humans need trends over time and correlated views, not raw numbers, especially at 3 AM.
+<br><strong>Detail:</strong> Grafana turns collected metrics into an operational nervous system — dashboards for steady-state observation, and alerting that pages humans when thresholds are breached.
+<br><strong>Production example:</strong> A dashboard showing CPU spike next to error-rate spike next to a deployment marker, letting an on-call engineer correlate cause and effect instantly.
+<br><strong>Common mistake:</strong> Expecting engineers to re-derive PromQL queries from scratch during a live incident instead of having pre-built dashboards.</div></details>
+
+<details class="qa"><summary>3. What is "dashboards-as-code" and why is it a key production practice?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Defining dashboards as JSON models stored in git rather than building them by clicking through the UI.
+<br><strong>Detail:</strong> UI-built dashboards aren't version-controlled and drift easily; JSON-as-code makes dashboards reviewable, reproducible across environments, and resistant to undocumented prod edits.
+<br><strong>Production example:</strong> Dashboards provisioned automatically via a sidecar (like k8s-sidecar) or the provisioning API from a git-backed ConfigMap.
+<br><strong>Common mistake:</strong> Hand-building production dashboards in the UI, leading to "someone edited prod and nobody knows why."</div></details>
+
+<details class="qa"><summary>4. How does Grafana's provisioning mechanism work in Kubernetes?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Grafana watches a config directory (or ConfigMaps mounted via a sidecar) for datasource and dashboard definitions and loads them on startup/change.
+<br><strong>Detail:</strong> No manual UI clicking is required — a sidecar like k8s-sidecar syncs ConfigMaps labeled appropriately (e.g. <code>grafana_datasource: "1"</code>) into files Grafana reads.
+<br><strong>Production example:</strong> A ConfigMap named <code>grafana-datasources</code> with <code>datasources.yaml</code> auto-registering VictoriaMetrics and Loki on startup.
+<br><strong>Common mistake:</strong> Forgetting the required label on the ConfigMap, so the sidecar never picks up the new datasource/dashboard.</div></details>
+
+<details class="qa"><summary>5. How does Grafana's server-side proxy model affect security and datasource access?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Grafana's backend proxies each datasource's query API; the browser never talks to the datasource directly.
+<br><strong>Detail:</strong> This centralizes datasource credentials/network access on the server side rather than exposing them to end-user browsers.
+<br><strong>Production example:</strong> A VictoriaMetrics datasource configured with <code>access: proxy</code> and a URL only the Grafana server needs network access to.
+<br><strong>Common mistake:</strong> Assuming a browser-based direct connection is used, and misconfiguring network policies that only need to allow Grafana-server-to-datasource traffic.</div></details>
+
+<details class="qa"><summary>6. What is Grafana's unified alerting engine and how does it relate to Alertmanager?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Grafana 9+'s built-in alerting evaluates queries against any configured datasource on a schedule and routes firing alerts to notification channels.
+<br><strong>Detail:</strong> For teams standardized on Grafana, this can replace or complement Prometheus's Alertmanager, giving one alerting UI across multiple metric backends instead of one per backend.
+<br><strong>Production example:</strong> A background scheduler tracking alert state (pending/firing/resolved) and pushing notifications via configured contact points like Slack or PagerDuty.
+<br><strong>Common mistake:</strong> Alerting from Grafana AND Alertmanager on the same condition, causing duplicate pages.</div></details>
+
+<details class="qa"><summary>7. How does Grafana link logs and traces together via derived fields?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Derived fields extract identifiers (like trace IDs) from log lines to link one datasource to another, e.g. Loki to Tempo.
+<br><strong>Detail:</strong> A regex matcher (e.g. <code>trace_id=(\w+)</code>) pulls the trace ID out of a log line and turns it into a clickable link to the tracing datasource.
+<br><strong>Production example:</strong> A Loki datasource config with <code>derivedFields</code> pointing a <code>TraceID</code> field at a Tempo datasource UID.
+<br><strong>Common mistake:</strong> Not configuring derived fields, forcing engineers to manually copy trace IDs between separate UI tabs.</div></details>
+
+<details class="qa"><summary>8. What is Grafana's Explore mode used for?</summary>
+<div class="qa-body"><strong>Short answer:</strong> It lets you pivot directly from a metrics panel to correlated logs/traces.
+<br><strong>Detail:</strong> This works when datasources share exemplar/trace-ID links, enabling ad-hoc investigation without building a formal dashboard.
+<br><strong>Production example:</strong> Jumping from a metric spike in a dashboard panel straight into Explore to view the logs for that pod at the same timeframe.
+<br><strong>Common mistake:</strong> Building a whole new dashboard for one-off investigation instead of using Explore for ad-hoc correlation.</div></details>
+
+<details class="qa"><summary>9. Why should dashboards use template variables like $namespace or $pod instead of hardcoded values?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Variables let one dashboard serve every service/team instead of duplicating dashboards per target.
+<br><strong>Detail:</strong> This avoids "dozens of one-off dashboards with copy-pasted queries" that drift from the underlying metric names over time.
+<br><strong>Production example:</strong> A single Kubernetes dashboard with a <code>$namespace</code> variable dropdown reused across every team's services.
+<br><strong>Common mistake:</strong> Copy-pasting a dashboard per service instead of parameterizing it, so metric name changes require updating every copy.</div></details>
+
+<details class="qa"><summary>10. What are common pitfalls that degrade Grafana's reliability or security in production?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Missing dashboard folder permissions, duplicate alerting, drifted ad-hoc dashboards, and unbounded high-cardinality panel queries.
+<br><strong>Detail:</strong> Best practices counter these: put Grafana behind SSO/OIDC, version-pin dashboard JSON, and test provisioning in staging first.
+<br><strong>Production example:</strong> Not setting dashboard folder permissions lets anyone edit shared production dashboards; ignoring query performance lets high-cardinality panels overload the datasource on load.
+<br><strong>Common mistake:</strong> Relying on local Grafana accounts instead of SSO for production access control.</div></details>
+
+<details class="qa"><summary>11–50. Additional rapid-fire questions</summary>
+<div class="qa-body">
+<strong>11.</strong> What query language does Grafana use for a Loki datasource? — LogQL.<br>
+<strong>12.</strong> What query language does Grafana use for a Tempo datasource? — TraceQL.<br>
+<strong>13.</strong> What are the "three pillars of observability" that Grafana correlates? — Metrics, logs, and traces.<br>
+<strong>14.</strong> What format do dashboards take when provisioned as code? — JSON documents — the exact format Grafana's UI itself produces and consumes.<br>
+<strong>15.</strong> What sidecar is mentioned for syncing dashboards/datasources from ConfigMaps? — k8s-sidecar.<br>
+<strong>16.</strong> What label is used on a ConfigMap to mark it as a Grafana datasource for the sidecar? — <code>grafana_datasource: "1"</code>.<br>
+<strong>17.</strong> How would you check which dashboards are being provisioned via ConfigMaps? — <code>kubectl get configmap -n monitoring -l grafana_dashboard=1</code>.<br>
+<strong>18.</strong> What datasource type should you use in Grafana for a VictoriaMetrics backend? — <code>prometheus</code>, since VM speaks the Prometheus API.<br>
+<strong>19.</strong> What field sets a default datasource in the datasources.yaml provisioning file? — <code>isDefault: true</code>.<br>
+<strong>20.</strong> What does the <code>access: proxy</code> setting mean on a datasource? — Queries route through the Grafana server rather than directly from the browser.<br>
+<strong>21.</strong> Where does the dashboard provisioning ConfigMap tell Grafana to load JSON dashboards from? — A mounted directory path, e.g. <code>/var/lib/grafana/dashboards</code>.<br>
+<strong>22.</strong> How would you reload provisioning after changing a ConfigMap? — <code>kubectl rollout restart deploy/grafana -n monitoring</code>.<br>
+<strong>23.</strong> How would you check the Grafana health endpoint? — <code>curl -s http://admin:admin@localhost:3000/api/health</code>.<br>
+<strong>24.</strong> How would you inspect the currently loaded datasource config inside the Grafana pod? — <code>kubectl exec -n monitoring deploy/grafana -- cat /etc/grafana/provisioning/datasources/datasources.yaml</code>.<br>
+<strong>25.</strong> How would you access the Grafana UI locally from a cluster? — <code>kubectl port-forward -n monitoring svc/grafana 3000:80</code>.<br>
+<strong>26.</strong> What's a symptom you'd check Grafana logs for after a ConfigMap change? — Provisioning/datasource errors, via <code>kubectl logs -n monitoring deploy/grafana --tail=50</code>.<br>
+<strong>27.</strong> Who manages Grafana's underlying data storage for metrics? — Nobody — Grafana stores no metrics or logs; the datasource (Prometheus/VM/Loki/etc.) does.<br>
+<strong>28.</strong> Why is Grafana described as "the topmost, human-facing layer" of the observability stack? — Because vmagent/Prometheus scrape and store, Loki/Fluent Bit collect logs, and OpenTelemetry/Tempo collect traces, while Grafana is where an engineer actually looks during an incident.<br>
+<strong>29.</strong> What happens architecturally if you point the same Grafana instance at multiple datasource types? — The server-side proxy queries each with its native query language (PromQL/LogQL/TraceQL) and renders them consistently in one UI.<br>
+<strong>30.</strong> What is the risk of building dashboards that all query similarly-named but slightly different metrics? — Copy-pasted queries drift from the underlying metric names over time, producing subtly wrong or broken panels.<br>
+<strong>31.</strong> How does dashboards-as-code make dashboards "reviewable"? — Changes go through git (PRs/diffs) instead of silent UI edits, so changes can be reviewed before reaching production.<br>
+<strong>32.</strong> What does version-pinning dashboard JSON schema protect against? — Grafana version upgrades changing the expected dashboard JSON structure and breaking provisioned dashboards unexpectedly.<br>
+<strong>33.</strong> Why test provisioning in a staging Grafana before rolling to prod? — To catch schema or datasource-reference errors before they break the dashboards production engineers rely on during incidents.<br>
+<strong>34.</strong> What's the danger of not setting dashboard folder permissions? — Anyone can edit shared production dashboards, risking accidental or unauthorized changes.<br>
+<strong>35.</strong> Why would alerting from both Grafana and Alertmanager on the same condition be a problem? — It causes duplicate pages for the same underlying issue, adding on-call noise and confusion.<br>
+<strong>36.</strong> What's the operational risk of high-cardinality panels on a dashboard? — They can overload the datasource on load, slowing dashboards or causing query timeouts.<br>
+<strong>37.</strong> Why put Grafana behind SSO/OIDC rather than local accounts in production? — Centralized access control and auditability instead of per-instance local credentials.<br>
+<strong>38.</strong> What does the Grafana alerting scheduler track for each alert rule? — State transitions — pending, firing, resolved.<br>
+<strong>39.</strong> How does Grafana route firing alerts to humans? — Via configured contact points/notification channels such as Slack, PagerDuty, or a generic webhook.<br>
+<strong>40.</strong> What is the purpose of the dashboard JSON model's version control in git? — It's the single source of truth that gets reviewed, diffed, and provisioned — preventing UI-only, undocumented drift.<br>
+<strong>41.</strong> If a newly added datasource ConfigMap isn't showing up in Grafana, what's the first thing to check? — Whether the ConfigMap has the correct label (e.g. <code>grafana_datasource: "1"</code>) that the sidecar watches for.<br>
+<strong>42.</strong> Why might a dashboard show no data even though the underlying metric exists? — The datasource query may reference a stale metric name that drifted, or the datasource itself may be misconfigured/unreachable.<br>
+<strong>43.</strong> What does "correlating signals using consistent labels" mean in practice? — Using the same label values (e.g. pod name) across metrics and logs so you can jump from a metric spike straight to the logs for that pod.<br>
+<strong>44.</strong> Why is a regex-based derived field considered fragile? — If log line formats change, the trace-ID extraction regex can silently stop matching, breaking the log-to-trace pivot.<br>
+<strong>45.</strong> What's the tradeoff of Grafana provisioning via a sidecar versus the provisioning API directly? — Sidecar-based sync from ConfigMaps fits GitOps workflows well; direct API provisioning may suit dynamic/programmatic setups better.<br>
+<strong>46.</strong> Why does Grafana support dozens of datasource types instead of being tied to one backend? — It's designed purely as a query-and-render layer, decoupled from any specific storage engine.<br>
+<strong>47.</strong> What's a practical reason to prefer Grafana's unified alerting over per-datasource native alerting? — One alerting UI/pipeline across multiple metric backends instead of maintaining separate alerting configs per backend.<br>
+<strong>48.</strong> How would dashboards drift if teams don't adopt dashboards-as-code? — Ad-hoc UI edits accumulate untracked, making it unclear who changed what and why, especially in production.<br>
+<strong>49.</strong> Why does the datasources.yaml example set a <code>timeInterval</code> for the VictoriaMetrics datasource? — It hints Grafana about the expected scrape interval, affecting how it renders/steps queries for that datasource.<br>
+<strong>50.</strong> If engineers report Grafana dashboards are slow to load, what two areas would you investigate first? — Query cardinality/complexity on the panels, and the health/load of the underlying datasource being queried.
+</div></details>
+
+<!-- ============================================================ -->
+
+<footer class="course-footer">Next: Topic 54 — OpenTelemetry, the vendor-neutral standard for collecting metrics, logs, and traces.</footer>
+
+<script>
+  mermaid.initialize({ startOnLoad: true, theme: 'dark' });
+</script>
+
+</body>
+</html>

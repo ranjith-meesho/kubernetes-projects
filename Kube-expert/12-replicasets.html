@@ -1,0 +1,295 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Topic 12: ReplicaSets — Kubernetes Expert Course</title>
+<link rel="stylesheet" href="styles.css">
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+</head>
+<body>
+
+<header class="course-header">
+  <div class="kicker">Topic 12 of 70</div>
+  <h1>ReplicaSets</h1>
+  <div class="subtitle">The controller that guarantees a stable number of identical Pod replicas are always running.</div>
+</header>
+
+<nav class="topic-nav">
+  <a href="11-pods.html">&larr; Pods</a>
+  <a href="index.html">Course Index</a>
+  <a href="13-deployments.html">Deployments &rarr;</a>
+</nav>
+
+<h2 id="explanation">Explanation</h2>
+<p>A <strong>ReplicaSet (RS)</strong> is a controller whose only job is to guarantee that a specified number of
+identical Pod replicas are running at all times. You give it a Pod template and a desired <code>replicas</code>
+count; it continuously watches the cluster and creates or deletes Pods so that the observed count always converges
+to the desired count. It is the simplest possible expression of Kubernetes' core idea: declare desired state, let a
+control loop reconcile reality to match it.</p>
+
+<p>Kubernetes needs this because Pods are inherently ephemeral and un-self-healing on their own — a bare Pod that
+crashes or is evicted simply disappears forever. Any real application needs redundancy (more than one replica for
+availability) and self-healing (automatic replacement on failure). A ReplicaSet supplies both: it spreads identical
+copies across the cluster, and the moment one is deleted, evicted, or its node fails, the ReplicaSet controller
+notices the gap between desired and actual count and creates a replacement.</p>
+
+<p>Mechanically, a ReplicaSet does not care <em>which</em> Pods it manages by name — it identifies "its" Pods purely
+by a <strong>label selector</strong>. Every Pod created from the RS's template gets the selector's labels, and the RS
+controller continuously lists Pods matching that selector to count how many exist. This label-based ownership
+(rather than a fixed list of Pod names) is what makes Kubernetes controllers composable: multiple controllers can, in
+principle, watch overlapping label sets, and Pods can be "adopted" by a ReplicaSet if they already exist and match
+its selector when it's created.</p>
+
+<p>In practice, you almost never create a ReplicaSet directly. It sits one layer below Deployments in the object
+hierarchy: a <strong>Deployment creates and manages ReplicaSets</strong>, and each ReplicaSet creates and manages
+Pods. This chain — Deployment &rarr; ReplicaSet &rarr; Pod — is how Kubernetes achieves rolling updates without
+sacrificing the self-healing guarantee: each ReplicaSet in the chain still independently guarantees its own replica
+count, while the Deployment orchestrates shifting traffic and replica counts between an old and a new ReplicaSet
+during a rollout.</p>
+
+<p>Understanding ReplicaSets in isolation matters because when things go wrong in production — a Deployment stuck
+mid-rollout, orphaned Pods after a botched <code>kubectl edit</code>, or a scale event that doesn't seem to take
+effect — the root cause is almost always visible at the ReplicaSet layer: an owner reference pointing to the wrong
+RS, a selector that no longer matches the Pod template's labels, or two ReplicaSets fighting over the same Pods.</p>
+
+<h2 id="internal-working">Internal Working / Interactions</h2>
+<ul>
+  <li><strong>API Server</strong> — the ReplicaSet controller (running inside kube-controller-manager) never talks to
+  etcd directly; it watches ReplicaSet and Pod objects via the API Server's watch/informer mechanism.</li>
+  <li><strong>etcd</strong> — stores the ReplicaSet object (desired replica count, template, selector) and every Pod
+  it owns, as with all objects.</li>
+  <li><strong>Pod owner references</strong> — every Pod created by a ReplicaSet gets an <code>ownerReferences</code>
+  entry pointing back to that RS's UID. This is how <code>kubectl delete rs</code> can cascade-delete its Pods, and
+  how the garbage collector knows a Pod is "owned."</li>
+  <li><strong>Scheduler / kubelet</strong> — unchanged from a bare Pod: the RS controller only creates the Pod
+  object; the Scheduler still binds it to a node and kubelet still starts the containers.</li>
+  <li><strong>Deployment controller</strong> — sits above the ReplicaSet controller, creating/scaling ReplicaSets
+  during rollouts; the RS controller has no awareness that a Deployment exists above it.</li>
+</ul>
+<p>Reconciliation loop, every cycle: list Pods matching <code>spec.selector</code> &rarr; compare count to
+<code>spec.replicas</code> &rarr; if too few, create new Pods from <code>spec.template</code>; if too many
+(e.g. after a manual Pod creation with matching labels), delete the newest/least-ready extras first.</p>
+
+<h2 id="architecture-diagram">Architecture Diagram</h2>
+<pre class="mermaid">
+flowchart TB
+    RS["ReplicaSet\nspec.replicas: 3\nspec.selector: app=web"]
+    RS -->|watches count via label selector| P1["Pod web-abc12\napp=web"]
+    RS -->|watches count via label selector| P2["Pod web-def34\napp=web"]
+    RS -->|watches count via label selector| P3["Pod web-ghi56\napp=web"]
+    RS -.->|creates replacement on failure| P4["Pod web-jkl78\n(new, replacing crashed Pod)"]
+    API["API Server"] <--> RS
+    API <--> P1
+    API <--> P2
+    API <--> P3
+    ETCD[("etcd")] <--> API
+</pre>
+
+<pre class="mermaid">
+sequenceDiagram
+    participant RSC as ReplicaSet Controller
+    participant A as API Server
+    participant E as etcd
+
+    RSC->>A: Watch ReplicaSets + Pods (label selector app=web)
+    Note over RSC: Pod web-def34 crashes and is deleted
+    A-->>RSC: Pod delete event observed
+    RSC->>RSC: Count Pods = 2, desired = 3
+    RSC->>A: Create Pod (from template, ownerRef = RS)
+    A->>E: Persist new Pod object
+    A-->>RSC: Pod created (Pending)
+</pre>
+
+<h2 id="code-example">Code Example</h2>
+<pre><code>apiVersion: apps/v1
+kind: ReplicaSet
+metadata:
+  name: web-rs                    # Name of the ReplicaSet object itself.
+  labels:
+    app: web
+spec:
+  replicas: 3                     # Desired number of identical Pods to maintain at all times.
+  selector:
+    matchLabels:
+      app: web                   # MUST be a subset of template.metadata.labels, or the API Server rejects it.
+  template:                       # Pod template — stamped out verbatim for each replica.
+    metadata:
+      labels:
+        app: web                 # These labels are what the selector above actually matches against.
+    spec:
+      containers:
+        - name: web
+          image: nginx:1.25
+          ports:
+            - containerPort: 80
+          resources:
+            requests: { cpu: "100m", memory: "128Mi" }
+            limits:   { cpu: "250m", memory: "256Mi" }
+</code></pre>
+
+<div class="callout warn">
+  <strong>Selector immutability:</strong> <code>spec.selector</code> is immutable after creation. If you need to
+  change which Pods a ReplicaSet manages, you must delete and recreate it — this is one reason Deployments (which
+  manage this for you) are preferred over hand-written ReplicaSets.
+</div>
+
+<h2 id="kubectl-commands">kubectl Commands</h2>
+<pre><code># List ReplicaSets in the current namespace
+kubectl get rs
+
+# Show desired vs current vs ready replica counts, and events
+kubectl describe rs web-rs
+
+# Scale a ReplicaSet directly (bypasses any owning Deployment's desired state — usually not recommended)
+kubectl scale rs web-rs --replicas=5
+
+# See which Pods a ReplicaSet actually owns
+kubectl get pods -l app=web -o wide
+
+# Inspect a Pod's ownerReferences to confirm which RS created it
+kubectl get pod web-abc12 -o jsonpath='{.metadata.ownerReferences}'
+
+# Delete a ReplicaSet but orphan its Pods instead of cascading the delete
+kubectl delete rs web-rs --cascade=orphan
+
+# Watch replica reconciliation live while deleting a Pod
+kubectl get pods -l app=web -w
+</code></pre>
+
+<h2 id="best-practices">Best Practices &amp; Common Pitfalls</h2>
+<div class="grid-2">
+<div>
+<h4>Best Practices</h4>
+<ul>
+  <li>Never create bare ReplicaSets in production — always go through a Deployment for rollout/rollback support.</li>
+  <li>Keep the label selector as specific as possible to avoid accidentally adopting unrelated Pods.</li>
+  <li>Set resource requests/limits on the Pod template so the Scheduler can place replacements reliably.</li>
+  <li>Use topology spread constraints in the template to avoid all replicas landing on one node.</li>
+</ul>
+</div>
+<div>
+<h4>Pitfalls</h4>
+<ul>
+  <li>Editing a Pod's labels so it no longer matches the RS selector — the RS silently creates a replacement, leaving the edited Pod orphaned.</li>
+  <li>Two ReplicaSets with overlapping selectors fighting over the same Pods, causing flapping create/delete cycles.</li>
+  <li>Assuming <code>kubectl scale</code> on an RS persists through a Deployment rollout — the Deployment will overwrite it.</li>
+  <li>Forgetting selector immutability and trying to <code>kubectl edit</code> it, which the API Server rejects.</li>
+</ul>
+</div>
+</div>
+
+<h2 id="interview-questions">50 Interview Questions</h2>
+
+<details class="qa"><summary>1. What is the single responsibility of a ReplicaSet?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Guarantee that a specified number of identical Pod replicas are running at all times, nothing more.
+<br><strong>Detailed explanation:</strong> It has no concept of rollouts, versions, or history — it only compares the count of Pods matching its selector against <code>spec.replicas</code> and creates/deletes Pods to close that gap.
+<br><strong>Production example:</strong> A Deployment creates a new ReplicaSet per rollout; each RS only ever cares about its own replica count, letting the Deployment layer own the rollout logic.
+<br><strong>Common mistake:</strong> Expecting a ReplicaSet to handle image updates gracefully — editing its Pod template does nothing to already-running Pods.</div></details>
+
+<details class="qa"><summary>2. How does a ReplicaSet decide which Pods belong to it?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Via a label selector, not a fixed list of Pod names.
+<br><strong>Detailed explanation:</strong> Every reconcile cycle it lists Pods matching <code>spec.selector.matchLabels</code> and counts them; any existing Pod with matching labels can be "adopted" even if the RS didn't create it.
+<br><strong>Production example:</strong> Manually creating a bare Pod with <code>app: web</code> labels in a namespace that already has a <code>web-rs</code> ReplicaSet causes that Pod to be adopted and counted toward the replica total.
+<br><strong>Common mistake:</strong> Using overly broad selectors that unintentionally adopt Pods belonging to a different, unrelated workload.</div></details>
+
+<details class="qa"><summary>3. What is an ownerReference and how does a ReplicaSet use it?</summary>
+<div class="qa-body"><strong>Short answer:</strong> A back-pointer on every Pod the RS creates, referencing the RS's UID.
+<br><strong>Detailed explanation:</strong> It's what lets <code>kubectl delete rs</code> cascade-delete its Pods by default, and lets the garbage collector recognize a Pod as "owned" versus orphaned.
+<br><strong>Production example:</strong> <code>kubectl get pod web-abc12 -o jsonpath='{.metadata.ownerReferences}'</code> shows exactly which RS (and, transitively, which Deployment) created a given Pod.
+<br><strong>Common mistake:</strong> Assuming deleting a ReplicaSet always deletes its Pods — <code>--cascade=orphan</code> explicitly disables this.</div></details>
+
+<details class="qa"><summary>4. Why is spec.selector immutable on a ReplicaSet?</summary>
+<div class="qa-body"><strong>Short answer:</strong> To prevent a running RS from suddenly changing which Pods it considers "its own," which could orphan or double-adopt Pods mid-flight.
+<br><strong>Detailed explanation:</strong> The API Server rejects any update to <code>spec.selector</code> after creation; the only way to change it is to delete and recreate the object.
+<br><strong>Production example:</strong> This is one reason Deployments are preferred — the Deployment controller handles creating a brand-new ReplicaSet with a new selector/hash rather than trying to mutate an existing one.
+<br><strong>Common mistake:</strong> Trying <code>kubectl edit rs</code> to change the selector and being surprised by a rejected update.</div></details>
+
+<details class="qa"><summary>5. What happens if the ReplicaSet controller sees more matching Pods than spec.replicas?</summary>
+<div class="qa-body"><strong>Short answer:</strong> It deletes the excess Pods, generally preferring to remove the newest/least-ready ones first.
+<br><strong>Detailed explanation:</strong> This can happen after a manual Pod creation with matching labels, or right after a scale-down, or when two overlapping-selector ReplicaSets both think they own the same Pods.
+<br><strong>Production example:</strong> Scaling a ReplicaSet from 5 to 3 replicas via <code>kubectl scale</code> triggers exactly this deletion path.
+<br><strong>Common mistake:</strong> Not realizing that manually created Pods matching an RS's selector will simply get deleted by the controller shortly after appearing.</div></details>
+
+<details class="qa"><summary>6. Why should you almost never create a bare ReplicaSet directly in production?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Because it has no rollout or rollback mechanism — updating its Pod template does not touch existing Pods.
+<br><strong>Detailed explanation:</strong> A Deployment solves this by creating a brand-new ReplicaSet on every template change and shifting traffic between old and new RS objects; a bare RS gives you none of that orchestration.
+<br><strong>Production example:</strong> Teams that hand-roll ReplicaSets for "simplicity" typically end up manually deleting Pods one at a time to force a rolling update — reinventing what Deployments already do safely.
+<br><strong>Common mistake:</strong> Editing a bare ReplicaSet's image field and expecting existing Pods to update themselves.</div></details>
+
+<details class="qa"><summary>7. How does the object hierarchy Deployment → ReplicaSet → Pod enable rolling updates without losing self-healing?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Each layer keeps its own narrow guarantee — the RS still guarantees its own replica count independently, while the Deployment shifts counts between an old and new RS.
+<br><strong>Detailed explanation:</strong> If a Pod crashes mid-rollout, the ReplicaSet it belongs to (old or new) notices the count drop and replaces it immediately, without the Deployment needing to intervene.
+<br><strong>Production example:</strong> During a <code>checkout-service</code> rollout, if a brand-new Pod in the new ReplicaSet crashes, that RS replaces it on its own — the Deployment's surge/unavailable math is unaffected by which specific Pod failed.
+<br><strong>Common mistake:</strong> Believing the Deployment directly manages every individual Pod rather than delegating that job to ReplicaSets.</div></details>
+
+<details class="qa"><summary>8. What's the risk of two ReplicaSets with overlapping selectors?</summary>
+<div class="qa-body"><strong>Short answer:</strong> They fight over the same Pods, causing flapping create/delete cycles.
+<br><strong>Detailed explanation:</strong> Each RS independently reconciles toward its own replica count using the same label-matched Pod pool, so one RS's "delete extra Pod" can trigger the other RS's "create missing Pod," repeating indefinitely.
+<br><strong>Production example:</strong> A botched migration that leaves both an old hand-written RS and a Deployment-owned RS selecting <code>app: web</code> will visibly show Pods being created and terminated in a loop in <code>kubectl get events</code>.
+<br><strong>Common mistake:</strong> Copy-pasting a ReplicaSet manifest without changing its selector/labels, accidentally creating a selector collision with an existing workload.</div></details>
+
+<details class="qa"><summary>9. Why does editing a Pod's labels so it no longer matches its ReplicaSet's selector cause an orphan?</summary>
+<div class="qa-body"><strong>Short answer:</strong> The RS controller sees the count of matching Pods drop by one and immediately creates a replacement — the edited Pod is not deleted, just no longer tracked.
+<br><strong>Detailed explanation:</strong> The RS never "notices" the Pod still exists; it only counts Pods matching its selector, so a relabeled Pod simply falls outside its view while continuing to run and consume resources.
+<br><strong>Production example:</strong> A debugging <code>kubectl label pod web-abc12 app-</code> to isolate one Pod from load causes a brand-new replacement Pod to spin up, doubling capacity unless you clean up the orphan.
+<br><strong>Common mistake:</strong> Using label edits as a way to "pause" one Pod without accounting for the replacement the RS will create.</div></details>
+
+<details class="qa"><summary>10. Why doesn't kubectl scale on a ReplicaSet persist if it's owned by a Deployment?</summary>
+<div class="qa-body"><strong>Short answer:</strong> The Deployment controller is the authoritative source for the RS's desired replica count and overwrites manual changes on its next reconcile.
+<br><strong>Detailed explanation:</strong> The Deployment continuously ensures its active ReplicaSet has the replica count derived from <code>Deployment.spec.replicas</code>; a direct <code>kubectl scale rs</code> is treated as configuration drift and corrected.
+<br><strong>Production example:</strong> An on-call engineer scaling a ReplicaSet directly during an incident will see it silently reset back to the Deployment's configured value within seconds.
+<br><strong>Common mistake:</strong> Scaling the RS instead of the owning Deployment during an emergency, then being confused when the change doesn't stick.</div></details>
+
+<details class="qa"><summary>11–50. Additional rapid-fire questions</summary>
+<div class="qa-body">
+<strong>11.</strong> What API group/version is ReplicaSet under? — <code>apps/v1</code>.<br>
+<strong>12.</strong> What predecessor object did ReplicaSet replace? — ReplicationController; RS supports set-based selectors (<code>matchExpressions</code>), RC only equality-based.<br>
+<strong>13.</strong> Can a ReplicaSet's template labels be a superset of its selector? — Yes, template labels must be a superset (include) the selector's matchLabels, not identical.<br>
+<strong>14.</strong> What component actually runs the ReplicaSet controller? — kube-controller-manager, as one of its many control loops.<br>
+<strong>15.</strong> Does the ReplicaSet controller talk to etcd directly? — No, only through the API Server, like every controller.<br>
+<strong>16.</strong> What happens to Pods when you delete a ReplicaSet with default cascade behavior? — They are deleted too (cascade foreground/background delete).<br>
+<strong>17.</strong> How do you delete an RS but keep its Pods running? — <code>kubectl delete rs &lt;name&gt; --cascade=orphan</code>.<br>
+<strong>18.</strong> Why does the Scheduler still get involved even though the RS creates the Pod? — The RS only creates the Pod object with empty nodeName; the Scheduler still performs filtering/scoring and binds it.<br>
+<strong>19.</strong> Does a ReplicaSet perform any rolling update logic itself? — No — it has no update strategy concept at all, only replica-count reconciliation.<br>
+<strong>20.</strong> What field on a Pod tells you which controller last decided to replace it? — Its ownerReferences UID, cross-referenced against the RS's own UID.<br>
+<strong>21.</strong> Why is a specific label selector recommended over a broad one? — To avoid accidentally adopting unrelated Pods that happen to share a common label.<br>
+<strong>22.</strong> How does an RS decide which extra Pod to delete first when scaling down? — Kubernetes uses a deterministic ranking (not-ready, then younger Pods, then Pods on the same node as others) to pick deletion order.<br>
+<strong>23.</strong> Can you have a ReplicaSet with replicas: 0? — Yes — commonly used by Deployments to keep an old RS around at zero replicas for fast rollback.<br>
+<strong>24.</strong> What does kubectl describe rs show that kubectl get rs doesn't? — Full Events history (creations, deletions) and detailed condition/selector information.<br>
+<strong>25.</strong> Is a ReplicaSet namespaced or cluster-scoped? — Namespaced, like Pods and Deployments.<br>
+<strong>26.</strong> What happens if you set resources.requests on the template but the Scheduler can't find capacity? — New replacement Pods stay Pending until capacity frees up or cluster-autoscaler adds a node.<br>
+<strong>27.</strong> Does a ReplicaSet spread its Pods across nodes automatically? — No — that requires explicit topologySpreadConstraints or anti-affinity in the Pod template.<br>
+<strong>28.</strong> What's the relationship between a ReplicaSet's UID and pod-template-hash? — Deployments inject a pod-template-hash label derived from the template into both the RS's selector and its Pods, distinguishing RS generations.<br>
+<strong>29.</strong> If you kubectl edit a running Pod's image directly, does the RS notice? — No — the RS only tracks count, not content; the edited Pod keeps running until deleted/replaced for some other reason.<br>
+<strong>30.</strong> Why can't you rename a ReplicaSet in place? — Name is immutable metadata; you must delete and recreate under a new name.<br>
+<strong>31.</strong> What happens to a ReplicaSet's Pods if the RS's node is drained? — The Pods are evicted and the RS creates replacements on other schedulable nodes.<br>
+<strong>32.</strong> How would you find every Pod not currently accounted for by any ReplicaSet? — Compare cluster Pods against the union of ownerReferences from all RS objects — orphaned Pods have no matching owner.<br>
+<strong>33.</strong> Does deleting a Deployment also delete its ReplicaSets? — Yes, by default (cascading delete) — and each RS's Pods too, transitively.<br>
+<strong>34.</strong> Can a ReplicaSet use matchExpressions instead of matchLabels? — Yes — it supports set-based selectors like <code>In</code>, <code>NotIn</code>, <code>Exists</code>.<br>
+<strong>35.</strong> Why might kubectl get rs show a ReplicaSet with DESIRED=3, CURRENT=3, READY=1? — Pods exist but haven't passed their readiness probes yet — CURRENT counts existence, READY counts probe success.<br>
+<strong>36.</strong> What's the risk of setting extremely aggressive resource requests on the Pod template? — Replacement Pods may repeatedly fail to schedule, leaving the RS permanently under-replica'd.<br>
+<strong>37.</strong> Does the ReplicaSet controller use a watch or poll the API Server? — Watch, via an informer — reacts to changes in milliseconds rather than on a fixed interval.<br>
+<strong>38.</strong> What happens if two Deployments' ReplicaSets accidentally share the same selector? — Classic selector-collision flapping — both RSs create/delete Pods fighting over the same label-matched set.<br>
+<strong>39.</strong> Can you scale a ReplicaSet using an HPA directly? — Yes, technically, but it's uncommon in practice — HPAs almost always target the owning Deployment instead.<br>
+<strong>40.</strong> What field would you check to see how long a ReplicaSet has existed? — <code>metadata.creationTimestamp</code>.<br>
+<strong>41.</strong> Why do old ReplicaSets from past rollouts still exist at 0 replicas? — Deployments retain them (up to revisionHistoryLimit) to make instant rollback possible without rebuilding images.<br>
+<strong>42.</strong> Is there a "status" subresource on ReplicaSet? — Yes — tracks replicas, fullyLabeledReplicas, readyReplicas, and availableReplicas separately.<br>
+<strong>43.</strong> What's the difference between fullyLabeledReplicas and replicas in RS status? — fullyLabeledReplicas counts Pods whose labels fully match the template (detects drift from manual edits).<br>
+<strong>44.</strong> Can a ReplicaSet manage Pods across multiple namespaces? — No — Pods and their owning ReplicaSet must be in the same namespace.<br>
+<strong>45.</strong> What's a realistic scenario where you WOULD create a bare ReplicaSet? — Rare cases needing precise, manual control over rollout timing without any Deployment abstraction — uncommon outside specialized tooling.<br>
+<strong>46.</strong> How does kubectl rollout history relate to ReplicaSets? — Each entry corresponds to one ReplicaSet the owning Deployment created, identified by revision annotation.<br>
+<strong>47.</strong> What happens if you delete all Pods of a ReplicaSet manually? — The controller notices the count drop to zero and immediately recreates replicas up to spec.replicas.<br>
+<strong>48.</strong> Why is understanding ReplicaSets critical for debugging a stuck Deployment rollout? — Because rollout state (which Pods are old/new, why counts aren't converging) is actually implemented at the RS layer, not the Deployment layer.<br>
+<strong>49.</strong> Does a ReplicaSet enforce any ordering when creating multiple replacement Pods? — No — unlike a StatefulSet, ReplicaSet Pods are created in parallel with no ordering guarantee.<br>
+<strong>50.</strong> What's the first thing to check when a ReplicaSet is stuck below its desired replica count? — <code>kubectl describe rs</code> Events for scheduling failures (insufficient resources, taints) blocking new Pod creation.
+</div></details>
+
+<footer class="course-footer">Next: Topic 13 — Deployments, which manage ReplicaSets for you during rolling updates.</footer>
+
+<script>
+  mermaid.initialize({ startOnLoad: true, theme: 'dark' });
+</script>
+
+</body>
+</html>

@@ -1,0 +1,257 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Topic 46: Operators — Kubernetes Expert Course</title>
+<link rel="stylesheet" href="styles.css">
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+</head>
+<body>
+
+<header class="course-header">
+  <div class="kicker">Topic 46 of 70</div>
+  <h1>Operators</h1>
+  <div class="subtitle">Custom controllers that encode a human operator's knowledge of running a specific piece of software.</div>
+</header>
+
+<nav class="topic-nav">
+  <a href="45-helm.html">&larr; Helm</a>
+  <a href="index.html">Course Index</a>
+  <a href="47-crds.html">CRDs &rarr;</a>
+</nav>
+
+<h2 id="explanation">Explanation</h2>
+
+<p>Kubernetes' built-in controllers (Deployment, ReplicaSet, Job) know how to run <em>generic</em> workloads — start N
+copies of a container, restart it if it dies. But operationally complex, stateful software — a Postgres cluster,
+Kafka, Elasticsearch — needs far more than that: initializing a cluster, electing a primary, performing safe
+version upgrades one replica at a time, taking backups, handling failover, resizing storage. A human "operator"
+(the job title) traditionally did this by hand or via runbooks. The <strong>Operator pattern</strong> encodes that
+same operational knowledge into software: a custom controller that watches a <strong>Custom Resource</strong>
+representing the desired state of that application and continuously drives the real system towards it.</p>
+
+<p>Kubernetes needs this because its built-in primitives are intentionally generic — they can't know that "upgrading
+Postgres safely" means promoting a replica before touching the primary, or that "scaling Kafka" means rebalancing
+partitions rather than just adding empty brokers. Operators close this gap without polluting the Kubernetes core with
+application-specific logic — every Operator is just an ordinary custom controller plus a CRD, running the exact same
+watch/reconcile loop as core Kubernetes controllers, deployed as a regular Pod.</p>
+
+<p>The core building block is the <strong>reconcile loop</strong>: the Operator watches its Custom Resource (e.g. a
+<code>PostgresCluster</code> object) via the API Server, and on every change (or periodic resync) runs a
+<code>Reconcile(request)</code> function that reads the CR's desired spec, inspects the actual state of the cluster
+(by querying the database, checking StatefulSet/Pod status, etc.), and takes whatever action closes the gap —
+creating a Pod, promoting a replica, updating a ConfigMap. Crucially this function is expected to be
+<strong>idempotent and level-triggered</strong>: it must produce the correct result whether called once or a hundred
+times for the same state, exactly like Kubernetes' own core controllers.</p>
+
+<p>Most production Operators are built with <strong>Operator SDK</strong> or <strong>kubebuilder</strong> — scaffolding
+frameworks built on top of <code>controller-runtime</code>, the same Go library the Kubernetes project's own core
+controllers are built with. These frameworks generate the boilerplate (CRD schema, RBAC manifests, the watch/informer
+setup) so the author focuses purely on the reconcile logic. Famous production Operators include the Postgres
+Operator (Zalando/CrunchyData), the Prometheus Operator, and the Strimzi Kafka Operator — each is effectively a
+domain expert's runbook turned into always-on software.</p>
+
+<p>The Operator "maturity model" ranges from Level 1 (basic install/config) to Level 5 (full auto-pilot: automated
+upgrades, auto-scaling, auto-tuning, self-healing from complex failure modes) — most real-world Operators sit around
+Level 2-3, automating day-2 operations like backups and minor-version upgrades but still requiring human judgment for
+major version jumps or capacity planning.</p>
+
+<h2 id="internal-working">Internal Working / Interactions</h2>
+<ul>
+  <li><strong>API Server:</strong> serves the Operator's CRD like any other resource type; the Operator authenticates via its own ServiceAccount and RBAC, same as any client.</li>
+  <li><strong>Custom Resource (CR):</strong> the desired-state object the Operator watches (e.g. <code>kind: PostgresCluster</code>) — analogous to a Deployment's spec, but application-specific.</li>
+  <li><strong>Operator Pod (controller-runtime):</strong> runs the watch/informer against the CR and any owned resources (Pods, StatefulSets, Secrets), invoking Reconcile on changes.</li>
+  <li><strong>Owned native resources:</strong> the Operator typically creates and owns standard objects (StatefulSet, Service, PVC, Secret) under the hood, setting <code>ownerReferences</code> so garbage collection cleans them up if the CR is deleted.</li>
+  <li><strong>External systems:</strong> many Operators also talk directly to the application itself (e.g. a SQL connection to Postgres to run <code>ALTER SYSTEM</code>) — this is where Operators go beyond what core Kubernetes controllers ever do.</li>
+</ul>
+
+<h2 id="architecture-diagram">Architecture Diagram</h2>
+<pre class="mermaid">
+flowchart TB
+    User["kubectl apply -f postgrescluster.yaml"]
+    API["API Server"]
+    CRD["PostgresCluster CRD schema"]
+    Op["Operator Pod\n(reconcile loop)"]
+    SS["StatefulSet + PVCs + Services\n(owned resources)"]
+    DB["Live Postgres process\n(direct SQL admin calls)"]
+
+    User --> API
+    API --> CRD
+    API -->|watch: PostgresCluster changed| Op
+    Op -->|create/update| SS
+    API -->|watch: StatefulSet/Pod status| Op
+    Op -->|"direct connection: promote replica,\nrun backup, check replication lag"| DB
+    Op -->|update .status| API
+</pre>
+
+<h2 id="code-example">Code Example</h2>
+<pre><code># Custom Resource an Operator watches — declarative desired state for a Postgres cluster
+apiVersion: postgres-operator.example.com/v1
+kind: PostgresCluster
+metadata:
+  name: orders-db
+  namespace: payments
+spec:
+  version: "15"                 # Operator handles version-specific upgrade logic internally.
+  instances: 3                  # Operator creates 1 primary + 2 replicas, wires up streaming replication.
+  storage:
+    size: 100Gi
+    storageClassName: gp3
+  backup:
+    schedule: "0 2 * * *"        # Operator runs this via its own reconcile logic + a backup tool (e.g. pgBackRest).
+    retention: "14d"
+  resources:
+    requests: { cpu: "1", memory: 4Gi }
+    limits:   { cpu: "2", memory: 8Gi }
+status:                          # Written ONLY by the Operator, never by the user.
+  currentPrimary: orders-db-0
+  replicationLag: "120ms"
+  phase: Running
+</code></pre>
+
+<h2 id="kubectl-commands">kubectl Commands</h2>
+<pre><code>kubectl get postgresclusters -n payments                  # List custom resources managed by this Operator
+kubectl describe postgrescluster orders-db -n payments     # See spec, status, and reconcile-related Events
+kubectl get pods -n payments -l postgres-operator/cluster=orders-db  # Underlying Pods the Operator created
+kubectl logs -n operators deploy/postgres-operator -f       # Watch the reconcile loop's decisions in real time
+kubectl get crd | grep postgres-operator.example.com         # Confirm the Operator's CRD is installed
+kubectl get events -n payments --field-selector involvedObject.name=orders-db  # Operator-emitted lifecycle events
+</code></pre>
+
+<h2 id="best-practices">Best Practices &amp; Common Pitfalls</h2>
+<div class="grid-2">
+<div>
+<h4>Best Practices</h4>
+<ul>
+  <li>Only build/adopt an Operator when the operational complexity genuinely justifies it — not every app needs one.</li>
+  <li>Ensure the reconcile function is idempotent and safe to run repeatedly against the same state.</li>
+  <li>Scope the Operator's RBAC tightly to the namespaces/resources it actually manages.</li>
+  <li>Prefer well-maintained community Operators (Strimzi, Prometheus Operator, CloudNativePG) over building bespoke ones unless truly necessary.</li>
+</ul>
+</div>
+<div>
+<h4>Pitfalls</h4>
+<ul>
+  <li>Writing non-idempotent reconcile logic that behaves differently depending on how many times it's called.</li>
+  <li>Granting an Operator cluster-admin "to be safe" instead of least-privilege RBAC scoped to its CRD and owned resources.</li>
+  <li>Ignoring the Operator's own health/version — an outdated Operator can silently fail to support a newer application version.</li>
+  <li>Expecting an Operator to replace all human judgment — most sit at maturity Level 2-3, not full autopilot.</li>
+</ul>
+</div>
+</div>
+
+<h2 id="interview-questions">50 Interview Questions</h2>
+
+<details class="qa"><summary>1. What problem does the Operator pattern solve that Deployments/ReplicaSets don't?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Built-in controllers only know how to run generic workloads; Operators encode application-specific operational knowledge (failover, backups, safe upgrades) for complex stateful software.
+<br><strong>Detail:</strong> A Deployment can restart a dead container, but it has no concept of "promote a replica before touching the primary" or "rebalance partitions when scaling" — that domain expertise has to live somewhere, and an Operator is where it lives as code.
+<br><strong>Production example:</strong> A Postgres Operator handling primary election and safe one-replica-at-a-time version upgrades, which a plain StatefulSet has no way to express.
+<br><strong>Common mistake:</strong> Building an Operator for an application simple enough that a Deployment/StatefulSet already handles its needs.</div></details>
+
+<details class="qa"><summary>2. What are the two things every Operator is composed of?</summary>
+<div class="qa-body"><strong>Short answer:</strong> A CustomResourceDefinition (the schema for desired state) and a custom controller (the reconcile loop that acts on it).
+<br><strong>Detail:</strong> The CRD alone is inert structured data; the controller is what actually watches it and drives real-world state towards what it declares — together they form the full extension pattern.
+<br><strong>Production example:</strong> The PostgresCluster CRD paired with the Operator Pod running its reconcile loop against instances of that CRD.
+<br><strong>Common mistake:</strong> Shipping a CRD without a controller watching it, leaving custom resources as unenforced data.</div></details>
+
+<details class="qa"><summary>3. Why must an Operator's Reconcile function be idempotent and level-triggered?</summary>
+<div class="qa-body"><strong>Short answer:</strong> It may be called any number of times for the same state (due to resyncs, restarts, retries), and must always produce the correct result regardless of call count.
+<br><strong>Detail:</strong> Level-triggered means it compares full desired vs. actual state each time rather than relying on remembering "what changed since last time," making it resilient to missed or duplicate events.
+<br><strong>Production example:</strong> Re-running Reconcile after an Operator Pod restart doesn't re-trigger a backup that already completed — it checks actual state first.
+<br><strong>Common mistake:</strong> Writing reconcile logic that assumes it's only ever called exactly once per actual change (edge-triggered), which breaks under restarts or missed events.</div></details>
+
+<details class="qa"><summary>4. How does an Operator typically manage native Kubernetes resources like StatefulSets under the hood?</summary>
+<div class="qa-body"><strong>Short answer:</strong> It creates and owns them directly, setting ownerReferences so garbage collection cleans them up automatically if the custom resource is deleted.
+<br><strong>Detail:</strong> This mirrors how a Deployment owns its ReplicaSets — the Operator's CR sits at the top of an ownership chain, with native resources (StatefulSet, Service, PVC, Secret) beneath it.
+<br><strong>Production example:</strong> Deleting a PostgresCluster CR cascades to delete its owned StatefulSet, Services, and Secrets via Kubernetes' garbage collector.
+<br><strong>Common mistake:</strong> An Operator creating resources without ownerReferences, leaving orphaned StatefulSets/PVCs behind after the CR is deleted.</div></details>
+
+<details class="qa"><summary>5. What's unique about how an Operator can go "beyond" what core Kubernetes controllers do?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Many Operators talk directly to the application itself (e.g. a SQL connection to run administrative commands), not just to the Kubernetes API.
+<br><strong>Detail:</strong> Core controllers like the Deployment controller never reach into the application layer — they only manage Kubernetes objects. An Operator often bridges both worlds, checking replication lag via SQL or triggering an application-level failover command.
+<br><strong>Production example:</strong> A Postgres Operator connecting directly to the database to run <code>ALTER SYSTEM</code> or check streaming replication lag before deciding to promote a replica.
+<br><strong>Common mistake:</strong> Assuming an Operator only ever manipulates Kubernetes objects like any other controller — many need direct application-protocol access to do their job.</div></details>
+
+<details class="qa"><summary>6. What frameworks are most production Operators built with, and what do they provide?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Operator SDK or kubebuilder, both scaffolding tools built on controller-runtime — the same Go library core Kubernetes controllers use.
+<br><strong>Detail:</strong> They generate boilerplate (CRD schema generation, RBAC manifest generation, watch/informer setup) so the author can focus purely on writing the Reconcile function's business logic.
+<br><strong>Production example:</strong> Scaffolding a new Operator project with kubebuilder, which generates the CRD types, controller skeleton, and RBAC markers automatically.
+<br><strong>Common mistake:</strong> Hand-rolling informer/watch plumbing from scratch instead of using the well-tested controller-runtime primitives these frameworks provide.</div></details>
+
+<details class="qa"><summary>7. What does the Operator "maturity model" describe, and where do most real Operators sit?</summary>
+<div class="qa-body"><strong>Short answer:</strong> A Level 1 (basic install/config) to Level 5 (full auto-pilot) scale; most production Operators sit around Level 2-3.
+<br><strong>Detail:</strong> Level 2-3 typically automates day-2 operations like backups and minor-version upgrades, but still relies on human judgment for major version jumps or capacity planning decisions.
+<br><strong>Production example:</strong> A Kafka Operator automating routine broker restarts and config rollouts, but requiring a human decision for a major Kafka version migration.
+<br><strong>Common mistake:</strong> Expecting any installed Operator to be full autopilot (Level 5) by default — most are not, and treating them as such risks unattended failures during complex scenarios.</div></details>
+
+<details class="qa"><summary>8. Why should an Operator's RBAC be scoped tightly rather than granted cluster-admin?</summary>
+<div class="qa-body"><strong>Short answer:</strong> An Operator with cluster-admin can affect every namespace/resource in the cluster, far beyond what it actually needs to manage its own CR and owned resources.
+<br><strong>Detail:</strong> Least-privilege RBAC scoped to the Operator's specific CRD group and the native resource types it creates limits the blast radius if the Operator itself is compromised or buggy.
+<br><strong>Production example:</strong> Scoping a Postgres Operator's RBAC to only its own CRD, StatefulSets, Services, PVCs, and Secrets within the namespaces it's meant to manage.
+<br><strong>Common mistake:</strong> Granting cluster-admin "to be safe" instead of doing the RBAC scoping work up front.</div></details>
+
+<details class="qa"><summary>9. What's the difference between an Operator's spec and status fields on its Custom Resource?</summary>
+<div class="qa-body"><strong>Short answer:</strong> spec is the user-declared desired state; status is written only by the Operator itself, reflecting observed real-world state.
+<br><strong>Detail:</strong> Users should never write to status directly — fields like currentPrimary or replicationLag are the Operator's own observations, updated as part of its reconcile loop.
+<br><strong>Production example:</strong> A PostgresCluster's status.phase field showing "Running" only once the Operator has verified the cluster is actually healthy.
+<br><strong>Common mistake:</strong> A user manually editing status fields expecting it to influence Operator behavior — the Operator will simply overwrite it on the next reconcile.</div></details>
+
+<details class="qa"><summary>10. When should you adopt a community Operator versus building a bespoke one?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Prefer well-maintained community Operators (Strimzi, Prometheus Operator, CloudNativePG) unless your operational needs are genuinely unique.
+<br><strong>Detail:</strong> Building a bespoke Operator means owning its reconcile correctness, upgrade path, and RBAC scoping forever — a substantial ongoing engineering investment that's rarely worth it if a mature open-source option already covers the need.
+<br><strong>Production example:</strong> Adopting the Prometheus Operator rather than writing a custom controller to manage ServiceMonitor-driven scrape config generation.
+<br><strong>Common mistake:</strong> Building an in-house Operator for a widely-solved problem instead of evaluating existing community options first.</div></details>
+
+<details class="qa"><summary>11–50. Additional rapid-fire questions</summary>
+<div class="qa-body">
+<strong>11.</strong> What Kubernetes object type does an Operator watch to know desired state? — Its Custom Resource (CR), defined by a CRD.<br>
+<strong>12.</strong> What library underlies both Operator SDK and kubebuilder? — controller-runtime.<br>
+<strong>13.</strong> What does an Operator typically create under the hood for a database cluster? — StatefulSet, Services, PVCs, Secrets.<br>
+<strong>14.</strong> How does deleting a CR clean up its owned resources? — Via ownerReferences and Kubernetes' garbage collector.<br>
+<strong>15.</strong> What field should users never write directly on a CR? — .status — it's Operator-owned.<br>
+<strong>16.</strong> Is the Operator pattern specific to stateful applications only? — No, though it's most valuable for operationally complex, often stateful software.<br>
+<strong>17.</strong> What command shows the reconcile loop's live decisions? — <code>kubectl logs deploy/&lt;operator&gt; -f</code>.<br>
+<strong>18.</strong> What command confirms an Operator's CRD is installed? — <code>kubectl get crd | grep &lt;group&gt;</code>.<br>
+<strong>19.</strong> What's a famous Operator for Kafka? — Strimzi.<br>
+<strong>20.</strong> What's a famous Operator for Prometheus? — Prometheus Operator.<br>
+<strong>21.</strong> Does an Operator authenticate to the API Server differently than any other client? — No, via its own ServiceAccount and RBAC like any client.<br>
+<strong>22.</strong> What happens if an Operator's reconcile function isn't idempotent? — It can behave incorrectly or destructively when called multiple times for the same state, e.g. re-running a migration twice.<br>
+<strong>23.</strong> Why is "level-triggered" reconciliation resilient to missed events? — It re-derives the correct action from full current state rather than relying on remembering exactly what changed.<br>
+<strong>24.</strong> What's a risk of an outdated Operator version? — It may silently fail to support a newer application version it's meant to manage.<br>
+<strong>25.</strong> What maturity level does "full auto-pilot" correspond to? — Level 5.<br>
+<strong>26.</strong> What maturity level is "basic install/config only"? — Level 1.<br>
+<strong>27.</strong> Can an Operator reconcile against external, non-Kubernetes systems? — Yes — e.g. connecting directly to a database or message broker via its native protocol.<br>
+<strong>28.</strong> What's the risk of granting an Operator overly broad RBAC "just in case"? — A bug or compromise in the Operator has a far larger blast radius than necessary.<br>
+<strong>29.</strong> What kubectl command lists custom resources managed by an Operator? — <code>kubectl get &lt;plural-crd-name&gt; -n &lt;namespace&gt;</code>.<br>
+<strong>30.</strong> Does an Operator need to be redeployed to pick up changes to its own CR instances? — No, it watches CR changes continuously via its informer and reacts live.<br>
+<strong>31.</strong> What's the relationship between an Operator and Topic 47's CRDs? — The CRD is the schema half; the Operator is the behavior half — together they form the full extension.<br>
+<strong>32.</strong> Why do many real-world Operators still require human judgment for major upgrades? — Major version jumps often involve breaking changes or irreversible decisions too risky to fully automate.<br>
+<strong>33.</strong> What's a typical Level 2-3 capability an Operator automates? — Automated backups and minor-version upgrades.<br>
+<strong>34.</strong> Can multiple instances of the same CR type be managed by one Operator simultaneously? — Yes, an Operator's reconcile loop typically handles many CR instances across namespaces concurrently.<br>
+<strong>35.</strong> What's the purpose of a status subresource on the CRD an Operator uses? — Separates RBAC for who can write spec (users) versus status (only the controller).<br>
+<strong>36.</strong> How does an Operator detect that a StatefulSet it owns has drifted? — Via its own watch on owned resources (StatefulSet/Pod status), triggering another reconcile pass.<br>
+<strong>37.</strong> What's a common cause of an Operator getting stuck in a reconcile loop? — Non-idempotent logic or an error path that never resolves the underlying condition, causing continuous retries.<br>
+<strong>38.</strong> Does an Operator require its own dedicated namespace? — Not strictly, but it's common practice to isolate the Operator Pod and its RBAC from application namespaces.<br>
+<strong>39.</strong> What's the benefit of using a CRD's enum validation for an Operator's supported versions? — Rejects unsupported version requests at admission time before the Operator ever has to handle them.<br>
+<strong>40.</strong> Can an Operator run with multiple replicas for high availability? — Yes, typically with leader election so only one instance actively reconciles at a time.<br>
+<strong>41.</strong> Why is leader election important for an Operator running multiple replicas? — Prevents two replicas from concurrently issuing conflicting reconcile actions against the same resources.<br>
+<strong>42.</strong> What's a risk of an Operator directly running SQL administrative commands? — It needs carefully scoped database credentials and error handling — mistakes here can affect live production data, not just Kubernetes objects.<br>
+<strong>43.</strong> How would you test an Operator's reconcile logic before production? — Unit/integration tests using tools like envtest (part of controller-runtime) simulating the API Server.<br>
+<strong>44.</strong> What's the value of Operator SDK/kubebuilder scaffolding beyond boilerplate generation? — Baked-in best practices for RBAC manifest generation, CRD schema generation, and watch/informer setup consistent with Kubernetes conventions.<br>
+<strong>45.</strong> Can an Operator's CR reference other Operators' CRs? — Yes, cross-CR references are common in more complex platform compositions (e.g. an app CR referencing a database CR).<br>
+<strong>46.</strong> What's a good first question before writing a custom Operator? — Does the operational complexity genuinely justify building/maintaining one, versus using a Deployment/StatefulSet directly?<br>
+<strong>47.</strong> How does an Operator typically expose lifecycle events to users? — Via Kubernetes Events tied to the CR object, visible through <code>kubectl describe</code> or `kubectl get events`.<br>
+<strong>48.</strong> What's the risk of an Operator not handling partial failures gracefully? — It could leave owned resources in an inconsistent intermediate state instead of safely retrying to completion.<br>
+<strong>49.</strong> Is an Operator's reconcile loop triggered only by changes to its own CR? — No, typically also by changes to owned resources (Pods, StatefulSets) and periodic resyncs.<br>
+<strong>50.</strong> What's the first thing to check when an Operator's CR seems "stuck" not progressing? — The Operator Pod's own logs and RBAC permissions, to see if reconcile is failing, erroring, or silently blocked.
+</div></details>
+
+<footer class="course-footer">Next: Topic 47 — Custom Resource Definitions, the schema layer Operators are built on.</footer>
+
+<script>
+  mermaid.initialize({ startOnLoad: true, theme: 'dark' });
+</script>
+
+</body>
+</html>

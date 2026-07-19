@@ -1,0 +1,257 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Topic 27: CSI — Kubernetes Expert Course</title>
+<link rel="stylesheet" href="styles.css">
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+</head>
+<body>
+
+<header class="course-header">
+  <div class="kicker">Topic 27 of 70</div>
+  <h1>Container Storage Interface (CSI)</h1>
+  <div class="subtitle">The standard contract between Kubernetes and storage backends — controller/node plugins and the gRPC calls kubelet makes.</div>
+</header>
+
+<nav class="topic-nav">
+  <a href="26-storageclass.html">&larr; StorageClass</a>
+  <a href="index.html">Course Index</a>
+  <a href="28-configmaps.html">ConfigMaps &rarr;</a>
+</nav>
+
+<h2 id="explanation">Explanation</h2>
+<p>Before CSI, every storage integration (AWS EBS, GCE PD, Azure Disk, Ceph, etc.) had to be compiled directly into the core Kubernetes binaries as "in-tree" volume plugins. That coupling was painful: a bug fix or new feature in a storage driver required waiting for the next Kubernetes release, vendors couldn't ship or version their own code independently, and the core codebase accumulated dozens of storage-specific branches it didn't really own. The <strong>Container Storage Interface (CSI)</strong> is the industry-standard fix: a vendor-neutral gRPC API that any container orchestrator (not just Kubernetes) can speak, and any storage vendor can implement once and reuse everywhere.</p>
+<p>A CSI driver is just a set of Pods you deploy like any other workload, split into two roles. The <strong>Controller plugin</strong> runs as a Deployment (usually 1-2 replicas) and handles cluster-level operations that don't need to happen on a specific node: <code>CreateVolume</code>, <code>DeleteVolume</code>, <code>ControllerPublishVolume</code> (attach a disk to a node), snapshotting, and resizing. The <strong>Node plugin</strong> runs as a DaemonSet (one Pod per node) and handles node-local operations: <code>NodeStageVolume</code> (format and mount the disk to a staging path) and <code>NodePublishVolume</code> (bind-mount it into the specific Pod's directory).</p>
+<p>Kubernetes talks to these plugins not directly, but through a set of well-known "sidecar" containers that translate Kubernetes API objects into CSI gRPC calls: <code>external-provisioner</code> (watches PVCs, calls CreateVolume), <code>external-attacher</code> (watches VolumeAttachment objects, calls ControllerPublishVolume), <code>external-resizer</code> (handles PVC resize requests), <code>external-snapshotter</code> (VolumeSnapshot support), and <code>node-driver-registrar</code> (registers the node plugin with kubelet via a Unix domain socket). This sidecar pattern means the actual vendor code only needs to implement the CSI gRPC interface — all the Kubernetes-specific watch/reconcile logic is reusable boilerplate shared across every driver.</p>
+<p>kubelet's role is to call the Node plugin directly over a Unix domain socket whenever a Pod using a CSI volume starts or stops on that node — it never talks to the cloud API itself. This is why CSI driver Pods must be healthy on every node that hosts stateful workloads: if the node plugin crashes, Pods needing volume mounts on that node will fail to start even if the cloud disk itself is fine.</p>
+
+<h2 id="internal-working">Internal Working / Interactions</h2>
+<ul>
+<li><strong>External provisioner / attacher / resizer sidecars</strong> — translate PVC/VolumeAttachment/resize events from the API Server into CSI controller RPCs.</li>
+<li><strong>CSI Controller plugin</strong> — talks to the cloud/storage backend API to create, delete, attach, detach, resize, snapshot volumes.</li>
+<li><strong>node-driver-registrar</strong> — tells kubelet where the node plugin's Unix socket lives so kubelet can call it.</li>
+<li><strong>kubelet</strong> — calls <code>NodeStageVolume</code>/<code>NodePublishVolume</code> on the CSI Node plugin over gRPC when a Pod starts; calls the unstage/unpublish equivalents on Pod termination.</li>
+<li><strong>CSI Node plugin</strong> — performs the actual mount/format/bind-mount on the node's filesystem.</li>
+</ul>
+
+<h2 id="architecture-diagram">Architecture Diagram</h2>
+<pre class="mermaid">
+flowchart TB
+  subgraph ControlPlaneArea["Anywhere in cluster (Deployment)"]
+    Prov[external-provisioner] --> Ctrl[CSI Controller Plugin]
+    Att[external-attacher] --> Ctrl
+    Rsz[external-resizer] --> Ctrl
+    Ctrl -->|CreateVolume/DeleteVolume/Attach| Cloud[(Cloud Storage API)]
+  end
+  subgraph EveryNode["Every Node (DaemonSet)"]
+    Reg[node-driver-registrar] --> Node[CSI Node Plugin]
+    Kubelet[kubelet] -->|gRPC over unix socket| Node
+    Node -->|mount/format| Disk[/attached block device/]
+  end
+  Ctrl -.->|VolumeAttachment| Kubelet
+</pre>
+
+<pre class="mermaid">
+sequenceDiagram
+  participant Kubelet as kubelet
+  participant Node as CSI Node Plugin
+  participant Ctrl as CSI Controller Plugin
+  participant Cloud as Cloud API
+  Note over Ctrl,Cloud: Provisioning already done (CreateVolume, attach)
+  Kubelet->>Node: NodeStageVolume(volumeID, stagingPath)
+  Node->>Node: format device (if needed), mount to staging path
+  Node-->>Kubelet: OK
+  Kubelet->>Node: NodePublishVolume(stagingPath, podTargetPath)
+  Node->>Node: bind-mount into Pod's volume directory
+  Node-->>Kubelet: OK
+  Note over Kubelet: Pod container starts with volume mounted
+</pre>
+
+<h2 id="code-example">Code Example</h2>
+<pre><code># CSIDriver object — declares driver capabilities to the cluster (usually installed by the driver's Helm chart)
+apiVersion: storage.k8s.io/v1
+kind: CSIDriver
+metadata:
+  name: ebs.csi.aws.com
+spec:
+  attachRequired: true          # this driver needs ControllerPublishVolume (attach) before mounting
+  podInfoOnMount: true          # pass Pod metadata to NodePublishVolume calls
+  volumeLifecycleModes:
+    - Persistent                # standard PVC-backed lifecycle (vs Ephemeral inline volumes)
+
+---
+# DaemonSet snippet for the CSI Node plugin (illustrative — real charts are longer)
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: ebs-csi-node
+  namespace: kube-system
+spec:
+  selector:
+    matchLabels: { app: ebs-csi-node }
+  template:
+    metadata:
+      labels: { app: ebs-csi-node }
+    spec:
+      containers:
+      - name: node-driver-registrar         # registers this node plugin's socket with kubelet
+        image: registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.10.0
+        args:
+        - --csi-address=/csi/csi.sock
+        - --kubelet-registration-path=/var/lib/kubelet/plugins/ebs.csi.aws.com/csi.sock
+      - name: ebs-plugin                     # the actual vendor driver binary
+        image: public.ecr.aws/ebs-csi-driver/aws-ebs-csi-driver:v1.32.0
+        args: ["node"]
+        securityContext:
+          privileged: true                   # needed to mount/format block devices on the host
+</code></pre>
+
+<h2 id="kubectl-commands">kubectl Commands</h2>
+<pre><code>kubectl get csidrivers                                  # list installed CSI drivers and capabilities
+kubectl get pods -n kube-system -l app=ebs-csi-node     # verify node plugin DaemonSet is healthy on every node
+kubectl get pods -n kube-system -l app=ebs-csi-controller  # verify controller plugin replicas are Running
+kubectl get volumeattachments                            # see which volumes are attached to which nodes
+kubectl describe volumeattachment <name>                # attach/detach status and errors
+kubectl logs -n kube-system ebs-csi-node-xxxx -c ebs-plugin  # driver-level mount errors
+kubectl get csinodes                                     # per-node CSI driver registration status
+</code></pre>
+
+<h2 id="best-practices">Best Practices &amp; Common Pitfalls</h2>
+<div class="grid-2">
+<div class="callout good">
+<strong>Do</strong>
+<ul>
+<li>Monitor CSI node plugin DaemonSet health as closely as kubelet itself — a crashed node plugin blocks all volume mounts on that node.</li>
+<li>Keep the CSI driver version compatible with your Kubernetes minor version per the vendor's support matrix.</li>
+<li>Use vendor-provided Helm charts/operators to install CSI drivers rather than hand-rolling manifests.</li>
+<li>Enable volume snapshot support (external-snapshotter) if you need backup/restore workflows.</li>
+</ul>
+</div>
+<div class="callout warn">
+<strong>Pitfalls</strong>
+<ul>
+<li>Draining/rebooting a node while a CSI attach/detach operation is mid-flight, leaving a stuck VolumeAttachment.</li>
+<li>Forgetting the node plugin typically needs <code>privileged: true</code> — restrictive PodSecurity policies can silently block it.</li>
+<li>Running an old in-tree volume plugin config alongside a CSI migration without checking migration flags.</li>
+<li>Ignoring controller plugin logs when PVCs hang in Pending — the root cause is usually a cloud API throttling or permission error, not Kubernetes itself.</li>
+</ul>
+</div>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="interview-questions">50 Interview Questions</h2>
+
+<details class="qa"><summary>1. Why was the Container Storage Interface (CSI) introduced when in-tree volume plugins already worked?</summary>
+<div class="qa-body"><strong>Short answer:</strong> In-tree plugins forced every storage vendor's code to live inside core Kubernetes, coupling their release cycle to Kubernetes releases.
+<br><strong>Detailed explanation:</strong> A bug fix or feature in an AWS EBS or Ceph driver had to wait for the next Kubernetes minor release, and the core codebase accumulated storage-specific code it didn't own. CSI replaces this with a vendor-neutral gRPC contract any orchestrator can speak and any vendor can implement and ship independently.
+<br><strong>Production example:</strong> A storage vendor can release a CSI driver patch and roll it out via a Helm chart upgrade the same day, without waiting on a Kubernetes release train.
+<br><strong>Common mistake:</strong> Assuming CSI is Kubernetes-specific — it's an industry-standard interface any container orchestrator can adopt.</div></details>
+
+<details class="qa"><summary>2. What is the split of responsibilities between the CSI Controller plugin and the Node plugin?</summary>
+<div class="qa-body"><strong>Short answer:</strong> The Controller plugin handles cluster-level operations like CreateVolume/DeleteVolume/attach; the Node plugin handles node-local mount operations.
+<br><strong>Detailed explanation:</strong> The Controller plugin runs as a Deployment (1-2 replicas) since its operations don't need to run on a specific node — it talks to the cloud/storage backend API. The Node plugin runs as a DaemonSet, one Pod per node, because formatting and mounting a device only makes sense on the node where the Pod will actually run.
+<br><strong>Production example:</strong> ControllerPublishVolume (attaching a disk to a node) runs from the Controller Deployment, while NodeStageVolume (mounting that attached disk) runs from the Node Pod on that exact node.
+<br><strong>Common mistake:</strong> Assuming a single CSI Pod handles the whole lifecycle — the split is deliberate and both must be healthy for volumes to work end to end.</div></details>
+
+<details class="qa"><summary>3. What role do the CSI sidecar containers (external-provisioner, external-attacher, etc.) play?</summary>
+<div class="qa-body"><strong>Short answer:</strong> They translate Kubernetes API objects (PVCs, VolumeAttachments) into CSI gRPC calls, so vendor code only needs to implement the CSI interface itself.
+<br><strong>Detailed explanation:</strong> <code>external-provisioner</code> watches PVCs and calls CreateVolume, <code>external-attacher</code> watches VolumeAttachment objects and calls ControllerPublishVolume, <code>external-resizer</code> handles PVC resize requests, and <code>external-snapshotter</code> handles VolumeSnapshot support. This reusable boilerplate is shared across every vendor's driver.
+<br><strong>Production example:</strong> A new storage vendor only writes the CreateVolume/DeleteVolume gRPC handlers; the sidecars they bundle from sig-storage handle all Kubernetes watch/reconcile logic.
+<br><strong>Common mistake:</strong> Thinking the vendor plugin container alone implements Kubernetes integration — without the correct sidecars, PVCs never trigger the vendor's gRPC calls at all.</div></details>
+
+<details class="qa"><summary>4. How does node-driver-registrar fit into the CSI Node plugin DaemonSet?</summary>
+<div class="qa-body"><strong>Short answer:</strong> It tells kubelet where the Node plugin's Unix domain socket lives so kubelet can call it directly.
+<br><strong>Detailed explanation:</strong> Each Node plugin exposes a gRPC endpoint over a Unix socket; node-driver-registrar registers that socket path with kubelet's plugin registration mechanism so kubelet knows exactly which socket to dial for that driver on that node.
+<br><strong>Production example:</strong> The DaemonSet's <code>--kubelet-registration-path</code> arg points to <code>/var/lib/kubelet/plugins/ebs.csi.aws.com/csi.sock</code>, which kubelet then uses for every subsequent NodeStageVolume/NodePublishVolume call.
+<br><strong>Common mistake:</strong> Forgetting node-driver-registrar crashing means kubelet loses its registration for that driver on that node, even if the vendor plugin container is still running.</div></details>
+
+<details class="qa"><summary>5. Why does kubelet talk to the CSI Node plugin over a Unix domain socket instead of calling the cloud API directly?</summary>
+<div class="qa-body"><strong>Short answer:</strong> kubelet is storage-agnostic by design under CSI — it only knows how to make generic gRPC calls to whatever Node plugin is registered, never the cloud provider's own API.
+<br><strong>Detailed explanation:</strong> This indirection is exactly what makes CSI vendor-neutral: kubelet's logic doesn't change per storage backend, it just calls NodeStageVolume/NodePublishVolume on the local socket and the Node plugin translates that into whatever the backend actually requires.
+<br><strong>Production example:</strong> Swapping from an EBS-backed StorageClass to a Ceph-backed one requires zero kubelet changes — only a different Node plugin DaemonSet is running that socket.
+<br><strong>Common mistake:</strong> Assuming kubelet has cloud-provider credentials or logic baked in for volume mounting under CSI — it does not, all backend-specific work lives in the plugin.</div></details>
+
+<details class="qa"><summary>6. Why does a crashed CSI Node plugin block Pod scheduling with volumes on that node, even if the cloud disk itself is healthy?</summary>
+<div class="qa-body"><strong>Short answer:</strong> kubelet has no way to mount the volume without a live Node plugin process to call over the Unix socket, regardless of the underlying disk's state.
+<br><strong>Detailed explanation:</strong> NodeStageVolume and NodePublishVolume are gRPC calls to that specific local Pod; if it's crashed or its socket is gone, kubelet's calls fail or hang, so any Pod scheduled onto that node needing the volume gets stuck in ContainerCreating.
+<br><strong>Production example:</strong> A misconfigured resource limit OOM-kills the node plugin Pod on one node; every StatefulSet Pod rescheduled there afterward hangs waiting for its volume to mount.
+<br><strong>Common mistake:</strong> Troubleshooting a stuck Pod by checking only the cloud provider's volume/disk status and ignoring the local Node plugin DaemonSet's health on that specific node.</div></details>
+
+<details class="qa"><summary>7. What is the difference between NodeStageVolume and NodePublishVolume?</summary>
+<div class="qa-body"><strong>Short answer:</strong> NodeStageVolume formats and mounts the device to a shared per-volume staging path; NodePublishVolume bind-mounts that staging path into the specific Pod's directory.
+<br><strong>Detailed explanation:</strong> Staging happens once per volume per node regardless of how many Pods use it (for shareable volumes), while publish happens per Pod, giving each container its own bind-mounted view without re-formatting or re-mounting the underlying device.
+<br><strong>Production example:</strong> If two Pods on the same node share a ReadWriteMany volume, the driver stages it once, then calls NodePublishVolume twice, once per Pod's target path.
+<br><strong>Common mistake:</strong> Assuming these are one combined operation — separating them is what lets a driver avoid redundant format/mount work per Pod.</div></details>
+
+<details class="qa"><summary>8. What does the CSIDriver object's attachRequired field actually control?</summary>
+<div class="qa-body"><strong>Short answer:</strong> It tells Kubernetes whether this driver needs a ControllerPublishVolume (attach) step before the Node plugin can mount the volume.
+<br><strong>Detailed explanation:</strong> Block-storage-backed drivers like EBS need the disk attached to the node's instance first, so <code>attachRequired: true</code> triggers external-attacher to create a VolumeAttachment object and call ControllerPublishVolume; drivers backed by network filesystems that don't need node-level attachment can set it to false and skip that step.
+<br><strong>Production example:</strong> An EFS-backed CSI driver typically sets <code>attachRequired: false</code> since there's no block device attach step, unlike EBS.
+<br><strong>Common mistake:</strong> Assuming every CSI driver goes through an attach phase — it's conditional on whether the backend actually requires node-level attachment.</div></details>
+
+<details class="qa"><summary>9. Why does the CSI Node plugin container typically need privileged: true, and what production risk does that create?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Formatting and mounting block devices on the host filesystem requires host-level privileges the container runtime doesn't grant by default.
+<br><strong>Detailed explanation:</strong> Operations like creating a filesystem on a raw block device or performing host mount namespace changes need capabilities beyond a normal container's sandbox, so vendor Node plugins commonly run with <code>privileged: true</code> and host mounts.
+<br><strong>Production example:</strong> A cluster tightening PodSecurity admission to the "restricted" profile can silently block the CSI Node plugin DaemonSet from being (re)scheduled, breaking all volume mounts cluster-wide.
+<br><strong>Common mistake:</strong> Rolling out stricter Pod security standards without carving out an exemption for the kube-system namespace hosting CSI Node plugins.</div></details>
+
+<details class="qa"><summary>10. What can cause a VolumeAttachment to get "stuck" during a node drain, and why is this a common production incident?</summary>
+<div class="qa-body"><strong>Short answer:</strong> If a node is drained or rebooted while an attach/detach gRPC call is mid-flight, the CSI Controller plugin can be left waiting on a Node/Controller operation that never completes cleanly.
+<br><strong>Detailed explanation:</strong> Detaching a volume requires the Controller plugin to call ControllerUnpublishVolume against the cloud API, but if the node disappears abruptly (forced termination, spot reclaim) before that finishes, the VolumeAttachment object can remain in a stuck state, blocking the Pod from rescheduling elsewhere with the same volume.
+<br><strong>Production example:</strong> A StatefulSet Pod fails to reschedule on a new node because Kubernetes won't attach the same PVC there until the old VolumeAttachment is cleaned up.
+<br><strong>Common mistake:</strong> Force-deleting the Pod without investigating the underlying VolumeAttachment object, which can leave the volume unusable on any node until manually resolved.</div></details>
+
+<details class="qa"><summary>11–50. Additional rapid-fire questions</summary>
+<div class="qa-body">
+<strong>11.</strong> What protocol does CSI use for communication between Kubernetes components and storage drivers? — gRPC.<br>
+<strong>12.</strong> Why is CSI described as "vendor-neutral"? — Any storage vendor implements the same interface once, and any container orchestrator (not just Kubernetes) can consume it.<br>
+<strong>13.</strong> What Kubernetes object registers a CSI driver's capabilities to the cluster? — The <code>CSIDriver</code> object.<br>
+<strong>14.</strong> What does <code>podInfoOnMount: true</code> on a CSIDriver do? — Passes Pod metadata (name, namespace, service account) to NodePublishVolume calls.<br>
+<strong>15.</strong> What workload type does the CSI Controller plugin typically run as? — A Deployment.<br>
+<strong>16.</strong> What workload type does the CSI Node plugin typically run as? — A DaemonSet, one Pod per node.<br>
+<strong>17.</strong> Which sidecar watches PVC objects and triggers CreateVolume? — external-provisioner.<br>
+<strong>18.</strong> Which sidecar watches VolumeAttachment objects and triggers ControllerPublishVolume? — external-attacher.<br>
+<strong>19.</strong> Which sidecar handles PVC resize requests? — external-resizer.<br>
+<strong>20.</strong> Which sidecar adds VolumeSnapshot support? — external-snapshotter.<br>
+<strong>21.</strong> What component registers the Node plugin's socket path with kubelet? — node-driver-registrar.<br>
+<strong>22.</strong> How does kubelet communicate with the CSI Node plugin? — Over a Unix domain socket via gRPC.<br>
+<strong>23.</strong> Does kubelet ever call the cloud storage API directly under CSI? — No, it only calls the local Node plugin over its socket.<br>
+<strong>24.</strong> What gRPC call formats and mounts a device to a staging path? — NodeStageVolume.<br>
+<strong>25.</strong> What gRPC call bind-mounts a staged volume into a specific Pod's directory? — NodePublishVolume.<br>
+<strong>26.</strong> What gRPC call attaches a cloud disk to a node? — ControllerPublishVolume.<br>
+<strong>27.</strong> What gRPC call provisions a new volume from the storage backend? — CreateVolume.<br>
+<strong>28.</strong> What kubectl command lists installed CSI drivers and their capabilities? — <code>kubectl get csidrivers</code>.<br>
+<strong>29.</strong> What kubectl command shows per-node CSI driver registration status? — <code>kubectl get csinodes</code>.<br>
+<strong>30.</strong> What kubectl command shows which volumes are attached to which nodes? — <code>kubectl get volumeattachments</code>.<br>
+<strong>31.</strong> Why did in-tree volume plugins slow down storage vendor development? — Fixes/features had to be merged into core Kubernetes and wait for the next release cycle.<br>
+<strong>32.</strong> Why does the Controller plugin not need to run on every node? — Its operations (create/delete/attach at the API level) are cluster-level, not tied to a specific node's local filesystem.<br>
+<strong>33.</strong> Why does the Node plugin need to run on every node? — Mount/format operations must happen on the exact node hosting the Pod that uses the volume.<br>
+<strong>34.</strong> What happens to a Pod's volume mount if the node-driver-registrar sidecar (not the vendor plugin container) crashes? — kubelet can lose its registration entry for that driver on that node, breaking new mount calls even if the vendor container is fine.<br>
+<strong>35.</strong> Why is CSI described as reusable across orchestrators beyond Kubernetes? — It's a standardized gRPC spec, not a Kubernetes-specific API, so Mesos/Nomad-style systems could implement the same client side.<br>
+<strong>36.</strong> What's a typical replica count for a CSI Controller plugin Deployment? — 1-2 replicas, often with leader election for the active instance.<br>
+<strong>37.</strong> Why might a PVC stay stuck in Pending due to the CSI Controller plugin rather than Kubernetes itself? — Cloud API throttling, permission/IAM errors, or quota limits on the backend the controller talks to.<br>
+<strong>38.</strong> What security context requirement commonly blocks CSI Node plugin scheduling under strict PodSecurity policies? — <code>privileged: true</code>, needed to format/mount host block devices.<br>
+<strong>39.</strong> What migration mechanism lets clusters move from in-tree plugins to CSI without breaking existing PVCs? — In-tree migration flags/CSI migration shims that translate in-tree plugin calls to the equivalent CSI driver transparently.<br>
+<strong>40.</strong> Why should CSI driver versions be checked against a vendor compatibility matrix? — Driver behavior and supported gRPC features are tied to specific Kubernetes minor versions; mismatches can break provisioning or mounting.<br>
+<strong>41.</strong> What's a good way to install a CSI driver in production rather than hand-writing manifests? — Use the vendor's official Helm chart or operator.<br>
+<strong>42.</strong> Why is monitoring the CSI Node plugin DaemonSet as important as monitoring kubelet? — A crashed node plugin has the same practical effect as kubelet being unable to mount volumes on that node.<br>
+<strong>43.</strong> What log location would you check for driver-level mount errors? — The vendor plugin container's logs, e.g. <code>kubectl logs -n kube-system &lt;node-pod&gt; -c &lt;plugin-container&gt;</code>.<br>
+<strong>44.</strong> What does <code>kubectl describe volumeattachment</code> help diagnose? — Attach/detach status and errors between the Controller plugin and the cloud backend.<br>
+<strong>45.</strong> Why can a stuck VolumeAttachment block a Pod from rescheduling to a new node? — Kubernetes won't attach the same volume to a second node until the prior attachment is cleaned up.<br>
+<strong>46.</strong> What field on CSIDriver distinguishes standard PVC-backed volumes from inline ephemeral volumes? — <code>volumeLifecycleModes</code> (Persistent vs Ephemeral).<br>
+<strong>47.</strong> Why is the sidecar pattern considered good architecture for CSI drivers? — It lets vendors reuse common, well-tested Kubernetes reconciliation logic and focus only on implementing the storage-specific gRPC handlers.<br>
+<strong>48.</strong> What's the risk of running an outdated external-provisioner sidecar image? — It may lack support for newer PVC features (like specific volume modes or snapshot data sources) even if the vendor plugin itself supports them.<br>
+<strong>49.</strong> Why is namespace kube-system a common home for CSI driver Pods? — It groups cluster-infrastructure components together, though the exact namespace is a deployment choice, not a CSI requirement.<br>
+<strong>50.</strong> How would you troubleshoot a Pod stuck in ContainerCreating due to a volume mount issue? — Check CSI Node plugin Pod health on that node, its logs for gRPC/mount errors, the VolumeAttachment status, and kubelet events for the Pod.
+</div></details>
+
+<footer class="course-footer">Next: Topic 28 — ConfigMaps (creating, consuming as env vars vs volumes, update propagation).</footer>
+
+<script>
+  mermaid.initialize({ startOnLoad: true, theme: 'dark' });
+</script>
+
+</body>
+</html>

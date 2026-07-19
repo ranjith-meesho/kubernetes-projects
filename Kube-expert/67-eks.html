@@ -1,0 +1,308 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Topic 67: EKS — Kubernetes Expert Course</title>
+<link rel="stylesheet" href="styles.css">
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+</head>
+<body>
+
+<header class="course-header">
+  <div class="kicker">Topic 67 of 70</div>
+  <h1>EKS (Amazon Elastic Kubernetes Service)</h1>
+  <div class="subtitle">AWS's managed Kubernetes: managed node groups vs Fargate, IRSA for pod-level IAM, and the VPC CNI's real-IP networking model.</div>
+</header>
+
+<nav class="topic-nav">
+  <a href="66-gke.html">&larr; GKE</a>
+  <a href="index.html">Course Index</a>
+  <a href="68-aks.html">AKS &rarr;</a>
+</nav>
+
+<h2 id="explanation">Explanation</h2>
+<p>EKS manages the control plane (etcd, API server, scheduler, controller-manager) across multiple AZs on AWS's
+behalf, billed as a flat hourly fee per cluster, while you retain full choice over how compute is provisioned. There
+are three compute options, and picking the wrong default costs real operational effort later. <strong>Managed node
+groups</strong> are AWS-provisioned Auto Scaling Groups of EC2 instances where AWS handles node provisioning,
+lifecycle, and (optionally) automated version upgrades, but you still choose instance types, and the nodes are real
+VMs you could SSH into if needed. <strong>Self-managed node groups</strong> give you full EC2/AMI control at the cost
+of doing everything yourself — rarely the right choice today. <strong>Fargate</strong> removes nodes entirely: each
+Pod gets its own isolated micro-VM sized to the Pod's resource requests, billed per-vCPU/memory-second with zero node
+patching or capacity planning — the tradeoff is no DaemonSets, no privileged Pods, and higher per-unit compute cost,
+making it best for spiky, less latency-sensitive, or security-isolation-sensitive workloads rather than your entire
+fleet.</p>
+
+<p><strong>IRSA (IAM Roles for Service Accounts)</strong> is EKS's answer to "how does a Pod get AWS credentials
+without static access keys." EKS runs an OIDC identity provider for the cluster; a Kubernetes ServiceAccount is
+annotated with an IAM role ARN, and that IAM role's trust policy is scoped to trust only that specific OIDC
+subject (namespace + service account name). When a Pod using that ServiceAccount calls AWS APIs via the SDK, the
+injected projected service-account token is exchanged (via <code>sts:AssumeRoleWithWebIdentity</code>) for short-lived
+AWS credentials scoped exactly to that IAM role's permissions — no shared node-level IAM role, no long-lived keys,
+and each workload's blast radius is limited to its own explicitly granted permissions. This is functionally identical
+in purpose to GKE's Workload Identity, just implemented through AWS STS and cluster OIDC federation.</p>
+
+<p>The <strong>VPC CNI</strong> is what makes EKS networking distinctive versus most other Kubernetes networking
+options: instead of an overlay network, the VPC CNI assigns each Pod a <strong>real, routable VPC IP address</strong>
+directly from the node's ENI (Elastic Network Interface) secondary IP pool. This means Pods can be reached directly
+by other AWS resources (RDS, EC2, on-prem via Direct Connect) without NAT translation, security groups can apply
+directly to Pods (via SecurityGroupPolicy), and there's no encapsulation overhead — but it also means your VPC subnet
+IP space must be sized generously, since every Pod consumes a real VPC IP, and small subnets run out of IPs far
+faster than people expect at scale (a common EKS production incident: pods stuck in <code>ContainerCreating</code>
+because the subnet ran out of free IPs).</p>
+
+<p>Practical defaults: use managed node groups for most steady-state workloads, add a Fargate profile for
+namespaces with spiky/untrusted/low-effort workloads (e.g. CI runners, batch jobs), always use IRSA instead of
+node-instance-profile IAM for workload permissions, and size VPC subnets (or enable custom networking / prefix
+delegation in the CNI) with real Pod-count headroom before you hit production scale.</p>
+
+<h2 id="internal-working">Internal Working / Interactions</h2>
+<ul>
+  <li><strong>Control plane:</strong> fully managed by AWS across 3 AZs; exposed via a managed API server endpoint
+  (public, private, or both) that you configure at cluster creation.</li>
+  <li><strong>Managed node groups:</strong> backed by an ASG; AWS handles rolling AMI upgrades respecting
+  PodDisruptionBudgets when you trigger a node-group update.</li>
+  <li><strong>Fargate:</strong> a Fargate profile matches Pods by namespace/labels; matching Pods are scheduled onto
+  AWS-managed Firecracker microVMs instead of your node groups, invisible to <code>kubectl get nodes</code> in the
+  traditional sense (a virtual node appears per Pod).</li>
+  <li><strong>IRSA / OIDC:</strong> EKS publishes an OIDC provider per cluster; IAM trust policies reference it;
+  the injected <code>AWS_WEB_IDENTITY_TOKEN_FILE</code> lets the AWS SDK auto-assume the mapped role.</li>
+  <li><strong>VPC CNI:</strong> the <code>aws-node</code> DaemonSet on each node manages ENI attachment and
+  secondary-IP allocation; kubelet requests a Pod IP from the CNI plugin at Pod creation.</li>
+</ul>
+
+<h2 id="architecture-diagram">Architecture Diagram</h2>
+<pre class="mermaid">
+flowchart TB
+  subgraph AWS["AWS-managed control plane (multi-AZ)"]
+    API[EKS API server]
+    ETCD[(etcd)]
+  end
+  subgraph VPC["Customer VPC"]
+    subgraph MNG["Managed Node Group (ASG)"]
+      Node1[EC2 Node] -->|ENI secondary IPs| Pod1[Pod: 10.0.1.15]
+      Node1 -->|ENI secondary IPs| Pod2[Pod: 10.0.1.16]
+    end
+    subgraph Fargate["Fargate Profile: batch namespace"]
+      FPod[Pod: micro-VM<br/>10.0.2.30]
+    end
+    OIDC[EKS OIDC Provider]
+  end
+  IAMRole["IAM Role: orders-role\n(trust: OIDC sub=ns:orders-sa)"]
+
+  API --- ETCD
+  API -.schedules.-> Node1
+  API -.schedules.-> FPod
+  Pod1 -->|AssumeRoleWithWebIdentity| OIDC
+  OIDC --> IAMRole
+  IAMRole -->|short-lived STS creds| Pod1
+</pre>
+
+<h2 id="code-example">Code Example</h2>
+<pre><code>#############################################
+# 1. eksctl - create a cluster with a managed node group + Fargate profile
+#############################################
+eksctl create cluster \
+  --name prod-eks \
+  --region us-east-1 \
+  --version 1.29 \
+  --nodegroup-name general \
+  --node-type m5.large \
+  --nodes 3 --nodes-min 3 --nodes-max 10 \      # managed node group with autoscaling bounds
+  --with-oidc                                    # provisions the OIDC provider needed for IRSA
+
+# Add a Fargate profile for spiky/batch workloads in the "batch" namespace
+eksctl create fargateprofile \
+  --cluster prod-eks \
+  --name batch-fp \
+  --namespace batch                              # any Pod created in "batch" ns runs on Fargate, not EC2 nodes
+
+---
+# 2. IRSA - create IAM role + bind it to a ServiceAccount (eksctl shortcut)
+eksctl create iamserviceaccount \
+  --cluster prod-eks \
+  --namespace orders \
+  --name orders-sa \
+  --attach-policy-arn arn:aws:iam::123456789012:policy/OrdersDynamoDBAccess \
+  --approve                                       # creates IAM role + trust policy scoped to ns:orders-sa
+
+apiVersion: v1
+kind: Pod
+metadata:
+  name: orders-worker
+  namespace: orders
+spec:
+  serviceAccountName: orders-sa    # Pod automatically gets AWS_WEB_IDENTITY_TOKEN_FILE + IRSA env vars injected
+  containers:
+    - name: worker
+      image: 123456789012.dkr.ecr.us-east-1.amazonaws.com/orders-worker:v1.4
+
+---
+# 3. VPC CNI - enable prefix delegation to avoid running out of Pod IPs
+kubectl set env daemonset aws-node -n kube-system ENABLE_PREFIX_DELEGATION=true
+# Assigns /28 IP prefixes per ENI instead of one IP at a time - dramatically raises
+# max Pods per node without needing bigger instance types or subnets.
+</code></pre>
+
+<h2 id="kubectl-cli-commands">kubectl / CLI Commands</h2>
+<pre><code># Update local kubeconfig for the EKS cluster
+aws eks update-kubeconfig --name prod-eks --region us-east-1
+
+# List node groups and their scaling config
+eksctl get nodegroup --cluster prod-eks
+
+# List Fargate profiles
+eksctl get fargateprofile --cluster prod-eks
+
+# Confirm IRSA annotation on a ServiceAccount
+kubectl get sa orders-sa -n orders -o yaml | grep eks.amazonaws.com/role-arn
+
+# Check aws-node (VPC CNI) DaemonSet health across nodes
+kubectl get pods -n kube-system -l k8s-app=aws-node
+
+# See how many IPs are available/used per node (diagnose ContainerCreating IP exhaustion)
+kubectl describe node <node> | grep -A5 Allocatable
+
+# Trigger a managed node group version upgrade
+eksctl upgrade nodegroup --cluster prod-eks --name general
+</code></pre>
+
+<h2 id="best-practices">Best Practices &amp; Common Pitfalls</h2>
+<div class="grid-2">
+  <div class="lab-card">
+    <h4>Best Practices</h4>
+    <ul>
+      <li>Use IRSA for every workload needing AWS access — never attach broad IAM to the node instance role.</li>
+      <li>Mix managed node groups (steady-state) with Fargate profiles (spiky/isolated workloads).</li>
+      <li>Size VPC subnets generously or enable prefix delegation before you hit IP exhaustion in production.</li>
+      <li>Use private API endpoint access (or both public+private with restricted CIDRs) for production clusters.</li>
+      <li>Enable EKS control-plane logging (audit, authenticator) to CloudWatch for security visibility.</li>
+    </ul>
+  </div>
+  <div class="lab-card">
+    <h4>Common Pitfalls</h4>
+    <ul>
+      <li>Granting the shared EC2 node IAM role broad permissions — every Pod on that node inherits them.</li>
+      <li>Undersized VPC subnets causing Pods to get stuck in ContainerCreating under load.</li>
+      <li>Assuming Fargate supports DaemonSets or privileged Pods — it does not.</li>
+      <li>Forgetting <code>--with-oidc</code> at cluster creation, then IRSA silently doesn't work.</li>
+      <li>Not monitoring ENI/IP allocation as a first-class capacity metric.</li>
+    </ul>
+  </div>
+</div>
+
+<h2 id="interview-questions">50 Interview Questions</h2>
+
+<details class="qa"><summary>1. What are the three EKS compute options, and when is each the right default?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Managed node groups (AWS-provisioned ASGs of EC2, you choose instance types), self-managed node groups (full EC2/AMI control, rarely the right choice today), and Fargate (per-Pod micro-VMs, no nodes at all).
+<br><strong>Detail:</strong> Managed node groups suit most steady-state workloads; Fargate suits spiky, less latency-sensitive, or security-isolation-sensitive workloads like CI runners or batch jobs, at higher per-unit compute cost and with no DaemonSets/privileged Pods.
+<br><strong>Production example:</strong> A cluster runs managed node groups for the main API fleet and a Fargate profile scoped to the `batch` namespace for CI/batch jobs.
+<br><strong>Common mistake:</strong> Defaulting to self-managed node groups today when managed node groups cover the same need with far less operational toil.</div></details>
+
+<details class="qa"><summary>2. How does IRSA let a Pod get AWS credentials without static access keys?</summary>
+<div class="qa-body"><strong>Short answer:</strong> A ServiceAccount is annotated with an IAM role ARN whose trust policy trusts only that specific OIDC subject (namespace + service account name); the Pod's injected token is exchanged via `sts:AssumeRoleWithWebIdentity` for short-lived credentials.
+<br><strong>Detail:</strong> EKS runs a per-cluster OIDC identity provider specifically to make this trust relationship possible — no shared node-level IAM role, and each workload's blast radius is limited to its own explicitly granted permissions.
+<br><strong>Production example:</strong> `eksctl create iamserviceaccount --namespace orders --name orders-sa --attach-policy-arn ...` creates both the IAM role and its scoped trust policy in one step.
+<br><strong>Common mistake:</strong> Forgetting `--with-oidc` at cluster creation, after which IRSA silently doesn't work because no OIDC provider exists to trust.</div></details>
+
+<details class="qa"><summary>3. Why does IRSA limit blast radius better than granting IAM permissions to the node instance role?</summary>
+<div class="qa-body"><strong>Short answer:</strong> A shared node IAM role grants its permissions to every Pod running on that node; IRSA scopes permissions per-ServiceAccount, so only Pods using that specific ServiceAccount inherit those permissions.
+<br><strong>Detail:</strong> This is the core reason IRSA is considered the correct default — without it, any compromised Pod on a node effectively has all of that node's IAM permissions, regardless of what that particular Pod actually needs.
+<br><strong>Production example:</strong> An `orders-sa` ServiceAccount scoped to only DynamoDB access on the orders table means a compromised orders Pod can't touch unrelated S3 buckets the node role might otherwise have access to.
+<br><strong>Common mistake:</strong> Granting broad permissions to the shared EC2 node IAM role "to make things work," giving every Pod on that node those same permissions.</div></details>
+
+<details class="qa"><summary>4. How does the VPC CNI's real-IP model differ from an overlay network, and what's the tradeoff?</summary>
+<div class="qa-body"><strong>Short answer:</strong> The VPC CNI assigns each Pod a real, routable VPC IP directly from the node's ENI secondary IP pool instead of using an overlay — Pods are reachable by other AWS resources without NAT, but VPC subnet IP space must be sized generously.
+<br><strong>Detail:</strong> Security groups can also apply directly to Pods via SecurityGroupPolicy, and there's no encapsulation overhead — but every Pod consumes a real VPC IP, so small subnets run out of IPs far faster than people expect at scale.
+<br><strong>Production example:</strong> A subnet sized for the initial cluster size runs out of free IPs as the cluster scales, and Pods get stuck in `ContainerCreating` — a classic EKS production incident.
+<br><strong>Common mistake:</strong> Sizing VPC subnets based on expected node count rather than expected total Pod count, since Pods (not nodes) are what consume the IP space.</div></details>
+
+<details class="qa"><summary>5. What does enabling prefix delegation on the VPC CNI actually change?</summary>
+<div class="qa-body"><strong>Short answer:</strong> It assigns `/28` IP prefixes per ENI instead of allocating one secondary IP at a time, dramatically raising the max Pods per node without needing bigger instance types or larger subnets.
+<br><strong>Detail:</strong> Without prefix delegation, Pod density per node is capped by the number of secondary IPs an ENI can hold individually; prefix delegation allocates blocks of IPs at once, relaxing that per-node ceiling.
+<br><strong>Production example:</strong> `kubectl set env daemonset aws-node -n kube-system ENABLE_PREFIX_DELEGATION=true` raises Pod density on existing instance types without a fleet-wide resize.
+<br><strong>Common mistake:</strong> Responding to IP exhaustion only by resizing the VPC subnet, when enabling prefix delegation or custom networking may solve it without a disruptive re-IP-plan.</div></details>
+
+<details class="qa"><summary>6. Why does Fargate remove nodes entirely, and what capability does that cost you?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Each Pod gets its own isolated micro-VM sized to its resource requests, billed per-vCPU/memory-second with zero node patching or capacity planning — but you lose DaemonSets and privileged Pods.
+<br><strong>Detail:</strong> Because there's no persistent, shared node underneath a Fargate Pod, anything requiring host-level access (a DaemonSet, hostPath, privileged mode) has no place to run — this is a fundamental architectural tradeoff, not a configurable limit.
+<br><strong>Production example:</strong> A Fargate profile scoped to the `batch` namespace runs CI jobs with zero node-capacity planning, but a log-collector DaemonSet still has to run on managed node groups instead.
+<br><strong>Common mistake:</strong> Assuming Fargate supports DaemonSets or privileged Pods for some workloads "if configured right" — it categorically does not.</div></details>
+
+<details class="qa"><summary>7. How do managed node groups handle AMI upgrades safely?</summary>
+<div class="qa-body"><strong>Short answer:</strong> AWS handles rolling AMI upgrades that respect PodDisruptionBudgets when you trigger a node-group update, rather than replacing all nodes at once.
+<br><strong>Detail:</strong> This is one of the concrete operational benefits over self-managed node groups — you still choose instance types and trigger the upgrade, but the rollout mechanics (cordon/drain respecting PDBs) are handled for you.
+<br><strong>Production example:</strong> `eksctl upgrade nodegroup --cluster prod-eks --name general` triggers a managed, PDB-aware rolling replacement of the group's nodes.
+<br><strong>Common mistake:</strong> Assuming self-managed node groups are needed for "more control" over upgrade timing, when managed node groups already expose this via a single command with safer defaults.</div></details>
+
+<details class="qa"><summary>8. What virtual node abstraction does Fargate present to kubectl, and why does that matter operationally?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Matching Fargate Pods are scheduled onto AWS-managed Firecracker microVMs, invisible in the traditional node-fleet sense — a virtual node appears per Pod in `kubectl get nodes`.
+<br><strong>Detail:</strong> This means node-count-based capacity reasoning (like `kubectl get nodes` to gauge total cluster capacity) doesn't apply the same way to Fargate workloads, since there's no shared, persistent node backing multiple Pods.
+<br><strong>Production example:</strong> A cluster running mostly Fargate workloads shows an unusually large, constantly-changing node list, one "node" per running Fargate Pod, rather than a small stable fleet.
+<br><strong>Common mistake:</strong> Trying to reason about Fargate capacity using traditional node-count or node-utilization dashboards designed for EC2-backed node groups.</div></details>
+
+<details class="qa"><summary>9. Why is IRSA described as "functionally identical in purpose" to GKE Workload Identity?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Both solve "how does a Pod get cloud credentials without static keys" via OIDC federation between a Kubernetes ServiceAccount and a cloud IAM identity — just implemented through different mechanisms (AWS STS vs GCP's metadata-server federation).
+<br><strong>Detail:</strong> This is a common interview framing: the underlying problem and security properties (short-lived, auditable, revocable, no static keys) are the same across EKS, GKE, and AKS — only the plumbing differs.
+<br><strong>Production example:</strong> A platform team documenting "workload identity" policy across a multi-cloud fleet writes one conceptual policy and maps it to IRSA on EKS, Workload Identity on GKE, and Azure AD Workload Identity on AKS.
+<br><strong>Common mistake:</strong> Treating IRSA as an EKS-specific one-off concept instead of recognizing it as one implementation of a cross-cloud pattern.</div></details>
+
+<details class="qa"><summary>10. What are the practical default recommendations this topic gives for a new production EKS cluster?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Managed node groups for steady-state workloads, a Fargate profile for spiky/untrusted/low-effort workloads, IRSA everywhere instead of node-instance-profile IAM, and generously sized VPC subnets (or prefix delegation) before hitting production scale.
+<br><strong>Detail:</strong> These defaults directly map to the topic's core risks: node-role over-permissioning (solved by IRSA), IP exhaustion (solved by subnet sizing/prefix delegation), and unnecessary operational toil (solved by managed node groups/Fargate over self-managed).
+<br><strong>Production example:</strong> A new cluster is bootstrapped with `--with-oidc`, a managed node group, a Fargate profile for the `batch` namespace, and IRSA bindings for every workload needing AWS access from day one.
+<br><strong>Common mistake:</strong> Treating these as optional hardening steps to add later, rather than defaults to establish at cluster creation before workloads onboard.</div></details>
+
+<details class="qa"><summary>11–50. Additional rapid-fire questions</summary>
+<div class="qa-body">
+<strong>11.</strong> What does EKS manage on AWS's behalf? — The control plane (etcd, API server, scheduler, controller-manager) across multiple AZs.<br>
+<strong>12.</strong> How is the EKS control plane billed? — A flat hourly fee per cluster.<br>
+<strong>13.</strong> What backs a managed node group? — An AWS-provisioned Auto Scaling Group (ASG) of EC2 instances.<br>
+<strong>14.</strong> What's the main downside of self-managed node groups? — You do everything yourself (provisioning, patching, lifecycle) with full EC2/AMI control.<br>
+<strong>15.</strong> What billing model does Fargate use? — Per-vCPU/memory-second, based on each Pod's resource requests.<br>
+<strong>16.</strong> What kind of micro-VM backs each Fargate Pod? — An AWS-managed Firecracker microVM.<br>
+<strong>17.</strong> What flag at cluster creation provisions the OIDC provider needed for IRSA? — `--with-oidc` (eksctl).<br>
+<strong>18.</strong> What env var does IRSA inject into a Pod for token-based auth? — `AWS_WEB_IDENTITY_TOKEN_FILE`.<br>
+<strong>19.</strong> What STS API call exchanges a Pod's token for AWS credentials? — `sts:AssumeRoleWithWebIdentity`.<br>
+<strong>20.</strong> What DaemonSet manages ENI attachment and secondary-IP allocation? — `aws-node` (the VPC CNI DaemonSet).<br>
+<strong>21.</strong> Where does a Pod's IP come from under the VPC CNI? — The node's ENI secondary IP pool, a real routable VPC IP.<br>
+<strong>22.</strong> What lets security groups apply directly to individual Pods? — SecurityGroupPolicy.<br>
+<strong>23.</strong> What CLI command updates local kubeconfig for an EKS cluster? — `aws eks update-kubeconfig --name <cluster> --region <region>`.<br>
+<strong>24.</strong> What command lists node groups and their scaling config? — `eksctl get nodegroup --cluster <cluster>`.<br>
+<strong>25.</strong> What command lists Fargate profiles? — `eksctl get fargateprofile --cluster <cluster>`.<br>
+<strong>26.</strong> How do you confirm the IRSA annotation on a ServiceAccount? — `kubectl get sa <sa> -o yaml | grep eks.amazonaws.com/role-arn`.<br>
+<strong>27.</strong> How do you check aws-node (VPC CNI) DaemonSet health? — `kubectl get pods -n kube-system -l k8s-app=aws-node`.<br>
+<strong>28.</strong> What symptom indicates VPC subnet IP exhaustion? — Pods stuck in `ContainerCreating`.<br>
+<strong>29.</strong> What command diagnoses per-node IP allocation during IP exhaustion troubleshooting? — `kubectl describe node <node> | grep -A5 Allocatable`.<br>
+<strong>30.</strong> What flag scopes a Fargate profile to specific Pods? — `--namespace` (matches Pods created in that namespace).<br>
+<strong>31.</strong> Does Fargate support privileged Pods? — No.<br>
+<strong>32.</strong> Does Fargate support DaemonSets? — No.<br>
+<strong>33.</strong> What workload types is Fargate best suited for? — Spiky, less latency-sensitive, or security-isolation-sensitive workloads like CI runners or batch jobs.<br>
+<strong>34.</strong> What's the recommended API endpoint access mode for production EKS clusters? — Private (or both public+private with restricted CIDRs), not fully public.<br>
+<strong>35.</strong> What EKS control-plane logs should be enabled for security visibility? — Audit and authenticator logs, sent to CloudWatch.<br>
+<strong>36.</strong> Why is granting broad IAM to a node's instance role risky? — Every Pod scheduled on that node inherits those permissions, regardless of what each Pod actually needs.<br>
+<strong>37.</strong> What's a common mistake when creating an EKS cluster that later breaks IRSA? — Forgetting `--with-oidc`, so no OIDC provider exists for IAM trust policies to reference.<br>
+<strong>38.</strong> What EKS-specific IP-planning tool addresses ENI IP density limits? — Prefix delegation (`ENABLE_PREFIX_DELEGATION=true`) or custom networking.<br>
+<strong>39.</strong> Why should ENI/IP allocation be monitored as a first-class capacity metric? — Because IP exhaustion causes silent Pod scheduling failures that don't show up in typical CPU/memory capacity dashboards.<br>
+<strong>40.</strong> What Kubernetes-native concept does an IAM trust policy scope IRSA access to? — The OIDC subject, i.e. a specific namespace + ServiceAccount name combination.<br>
+<strong>41.</strong> Why is `eksctl create iamserviceaccount` considered a shortcut? — It creates the IAM role, its scoped trust policy, and the Kubernetes ServiceAccount annotation together in one command.<br>
+<strong>42.</strong> What's the tradeoff of choosing Fargate for an entire fleet rather than select namespaces? — Higher per-unit compute cost and loss of DaemonSet/privileged-Pod capability across the whole fleet, not just isolated workloads.<br>
+<strong>43.</strong> Why does EKS's per-cluster flat control-plane fee matter for cost planning versus AKS? — Unlike AKS (no control-plane charge), EKS bills a flat hourly fee per cluster regardless of node count, which changes the cost calculus for running many small clusters.<br>
+<strong>44.</strong> What happens operationally if you rely on VPC CNI without ever revisiting subnet sizing as the cluster grows? — Pods eventually get stuck in ContainerCreating once the subnet's free IP pool is exhausted.<br>
+<strong>45.</strong> What's the advantage of real Pod IPs (VPC CNI) for hybrid connectivity? — Pods can be reached directly by on-prem resources via Direct Connect without NAT translation.<br>
+<strong>46.</strong> What upgrade command targets a specific managed node group's Kubernetes version? — `eksctl upgrade nodegroup --cluster <cluster> --name <nodegroup>`.<br>
+<strong>47.</strong> Why is checking IRSA annotations part of a security audit on an existing EKS cluster? — Confirms workloads are actually using scoped per-ServiceAccount credentials rather than silently falling back to the shared node role.<br>
+<strong>48.</strong> What's the risk of skipping a Fargate profile and running untrusted/spiky workloads on shared node groups instead? — Those workloads share the underlying EC2 node's kernel and resources with other Pods, unlike Fargate's per-Pod isolation.<br>
+<strong>49.</strong> Why does the topic recommend mixing managed node groups with Fargate rather than choosing one exclusively? — Steady-state workloads benefit from managed node groups' cost efficiency, while spiky/isolated workloads benefit from Fargate's zero-capacity-planning model — most real fleets need both.<br>
+<strong>50.</strong> What's the single biggest operational decision point this topic emphasizes for new EKS clusters? — Compute model choice (managed node groups vs Fargate) plus IRSA-by-default — together they shape cost, security blast radius, and operational toil more than any other early decision.
+</div></details>
+
+<footer class="course-footer">Continue to Topic 68: AKS.</footer>
+
+<script>
+  mermaid.initialize({ startOnLoad: true, theme: 'dark' });
+</script>
+
+</body>
+</html>

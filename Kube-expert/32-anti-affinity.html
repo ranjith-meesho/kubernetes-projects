@@ -1,0 +1,339 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Topic 32: Anti-Affinity — Kubernetes Expert Course</title>
+<link rel="stylesheet" href="styles.css">
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+</head>
+<body>
+
+<header class="course-header">
+  <div class="kicker">Topic 32 of 70</div>
+  <h1>Pod Anti-Affinity</h1>
+  <div class="subtitle">Spreading replicas apart so a single node or zone failure never takes down your whole service.</div>
+</header>
+
+<nav class="topic-nav">
+  <a href="31-affinity.html">&larr; Affinity</a>
+  <a href="index.html">Course Index</a>
+  <a href="33-taints.html">Taints &rarr;</a>
+</nav>
+
+<h2 id="explanation">Explanation</h2>
+<p><strong>Pod anti-affinity</strong> is a scheduling rule that tells the Scheduler to <em>avoid</em> placing a Pod on a
+node that already runs (or doesn't run) Pods matching a given label selector, evaluated relative to a topology domain
+such as <code>kubernetes.io/hostname</code> or <code>topology.kubernetes.io/zone</code>. Where affinity pulls Pods
+together, anti-affinity pushes them apart. It is the single most important primitive for turning "3 replicas" into
+"3 replicas that actually survive a node failure" — without it, the Scheduler is free to bin-pack all three replicas
+of a Deployment onto the same node purely because that node happened to have the most free capacity at the time.</p>
+
+<p>Kubernetes needs this because the default scheduling objective is efficient bin-packing, not availability. Bin-packing
+and high availability are often in direct tension: the most "efficient" placement for 3 replicas is frequently all on
+one node, which is exactly the placement that turns a single node failure into a full outage. Anti-affinity lets you
+explicitly encode the availability requirement as a scheduling constraint instead of hoping the scorer happens to
+spread things out.</p>
+
+<p>There are two flavors, mirroring node affinity: <code>requiredDuringSchedulingIgnoredDuringExecution</code> (a hard
+rule — if no node satisfies it, the Pod stays <code>Pending</code>) and <code>preferredDuringSchedulingIgnoredDuringExecution</code>
+(a soft rule — the Scheduler tries to honor it via scoring, but will still place the Pod if no ideal node exists). The
+"IgnoredDuringExecution" suffix means that once a Pod is running, Kubernetes never evicts it just because the
+anti-affinity rule is later violated (e.g. another Pod is later scheduled that breaks the rule) — it only affects the
+initial placement decision.</p>
+
+<p>Anti-affinity fits into the wider architecture at the Scheduler's <em>filtering</em> and <em>scoring</em> phases,
+exactly like node affinity and taints/tolerations. It reads <code>PodAffinityTerm</code> objects containing a
+<code>labelSelector</code>, a <code>topologyKey</code>, and optionally a <code>namespaces</code> list, and the
+Scheduler must query the current placement of every other Pod matching that selector across the cluster before it can
+decide — this makes pod anti-affinity computationally more expensive than node affinity, which is one reason large
+clusters are cautioned against overusing "required" pod anti-affinity at scale.</p>
+
+<p>In production, anti-affinity is what makes topology-aware statements like "no two replicas of payment-service on the
+same node" or "no two replicas in the same availability zone" actually enforceable, rather than best-effort. It composes
+naturally with <code>topologySpreadConstraints</code> (topic 35), which is the more modern, flexible tool for the same
+general goal — many teams today prefer topology spread constraints for even distribution and reserve anti-affinity for
+strict "never co-locate these two workloads" rules (e.g. keep an app and its adjacent cache off the same node).</p>
+
+<div class="callout">
+  <strong>Anti-affinity vs topology spread constraints:</strong> Anti-affinity answers "keep me away from Pods with
+  label X." Topology spread constraints answer "spread my Pods evenly across a topology domain." They can be combined,
+  but if all you want is even distribution of one Deployment's own replicas, topology spread constraints (topic 35) are
+  usually the cleaner, more scalable choice.
+</div>
+
+<h2 id="internal-working">Internal Working / Interactions</h2>
+<ul>
+  <li><strong>API Server:</strong> validates the <code>affinity.podAntiAffinity</code> block against the Pod spec schema and persists it to etcd unchanged — the Scheduler reads it back on the next scheduling attempt.</li>
+  <li><strong>Scheduler:</strong> the <code>InterPodAffinity</code> plugin runs during the Filter phase (for required rules) and the Score phase (for preferred rules). It must list existing Pods across the relevant topology domain to evaluate the selector — this is a live query against the Scheduler's Pod cache (informer), not etcd directly.</li>
+  <li><strong>kubelet:</strong> has no role in anti-affinity — by the time a Pod reaches a node, the placement decision is already final.</li>
+  <li><strong>etcd:</strong> stores the anti-affinity rule as part of the Pod object; no separate storage.</li>
+  <li><strong>Cluster Autoscaler:</strong> must simulate anti-affinity rules when deciding whether adding a new node would actually let a Pending Pod schedule — a common source of "cluster autoscaler added a node but the pod is still Pending" confusion.</li>
+</ul>
+
+<h2 id="architecture-diagram">Architecture Diagram</h2>
+<pre class="mermaid">
+flowchart TB
+    subgraph Zone_A["Zone A"]
+        N1["Node 1 - checkout-pod-1"]
+    end
+    subgraph Zone_B["Zone B"]
+        N2["Node 2 - checkout-pod-2"]
+    end
+    subgraph Zone_C["Zone C"]
+        N3["Node 3 - checkout-pod-3"]
+        N4["Node 4 (empty)"]
+    end
+
+    SCHED["Scheduler: InterPodAffinity plugin"] -->|"1. New pod: checkout-pod-4\nlabelSelector app=checkout\ntopologyKey=hostname"| CHECK{"Any node without\nan app=checkout pod?"}
+    CHECK -->|"N1,N2,N3 already host one"| REJECT["Filtered out"]
+    CHECK -->|"N4 is clear"| N4
+    REJECT -.-> N1
+    REJECT -.-> N2
+    REJECT -.-> N3
+</pre>
+
+<pre class="mermaid">
+sequenceDiagram
+    participant U as kubectl apply
+    participant A as API Server
+    participant S as Scheduler
+    participant C as Pod Cache (informer)
+
+    U->>A: Create Pod (podAntiAffinity: app=checkout, topologyKey=hostname)
+    A->>S: Watch fires - new unscheduled Pod
+    S->>C: List existing Pods matching labelSelector
+    C-->>S: Pods on node-1, node-2, node-3
+    S->>S: Filter out node-1, node-2, node-3 (required rule violated)
+    S->>S: node-4 passes filter, scores highest
+    S->>A: Bind Pod to node-4
+    A-->>U: Pod scheduled
+</pre>
+
+<h2 id="code-example">Code Example</h2>
+<pre><code>apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: checkout-service
+  namespace: payments
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: checkout
+  template:
+    metadata:
+      labels:
+        app: checkout
+    spec:
+      affinity:
+        podAntiAffinity:
+          # HARD rule: never place two "app=checkout" pods on the same node.
+          # If no node can satisfy this, new pods stay Pending instead of co-locating.
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchExpressions:
+                  - key: app
+                    operator: In
+                    values: ["checkout"]
+              topologyKey: "kubernetes.io/hostname"   # domain = individual node
+      containers:
+        - name: checkout
+          image: registry.internal/checkout-service:2.4.1
+          resources:
+            requests: { cpu: "250m", memory: "256Mi" }
+</code></pre>
+
+<pre><code>apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: checkout-service-multi-az
+  namespace: payments
+spec:
+  replicas: 6
+  selector:
+    matchLabels:
+      app: checkout
+  template:
+    metadata:
+      labels:
+        app: checkout
+    spec:
+      affinity:
+        podAntiAffinity:
+          # SOFT rule: prefer spreading across zones, but don't block scheduling
+          # if capacity forces some replicas to share a zone.
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100                              # relative weight vs other preferred terms
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: checkout
+                topologyKey: "topology.kubernetes.io/zone"   # domain = availability zone
+          # Combine with a hard per-node rule so no single node ever gets 2 replicas.
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: checkout
+              topologyKey: "kubernetes.io/hostname"
+      containers:
+        - name: checkout
+          image: registry.internal/checkout-service:2.4.1
+</code></pre>
+
+<h2 id="kubectl-commands">kubectl Commands</h2>
+<pre><code># See which node each replica landed on — quick visual anti-affinity check
+kubectl get pods -l app=checkout -o wide
+
+# Confirm no two replicas share a node
+kubectl get pods -l app=checkout -o custom-columns=NAME:.metadata.name,NODE:.spec.nodeName
+
+# Inspect why a pod is Pending (anti-affinity conflicts show up here)
+kubectl describe pod checkout-abcde | grep -A5 Events
+
+# View the raw affinity rule on a running pod
+kubectl get pod checkout-abcde -o jsonpath='{.spec.affinity.podAntiAffinity}'
+
+# Check node zone labels used as the topology domain
+kubectl get nodes -L topology.kubernetes.io/zone
+
+# Dry-run validate a manifest's affinity block against the live schema
+kubectl explain deployment.spec.template.spec.affinity.podAntiAffinity
+</code></pre>
+
+<h2 id="best-practices">Best Practices &amp; Common Pitfalls</h2>
+<div class="grid-2">
+<div>
+<h4>Do's</h4>
+<ul>
+  <li>Use hard (required) anti-affinity by hostname for critical, low-replica-count services (databases, leader-elected controllers).</li>
+  <li>Prefer soft (preferred) anti-affinity by zone for larger fleets where strict enforcement could cause Pending pods.</li>
+  <li>Combine with <code>topologySpreadConstraints</code> when you need both "spread evenly" and "never co-locate with X".</li>
+  <li>Always pair required anti-affinity with enough node/zone capacity — verify with cluster-autoscaler dry-run before rollout.</li>
+</ul>
+</div>
+<div>
+<h4>Don'ts</h4>
+<ul>
+  <li>Don't use required anti-affinity on high-replica-count Deployments in small clusters — pods will get stuck Pending once nodes run out.</li>
+  <li>Don't forget podAffinityTerm evaluation cost scales with cluster size — avoid required inter-pod anti-affinity at very large scale (1000s of nodes) without testing scheduler latency.</li>
+  <li>Don't rely on anti-affinity alone for rebalancing after scale-up — it only affects initial placement, not existing running pods.</li>
+  <li>Don't mix labelSelectors so broad they accidentally match unrelated pods across namespaces (remember to scope with <code>namespaces</code> field).</li>
+</ul>
+</div>
+</div>
+
+<h2 id="interview-questions">50 Interview Questions</h2>
+
+<details class="qa"><summary>1. What is pod anti-affinity and how does it differ from node affinity?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Anti-affinity repels a Pod from nodes already running Pods matching a label selector, relative to a topology domain; node affinity attracts a Pod toward nodes matching node-level labels.
+<br><strong>Detailed explanation:</strong> <strong>Node affinity</strong> compares a Pod's rules against static node labels. <strong>Pod anti-affinity</strong> compares against the live placement of *other Pods*, which the Scheduler must query dynamically via its Pod cache — a fundamentally more expensive operation.
+<br><strong>Production example:</strong> Spreading 3 replicas of checkout-service across 3 different nodes using <code>podAntiAffinity</code> with <code>topologyKey: kubernetes.io/hostname</code>.
+<br><strong>Common mistake:</strong> Assuming anti-affinity reads node labels — it reads other Pods' labels and positions instead.</div></details>
+
+<details class="qa"><summary>2. What do <code>requiredDuringSchedulingIgnoredDuringExecution</code> and <code>preferredDuringSchedulingIgnoredDuringExecution</code> mean?</summary>
+<div class="qa-body"><strong>Short answer:</strong> "Required" is a hard constraint — the Pod stays Pending if unmet; "preferred" is a soft scoring hint that never blocks scheduling.
+<br><strong>Detailed explanation:</strong> "IgnoredDuringExecution" means once a Pod is running, Kubernetes never evicts it even if the anti-affinity rule is later violated by a subsequent scheduling decision — it only governs initial placement.
+<br><strong>Production example:</strong> A payments team uses required hostname anti-affinity for a 3-replica database and preferred zone anti-affinity for a 20-replica stateless API.
+<br><strong>Common mistake:</strong> Expecting a required rule to rebalance already-running Pods after the rule is violated — it never does.</div></details>
+
+<details class="qa"><summary>3. Why is required pod anti-affinity more expensive for the Scheduler than node affinity or taints?</summary>
+<div class="qa-body"><strong>Short answer:</strong> It requires listing every existing Pod matching the label selector across the topology domain before a placement decision can be made.
+<br><strong>Detailed explanation:</strong> Node affinity/taints only compare against static node metadata already cached; inter-pod affinity/anti-affinity forces the <code>InterPodAffinity</code> plugin to query live Pod placement, which scales with cluster and Pod count.
+<br><strong>Production example:</strong> Large clusters (1000s of nodes) are cautioned against heavy use of required pod anti-affinity because of Scheduler latency impact.
+<br><strong>Common mistake:</strong> Applying required pod anti-affinity broadly across hundreds of Deployments without load-testing scheduler throughput.</div></details>
+
+<details class="qa"><summary>4. What is the role of <code>topologyKey</code> in an anti-affinity rule?</summary>
+<div class="qa-body"><strong>Short answer:</strong> It defines the domain across which the anti-affinity rule is evaluated — e.g. per-node or per-zone.
+<br><strong>Detailed explanation:</strong> <code>kubernetes.io/hostname</code> means "never share a node"; <code>topology.kubernetes.io/zone</code> means "never share a zone." The Scheduler groups nodes by this label's value to compute matches.
+<br><strong>Production example:</strong> checkout-service uses hostname-level required anti-affinity plus zone-level preferred anti-affinity, layering two domains.
+<br><strong>Common mistake:</strong> Choosing a topologyKey that isn't consistently applied to all nodes, silently breaking the rule for unlabeled nodes.</div></details>
+
+<details class="qa"><summary>5. Why would the Scheduler bin-pack all 3 replicas of a Deployment onto one node without anti-affinity?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Because the default scheduling objective optimizes for efficient resource packing, not high availability.
+<br><strong>Detailed explanation:</strong> The scorer picks the "best fit" node by capacity criteria; nothing about that objective inherently spreads replicas of the same workload apart.
+<br><strong>Production example:</strong> A 3-replica Deployment landed entirely on one large, mostly-empty node until anti-affinity was added, and a single node failure took the whole service down.
+<br><strong>Common mistake:</strong> Assuming "3 replicas" automatically implies "3 different nodes" — it does not without an explicit constraint.</div></details>
+
+<details class="qa"><summary>6. How does anti-affinity interact with Cluster Autoscaler?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Cluster Autoscaler must simulate anti-affinity rules when deciding if a new node would actually let a Pending Pod schedule.
+<br><strong>Detailed explanation:</strong> If it doesn't correctly account for required anti-affinity, it may add a node that still can't satisfy the rule, leaving the Pod Pending even after scale-up.
+<br><strong>Production example:</strong> Cluster Autoscaler added a node in an already-occupied zone, but the Pod's required hostname anti-affinity still blocked it because another replica already sat there.
+<br><strong>Common mistake:</strong> Assuming "Cluster Autoscaler added a node" always resolves a Pending Pod — anti-affinity mismatches are a common exception.</div></details>
+
+<details class="qa"><summary>7. When should you prefer topology spread constraints over pod anti-affinity?</summary>
+<div class="qa-body"><strong>Short answer:</strong> When the goal is even distribution of one Deployment's own replicas rather than avoiding co-location with a *different* workload.
+<br><strong>Detailed explanation:</strong> Anti-affinity is binary (co-locate or not); topology spread constraints reason quantitatively via <code>maxSkew</code> and scale better for large replica counts.
+<br><strong>Production example:</strong> checkout-service replaced its zone-level anti-affinity with a topology spread constraint once replica count grew past the number of zones.
+<br><strong>Common mistake:</strong> Reaching for required anti-affinity to spread N replicas across M zones when N > M — it becomes impossible to satisfy.</div></details>
+
+<details class="qa"><summary>8. What happens if a required anti-affinity rule can't be satisfied by any node?</summary>
+<div class="qa-body"><strong>Short answer:</strong> The Pod stays <code>Pending</code> indefinitely until a satisfying node appears.
+<br><strong>Detailed explanation:</strong> The Filter phase eliminates every node that violates the rule; if none remain, the Scheduler has nothing left to bind the Pod to.
+<br><strong>Production example:</strong> A 4th replica of a hostname-anti-affinity-constrained Deployment stayed Pending in a 3-node cluster until a 4th node was added.
+<br><strong>Common mistake:</strong> Setting required per-node anti-affinity on a Deployment whose replica count can exceed the node count.</div></details>
+
+<details class="qa"><summary>9. How would you diagnose a Pod stuck Pending due to anti-affinity?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Run <code>kubectl describe pod</code> and check the Events section for a scheduling failure reason referencing affinity.
+<br><strong>Detailed explanation:</strong> The FailedScheduling event typically states something like "didn't match pod anti-affinity rules," identifying exactly which constraint filtered out every candidate node.
+<br><strong>Production example:</strong> Ops saw "0/5 nodes are available: 3 node(s) didn't match pod anti-affinity rules" and traced it to insufficient node count for the hostname rule.
+<br><strong>Common mistake:</strong> Debugging by checking resource requests first when the real blocker is an affinity/anti-affinity mismatch shown clearly in Events.</div></details>
+
+<details class="qa"><summary>10. Can anti-affinity rules span namespaces, and why does that matter?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Yes, unless scoped — the optional <code>namespaces</code> field on the <code>PodAffinityTerm</code> restricts which namespaces' Pods count toward the selector match.
+<br><strong>Detailed explanation:</strong> Without scoping, a broad labelSelector could match unrelated Pods in other namespaces, causing unexpected scheduling failures.
+<br><strong>Production example:</strong> Two unrelated teams both labeled Pods <code>app=worker</code>; one team's anti-affinity rule accidentally counted the other team's Pods until <code>namespaces</code> was added.
+<br><strong>Common mistake:</strong> Writing a labelSelector broad enough to accidentally match Pods across the whole cluster.</div></details>
+
+<details class="qa"><summary>11–50. Additional rapid-fire questions</summary>
+<div class="qa-body">
+<strong>11.</strong> Does anti-affinity have any runtime effect after a Pod is scheduled? — No, it only affects the initial Filter/Score decision; running Pods are never evicted for violating it.<br>
+<strong>12.</strong> What plugin implements pod anti-affinity in the Scheduler? — The InterPodAffinity plugin, active during both Filter and Score phases.<br>
+<strong>13.</strong> Does kubelet play any role in anti-affinity? — No, by the time a Pod reaches a node the scheduling decision is already final.<br>
+<strong>14.</strong> How is a preferred anti-affinity rule expressed? — Via <code>preferredDuringSchedulingIgnoredDuringExecution</code> with a <code>weight</code> and <code>podAffinityTerm</code>.<br>
+<strong>15.</strong> What does the <code>weight</code> field control in a preferred rule? — Its relative influence versus other preferred terms during the Score phase.<br>
+<strong>16.</strong> Why is anti-affinity described as "computationally more expensive" than node affinity? — It requires querying live Pod placement across the cluster rather than static node metadata.<br>
+<strong>17.</strong> What's a common production use for combining required + preferred anti-affinity? — Hard per-node spread plus soft per-zone spread, layering two topology domains.<br>
+<strong>18.</strong> Can anti-affinity be used to keep two *different* workloads apart? — Yes — e.g. never co-locate an app and its adjacent cache on the same node; this is the use case anti-affinity retains over topology spread constraints.<br>
+<strong>19.</strong> What object stores an anti-affinity rule? — It's persisted as part of the Pod spec (<code>spec.affinity.podAntiAffinity</code>) in etcd, unchanged from what was submitted.<br>
+<strong>20.</strong> Does the API Server validate anti-affinity rules semantically against live nodes? — No, only shape/schema validation; semantic feasibility is entirely the Scheduler's job at scheduling time.<br>
+<strong>21.</strong> What happens during a rolling update if the new replica's anti-affinity can't be satisfied? — The new Pod stays Pending, which can stall the rollout depending on maxUnavailable/maxSurge settings.<br>
+<strong>22.</strong> How do you check which node each replica landed on to verify anti-affinity worked? — <code>kubectl get pods -l app=X -o wide</code> or custom-columns showing NODE.<br>
+<strong>23.</strong> Why is a hard per-node anti-affinity risky for a high-replica-count Deployment in a small cluster? — Replicas can outnumber nodes, leaving some Pods permanently Pending.<br>
+<strong>24.</strong> What field limits which Pods count toward the anti-affinity match? — <code>labelSelector</code> on the <code>podAffinityTerm</code>.<br>
+<strong>25.</strong> Is anti-affinity Pod-spec-level or Deployment-level? — It's set in the Pod template's spec, inherited by every replica the Deployment creates.<br>
+<strong>26.</strong> What's the risk of using an overly broad labelSelector? — It may match unrelated Pods across namespaces, distorting the anti-affinity decision.<br>
+<strong>27.</strong> How does anti-affinity differ conceptually from a taint? — Anti-affinity is a Pod-side rule about other Pods; a taint is a node-side rule that repels any Pod lacking a matching toleration.<br>
+<strong>28.</strong> Why do database StatefulSets commonly use required hostname anti-affinity? — To guarantee no single node failure takes out more than one replica of a low-replica-count, stateful workload.<br>
+<strong>29.</strong> What's the interaction between anti-affinity and node draining? — Draining a node relocates Pods elsewhere; anti-affinity rules are re-evaluated as if the Pod were newly scheduled.<br>
+<strong>30.</strong> Can a preferred anti-affinity rule ever block scheduling? — No — by definition it only affects scoring, never filtering.<br>
+<strong>31.</strong> What log/event message typically indicates an anti-affinity scheduling failure? — Something like "didn't match pod anti-affinity rules" inside the FailedScheduling event.<br>
+<strong>32.</strong> Why should required inter-pod anti-affinity be tested before scaling to very large clusters? — Its evaluation cost scales with cluster size and can measurably increase scheduler latency.<br>
+<strong>33.</strong> How does anti-affinity combine with resource requests during scheduling? — Both are independent Filter-phase checks; a node must pass both to be a valid candidate.<br>
+<strong>34.</strong> What's the danger of relying on anti-affinity alone for "rebalancing" after a scale event? — It never moves already-running Pods, so imbalance introduced before the rule existed persists.<br>
+<strong>35.</strong> Why might anti-affinity and topology spread constraints be combined in one spec? — To get both "never co-locate with X" and "spread my own replicas evenly" simultaneously.<br>
+<strong>36.</strong> What's the effect of setting topologyKey to a custom node label instead of a built-in one? — The Scheduler groups nodes purely by that label's value — any custom domain works as long as nodes are labeled consistently.<br>
+<strong>37.</strong> Does anti-affinity require the CNI or networking layer to do anything? — No, it's purely a Scheduler-side placement decision, unrelated to networking.<br>
+<strong>38.</strong> How would you validate an anti-affinity manifest against the live API schema before applying? — <code>kubectl explain deployment.spec.template.spec.affinity.podAntiAffinity</code>.<br>
+<strong>39.</strong> What's a realistic symptom of forgetting the <code>namespaces</code> scoping field? — Pods stuck Pending because an unrelated namespace's same-labeled Pods are being counted against the rule.<br>
+<strong>40.</strong> Why is "3 replicas that survive a node failure" not automatic in Kubernetes? — Because the default Scheduler objective is efficient packing, not availability, unless an explicit anti-affinity/spread constraint is added.<br>
+<strong>41.</strong> What's the tradeoff of choosing zone-level over node-level anti-affinity? — Zone-level survives node failures within the same zone but not a full zone outage; it also leaves more scheduling flexibility than node-level.<br>
+<strong>42.</strong> Can you mix Equal/In-style matchExpressions in a podAffinityTerm's labelSelector? — Yes, it uses standard Kubernetes label selector matchExpressions syntax (In, NotIn, Exists, DoesNotExist).<br>
+<strong>43.</strong> What's a good way to prove anti-affinity is actually enforced in a running cluster? — Compare each replica's node via custom-columns output and confirm none repeat under a per-node rule.<br>
+<strong>44.</strong> Why does the course callout distinguish "keep me away from X" (anti-affinity) vs "spread evenly" (topology spread)? — Because conflating them leads to picking a scaling-unfriendly tool (anti-affinity) for a problem topology spread solves more cleanly.<br>
+<strong>45.</strong> What happens to anti-affinity rules when a Deployment is scaled down then back up? — Each new Pod re-evaluates the rule fresh against whatever Pods are currently running at that moment.<br>
+<strong>46.</strong> Is there a way to make anti-affinity affect already-running Pods? — Not natively — "IgnoredDuringExecution" is a permanent property of this API today; achieving that requires external tooling (e.g. a descheduler).<br>
+<strong>47.</strong> Why is combining toleration + anti-affinity uncommon compared to combining toleration + node affinity? — Anti-affinity concerns other Pods' placement, not node properties, so it doesn't need a toleration to bypass a taint — they solve different problems entirely.<br>
+<strong>48.</strong> What's the first thing you'd check if Cluster Autoscaler added nodes but a Pod is still Pending? — Whether the new node(s) actually satisfy the Pod's anti-affinity/affinity/taint constraints, not just raw capacity.<br>
+<strong>49.</strong> Why would a platform team standardize on topology spread constraints as the default and reserve anti-affinity for exceptions? — Lower Scheduler overhead and quantifiable balance at scale, keeping anti-affinity only for genuine cross-workload exclusion rules.<br>
+<strong>50.</strong> What's the key interview-ready one-liner distinguishing all three spreading tools? — Node affinity = attract to nodes; anti-affinity = repel from other Pods; topology spread constraints = quantifiably balance a Deployment's own replicas.
+</div></details>
+
+<footer class="course-footer">Next up: Topic 33 — Taints, the flip side of scheduling repulsion applied at the node level.</footer>
+
+<script>
+  mermaid.initialize({ startOnLoad: true, theme: 'dark' });
+</script>
+
+</body>
+</html>

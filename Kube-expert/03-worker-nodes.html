@@ -1,0 +1,272 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Topic 3: Worker Nodes — Kubernetes Expert Course</title>
+<link rel="stylesheet" href="styles.css">
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+</head>
+<body>
+
+<header class="course-header">
+  <div class="kicker">Topic 3 of 70</div>
+  <h1>Worker Nodes</h1>
+  <div class="subtitle">Where containers actually run: kubelet, kube-proxy, and the container runtime working together on every machine.</div>
+</header>
+
+<nav class="topic-nav">
+  <a href="02-control-plane.html">&larr; Control Plane</a>
+  <a href="index.html">Course Index</a>
+  <a href="04-api-server.html">API Server &rarr;</a>
+</nav>
+
+<h2 id="explanation">Explanation</h2>
+<p>A worker node is any machine (VM or bare metal) that runs your actual workloads. Every worker node runs the same
+trio of agents: <strong>kubelet</strong> (the node agent that starts/stops containers and reports status),
+<strong>kube-proxy</strong> (programs node-local networking rules for Services), and a <strong>container runtime</strong>
+(containerd or CRI-O, which actually creates namespaces/cgroups and runs the container process). None of these talk
+to each other directly except through well-defined interfaces — kubelet drives the runtime via the CRI (Container
+Runtime Interface) gRPC API, and drives networking setup via the CNI (Container Network Interface) plugin.</p>
+
+<p>Kubernetes needs this layer because the control plane only stores <em>intent</em> — nothing runs until some agent
+on a physical machine turns that intent into a real Linux process. Splitting "decide what to run" (control plane) from
+"actually run it" (worker node) is what allows the cluster to scale to thousands of machines: the control plane never
+needs to know how to start a container, it only needs to write "Pod X belongs on Node Y" and trust that Node Y's
+kubelet will do the rest.</p>
+
+<p>Each worker node registers itself with the API Server as a <code>Node</code> object, advertising its capacity (CPU,
+memory, pods) and allocatable resources (capacity minus reserved system/kube overhead). The Scheduler reads this Node
+object when deciding placement. The node then sends periodic heartbeats — if these stop, the Node Controller (part of
+Controller Manager) marks it <code>NotReady</code> and eventually evicts its Pods for rescheduling elsewhere.</p>
+
+<p>In production, worker nodes are typically organized into node pools/groups with different instance types (e.g. a
+general-purpose pool and a GPU pool), scaled by a cluster autoscaler that adds/removes whole nodes based on pending
+Pod pressure. Because kubelet, kube-proxy, and the runtime run as systemd services or static processes (not
+Kubernetes-managed Pods themselves, in most distros), node-level upgrades typically mean cordoning, draining, and
+replacing the node's OS image rather than in-place patching.</p>
+
+<p>The health and correct configuration of these three agents is the single biggest source of "why is my pod stuck /
+slow / unreachable" production incidents — more so than control-plane issues in most clusters, simply because there
+are far more worker nodes than control-plane nodes and each one is an independent point of failure.</p>
+
+<h2 id="internal-working">Internal Working / Interactions</h2>
+<ul>
+  <li><strong>kubelet &harr; API Server:</strong> watches for Pods bound to its node name; posts Node status/heartbeats every ~10s (configurable via <code>--node-status-update-frequency</code>).</li>
+  <li><strong>kubelet &harr; Container Runtime:</strong> talks over the CRI gRPC socket (<code>/run/containerd/containerd.sock</code>) to create/stop containers and pull images.</li>
+  <li><strong>kubelet &harr; CNI plugin:</strong> invokes the CNI binary to set up the Pod's network namespace and assign an IP.</li>
+  <li><strong>kube-proxy &harr; API Server:</strong> watches Services/EndpointSlices, translates them into iptables/IPVS rules on the local node.</li>
+  <li><strong>Node Controller (control plane) &harr; kubelet:</strong> monitors heartbeats; marks Node <code>NotReady</code> and triggers Pod eviction after the configured timeout if heartbeats stop.</li>
+</ul>
+
+<h2 id="architecture-diagram">Architecture Diagram</h2>
+<pre class="mermaid">
+flowchart TB
+    API["API Server"]
+    subgraph Node["Worker Node"]
+        KL["kubelet"]
+        KP["kube-proxy"]
+        CNI["CNI plugin"]
+        CRI["Container Runtime (containerd)"]
+        P1["Pod A"]
+        P2["Pod B"]
+    end
+    API <-->|watch Pods bound to this node| KL
+    API <-->|watch Services/EndpointSlices| KP
+    KL -->|CRI gRPC| CRI
+    KL -->|invoke| CNI
+    CRI --> P1
+    CRI --> P2
+    KP -->|iptables/IPVS rules| P1
+    KP -->|iptables/IPVS rules| P2
+    KL -->|heartbeat + status| API
+</pre>
+
+<pre class="mermaid">
+sequenceDiagram
+    participant KL as kubelet
+    participant A as API Server
+    participant CR as Container Runtime
+    loop Every ~10s
+        KL->>A: Node heartbeat (status, capacity, conditions)
+    end
+    A->>KL: Watch event: new Pod bound to this node
+    KL->>CR: RunPodSandbox (CRI)
+    CR-->>KL: Sandbox ready
+    KL->>CR: PullImage + CreateContainer + StartContainer
+    CR-->>KL: Container running
+    KL->>A: Update Pod status = Running, Ready
+</pre>
+
+<h2 id="code-example">Code Example</h2>
+<pre><code># kubelet systemd unit config — a real worker node has no "Node YAML" to apply;
+# node registration/config is driven by kubelet's own startup flags/config file.
+# /var/lib/kubelet/config.yaml
+apiVersion: kubelet.config.k8s.io/v1beta1
+kind: KubeletConfiguration
+address: 0.0.0.0
+authentication:
+  anonymous:
+    enabled: false            # disallow unauthenticated API calls to kubelet itself
+  webhook:
+    enabled: true             # delegate authn/authz decisions to the API Server
+clusterDNS:
+  - 10.96.0.10                # CoreDNS ClusterIP, injected into every Pod's resolv.conf
+clusterDomain: cluster.local
+maxPods: 110                  # hard cap on pods this node will accept (affects allocatable calc)
+evictionHard:
+  memory.available: "200Mi"   # kubelet proactively evicts pods before the node truly OOMs
+  nodefs.available: "10%"
+cgroupDriver: systemd         # MUST match the container runtime's cgroup driver, a classic mismatch bug
+</code></pre>
+
+<h2 id="kubectl-commands">kubectl Commands</h2>
+<pre><code># List all nodes with role, version, internal/external IP
+kubectl get nodes -o wide
+
+# Inspect one node's capacity, allocatable resources, and conditions
+kubectl describe node worker-3
+
+# See what's actually running on a given node
+kubectl get pods -A --field-selector spec.nodeName=worker-3
+
+# Safely take a node out of scheduling for maintenance
+kubectl cordon worker-3
+kubectl drain worker-3 --ignore-daemonsets --delete-emptydir-data
+kubectl uncordon worker-3
+
+# Check kubelet version reported by each node (skew vs API Server)
+kubectl get nodes -o custom-columns=NAME:.metadata.name,KUBELET:.status.nodeInfo.kubeletVersion
+</code></pre>
+
+<h2 id="best-practices">Best Practices &amp; Common Pitfalls</h2>
+<div class="grid-2">
+<div>
+<h4>Best Practices</h4>
+<ul>
+  <li>Match kubelet and container-runtime cgroup driver (<code>systemd</code> on modern distros) to avoid silent instability.</li>
+  <li>Set <code>maxPods</code> and reserve CPU/memory for system daemons (<code>--system-reserved</code>, <code>--kube-reserved</code>).</li>
+  <li>Always cordon + drain before maintenance rather than force-terminating a node.</li>
+  <li>Spread nodes across availability zones and use topology spread constraints for real resilience.</li>
+</ul>
+</div>
+<div>
+<h4>Pitfalls</h4>
+<ul>
+  <li>Letting kubelet and runtime versions drift out of the supported skew window.</li>
+  <li>Ignoring disk pressure — a full node-fs triggers aggressive, disruptive eviction.</li>
+  <li>Assuming a NotReady node instantly reschedules Pods — there's a default eviction grace period (~5 min).</li>
+  <li>Running workloads directly on control-plane nodes in self-managed clusters.</li>
+</ul>
+</div>
+</div>
+
+<h2 id="interview-questions">50 Interview Questions</h2>
+
+<details class="qa"><summary>1. What three agents run on every worker node and what does each do?</summary>
+<div class="qa-body"><strong>Short answer:</strong> kubelet (node agent), kube-proxy (networking rules), and a container runtime (containerd/CRI-O).
+<br><strong>Detailed explanation:</strong> kubelet starts/stops containers and reports status; kube-proxy programs iptables/IPVS rules for Services; the container runtime creates namespaces/cgroups and runs the actual process. None talk to each other directly — kubelet drives the runtime via CRI and networking via CNI.
+<br><strong>Production example:</strong> Diagnosing a "Pod stuck Pending on this node" issue means checking kubelet logs; diagnosing "Service unreachable" means checking kube-proxy rules instead.
+<br><strong>Common mistake:</strong> Assuming kube-proxy or the runtime can independently decide what runs — only kubelet decides that, driven by the API Server.</div></details>
+
+<details class="qa"><summary>2. Why does the control plane never need to know how to start a container?</summary>
+<div class="qa-body"><strong>Short answer:</strong> That responsibility is entirely delegated to worker-node kubelets, keeping the control plane's job limited to writing intent.
+<br><strong>Detailed explanation:</strong> The control plane only writes "Pod X belongs on Node Y" to etcd; kubelet on Node Y independently notices this and does all the real work. This split is what lets the cluster scale to thousands of machines without the control plane becoming a bottleneck.
+<br><strong>Production example:</strong> Scheduler binds a Pod in milliseconds regardless of how long the image pull or container startup takes afterward — those are fully decoupled.
+<br><strong>Common mistake:</strong> Believing the Scheduler or API Server "creates" the container — they only ever record a decision.</div></details>
+
+<details class="qa"><summary>3. How does a Node register itself and what does the Scheduler read from it?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Each worker node registers as a <code>Node</code> object advertising capacity and allocatable resources.
+<br><strong>Detailed explanation:</strong> Allocatable resources are capacity minus reserved system/kube overhead (<code>--system-reserved</code>/<code>--kube-reserved</code>); the Scheduler reads this Node object during filtering/scoring to decide if a Pod fits.
+<br><strong>Production example:</strong> <code>kubectl describe node worker-3</code> shows both Capacity and Allocatable — the Scheduler only reasons about the latter.
+<br><strong>Common mistake:</strong> Forgetting reserved resources exist and being surprised the node has less schedulable capacity than raw hardware specs suggest.</div></details>
+
+<details class="qa"><summary>4. What happens when a node stops sending heartbeats?</summary>
+<div class="qa-body"><strong>Short answer:</strong> The Node Controller marks it <code>NotReady</code> and eventually evicts its Pods for rescheduling elsewhere.
+<br><strong>Detailed explanation:</strong> kubelet posts heartbeats roughly every 10s (<code>--node-status-update-frequency</code>); after a grace period with no heartbeat, Node Controller applies a <code>NoExecute</code> taint and, after the pod-eviction-timeout, evicts Pods lacking a matching toleration.
+<br><strong>Production example:</strong> A network partition between a worker node and the control plane shows as NotReady within ~40s, with eviction following after ~5 minutes by default.
+<br><strong>Common mistake:</strong> Expecting instant rescheduling the moment a node goes NotReady — there's a deliberate grace period to avoid overreacting to transient blips.</div></details>
+
+<details class="qa"><summary>5. Why must kubelet's cgroup driver match the container runtime's exactly?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Both must manage the same cgroup hierarchy consistently, or resource enforcement becomes unstable.
+<br><strong>Detailed explanation:</strong> kubelet's <code>cgroupDriver: systemd</code> setting must match containerd's <code>SystemdCgroup = true</code> option — a mismatch causes subtle, hard-to-diagnose instability (double cgroup hierarchies, resource limits not applied correctly).
+<br><strong>Production example:</strong> After migrating from cgroup v1 to v2, forgetting to align both configs causes containers to silently ignore CPU/memory limits.
+<br><strong>Common mistake:</strong> Changing one side (e.g. upgrading the runtime) without verifying the other still matches.</div></details>
+
+<details class="qa"><summary>6. What is <code>maxPods</code> and why does it matter for allocatable calculation?</summary>
+<div class="qa-body"><strong>Short answer:</strong> A hard cap on how many Pods a node will accept, which factors into how the Scheduler and cluster-autoscaler reason about node capacity.
+<br><strong>Detailed explanation:</strong> Even if CPU/memory technically allow more Pods, kubelet refuses to exceed <code>maxPods</code> (default 110). This is especially relevant on cloud nodes where IP-per-Pod networking (e.g. AWS VPC CNI) further constrains real Pod density below the default.
+<br><strong>Production example:</strong> An EKS node type with limited ENI/IP capacity hitting its practical Pod limit well before <code>maxPods</code> or CPU/memory limits are reached.
+<br><strong>Common mistake:</strong> Sizing nodes purely by CPU/memory and being surprised Pods won't schedule due to the Pod-count or IP-address ceiling.</div></details>
+
+<details class="qa"><summary>7. Why is cordon + drain the correct way to take a node out of service?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Cordon stops new scheduling; drain gracefully evicts existing Pods, respecting PodDisruptionBudgets and graceful termination.
+<br><strong>Detailed explanation:</strong> <code>kubectl cordon</code> marks the node unschedulable without touching running Pods; <code>kubectl drain --ignore-daemonsets --delete-emptydir-data</code> then evicts Pods one by one, letting controllers reschedule them elsewhere safely.
+<br><strong>Production example:</strong> Rolling OS-image upgrades across a node pool: cordon, drain, replace, uncordon, one node at a time.
+<br><strong>Common mistake:</strong> Force-terminating or deleting a node directly instead of draining first, causing ungraceful Pod termination and potential PDB violations.</div></details>
+
+<details class="qa"><summary>8. Why are node-level upgrades typically "replace the node" rather than "patch in place"?</summary>
+<div class="qa-body"><strong>Short answer:</strong> kubelet, kube-proxy, and the runtime run as systemd services/host processes, not Kubernetes-managed Pods, so in-place upgrades are harder to automate safely at scale.
+<br><strong>Detailed explanation:</strong> Cloud node pools typically use immutable machine images — a new node image with upgraded components is rolled out, and old nodes are cordoned/drained/terminated rather than patched live.
+<br><strong>Production example:</strong> EKS managed node groups perform "replace" upgrades: new nodes join with the new AMI, old nodes drain and terminate.
+<br><strong>Common mistake:</strong> Trying to live-upgrade kubelet via config management across a fleet instead of using the cordon-drain-replace pattern, risking partial, inconsistent states.</div></details>
+
+<details class="qa"><summary>9. Why do worker-node issues cause more production incidents than control-plane issues in most clusters?</summary>
+<div class="qa-body"><strong>Short answer:</strong> There are far more worker nodes than control-plane nodes, and each is an independent point of failure.
+<br><strong>Detailed explanation:</strong> Misconfiguration of any single node's kubelet, kube-proxy, or runtime (cgroup mismatch, disk pressure, PLEG issues) only affects that node's Pods, but such issues are individually far more numerous and varied than centralized control-plane failures.
+<br><strong>Production example:</strong> A single node hitting disk pressure triggers aggressive local eviction, disrupting only Pods scheduled there.
+<br><strong>Common mistake:</strong> Focusing all monitoring effort on control-plane health while under-monitoring per-node kubelet/runtime health.</div></details>
+
+<details class="qa"><summary>10–50. Additional rapid-fire questions</summary>
+<div class="qa-body">
+<strong>10.</strong> What interface does kubelet use to talk to the container runtime? — CRI (Container Runtime Interface), a gRPC API.<br>
+<strong>11.</strong> What interface does kubelet use to set up Pod networking? — CNI (Container Network Interface) plugins.<br>
+<strong>12.</strong> What's the default node heartbeat interval? — Roughly every 10 seconds, configurable via <code>--node-status-update-frequency</code>.<br>
+<strong>13.</strong> What's the difference between Capacity and Allocatable on a Node? — Capacity is total hardware resources; Allocatable is Capacity minus reserved system/kube overhead, which the Scheduler actually uses.<br>
+<strong>14.</strong> Which component evicts Pods off a NotReady node? — The Node Controller, part of the Controller Manager.<br>
+<strong>15.</strong> Why does kube-proxy run on every node instead of centrally? — Routing decisions must be applied inline per-packet at line rate, which a centralized service can't do fast enough.<br>
+<strong>16.</strong> What's the danger of ignoring disk pressure on a node? — kubelet triggers aggressive, disruptive eviction of Pods to reclaim space once <code>nodefs.available</code> thresholds are breached.<br>
+<strong>17.</strong> How do you check a node's kubelet version vs the API Server's? — <code>kubectl get nodes -o custom-columns=...KUBELET:.status.nodeInfo.kubeletVersion</code> compared against <code>kubectl version</code>.<br>
+<strong>18.</strong> What's a node pool/group used for? — Grouping nodes by instance type/purpose (e.g. general-purpose vs GPU) so different workloads land on appropriately-provisioned hardware.<br>
+<strong>19.</strong> Why does the cluster-autoscaler add/remove whole nodes rather than resize existing ones? — Cloud instances aren't elastically resizable in place at the speed needed; adding/removing whole nodes based on pending-Pod pressure is the practical mechanism.<br>
+<strong>20.</strong> What does <code>evictionHard: memory.available: "200Mi"</code> do? — Proactively evicts Pods once available memory drops below 200Mi, before the node truly OOMs.<br>
+<strong>21.</strong> Why should you avoid running workloads on control-plane nodes in self-managed clusters? — Security isolation and to avoid noisy-neighbor resource contention affecting etcd/API Server.<br>
+<strong>22.</strong> What's the risk of letting kubelet and runtime versions drift out of supported skew? — Undefined or broken behavior in CRI calls, subtle bugs that are hard to reproduce and diagnose.<br>
+<strong>23.</strong> How do topology spread constraints relate to worker nodes? — They instruct the Scheduler to spread Pods across node failure domains (zones) rather than clustering them for real resilience.<br>
+<strong>24.</strong> What field on the Pod tells you which worker node it's running on? — <code>spec.nodeName</code>, set once by the Scheduler and never changed afterward.<br>
+<strong>25.</strong> Why can't a Pod be "moved" to another node? — Pods are bound permanently once scheduled; a controller creates an entirely new Pod object elsewhere if the original dies.<br>
+<strong>26.</strong> What's the purpose of <code>--kube-reserved</code>? — Reserves resources for Kubernetes system daemons (kubelet, kube-proxy) so they aren't starved by user workloads.<br>
+<strong>27.</strong> How does kubelet find out a Pod is assigned to its node? — It watches the API Server for Pods with <code>spec.nodeName</code> matching its own node name.<br>
+<strong>28.</strong> What is the practical effect of a full node filesystem? — Aggressive Pod eviction and potential inability to pull new images or write container logs.<br>
+<strong>29.</strong> Why is <code>--ignore-daemonsets</code> needed during drain? — DaemonSet Pods are meant to run on every node including this one; drain would otherwise fail trying to evict Pods that will just be recreated.<br>
+<strong>30.</strong> What's a symptom that a worker node's kube-proxy is misconfigured? — Services resolve/route inconsistently or not at all from Pods on that specific node, while other nodes work fine.<br>
+<strong>31.</strong> How would you find all Pods currently running on a specific node? — <code>kubectl get pods -A --field-selector spec.nodeName=worker-3</code>.<br>
+<strong>32.</strong> What does it mean that kubelet, kube-proxy, and the runtime are "not Kubernetes-managed Pods"? — They typically run as systemd services or host processes bootstrapping the node itself, not objects the Scheduler places.<br>
+<strong>33.</strong> Why might a Pod become stuck in ContainerCreating on a specific node? — Often CNI plugin failures, image pull issues, or CRI socket problems local to that node's runtime.<br>
+<strong>34.</strong> What's the relationship between Node conditions and taints? — Certain conditions (e.g. MemoryPressure, DiskPressure) can automatically apply corresponding taints that repel new scheduling.<br>
+<strong>35.</strong> Why is worker-node capacity planning about more than raw CPU/memory? — Pod density is also limited by <code>maxPods</code>, IP address availability (CNI), and reserved resources.<br>
+<strong>36.</strong> What's the value of spreading worker nodes across availability zones? — Tolerates an entire AZ failure without losing all capacity, assuming topology spread constraints are also used.<br>
+<strong>37.</strong> How does a worker node's kubelet contribute to cluster-wide DNS resolution? — It injects the configured <code>clusterDNS</code> IP (CoreDNS ClusterIP) into every Pod's <code>resolv.conf</code> on that node.<br>
+<strong>38.</strong> What's the risk of uncordoning a node too early after maintenance? — New Pods may schedule onto it before the underlying issue is confirmed fixed, causing repeat failures.<br>
+<strong>39.</strong> Why does a NotReady node not instantly lose all its Pods? — There's a default eviction grace period (pod-eviction-timeout, ~5 min) to tolerate transient network blips without unnecessary reschedule storms.<br>
+<strong>40.</strong> What tool would you use to debug the container runtime directly on a worker node, bypassing kubectl? — <code>crictl</code>, the CRI-level CLI.<br>
+<strong>41.</strong> Why is per-node monitoring of kubelet resource usage important? — A starved kubelet delays every Pod lifecycle operation (start, probe, status report) on that entire node.<br>
+<strong>42.</strong> What's a common root cause when only one node in a cluster has slow Pod startup? — Local image pull bottlenecks, disk I/O contention, or that node's specific runtime/CNI misconfiguration.<br>
+<strong>43.</strong> Why does the Scheduler need up-to-date Node objects, not stale ones? — Placing a Pod based on stale capacity data risks overcommitting a node that's actually already full.<br>
+<strong>44.</strong> What's the effect of setting <code>maxPods</code> too low on a large-capacity node? — Wastes CPU/memory capacity because the Pod-count ceiling is hit before resource limits are.<br>
+<strong>45.</strong> How does worker-node design support horizontal scalability of the whole cluster? — Adding more worker nodes linearly adds capacity without any control-plane component needing to know how containers actually run.<br>
+<strong>46.</strong> What's a good first troubleshooting step for "Pod runs fine on some nodes but not others"? — Compare kubelet/runtime versions and cgroup driver configuration across the affected nodes.<br>
+<strong>47.</strong> Why should GPU workloads typically run in a separate node pool? — Different hardware/driver requirements and cost profile than general-purpose nodes, and to avoid GPU nodes being wasted on non-GPU workloads.<br>
+<strong>48.</strong> What happens to DaemonSet Pods during a drain? — By default drain would try to evict them too; <code>--ignore-daemonsets</code> skips them since they'll simply be recreated by their controller.<br>
+<strong>49.</strong> Why is "kubectl describe node" often the first command in node troubleshooting? — It surfaces Capacity/Allocatable, Conditions, Taints, and recent Events in one place, covering most common node-level failure signatures.<br>
+<strong>50.</strong> What's the risk of scaling worker nodes without adjusting cluster-autoscaler settings? — Manual node additions/removals can conflict with autoscaler decisions, causing thrash or nodes being removed unexpectedly.
+</div></details>
+
+<footer class="course-footer">Next: Topic 4 — API Server, the front door every one of these agents talks through.</footer>
+
+<script>
+  mermaid.initialize({ startOnLoad: true, theme: 'dark' });
+</script>
+
+</body>
+</html>

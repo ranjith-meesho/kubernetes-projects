@@ -1,0 +1,279 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Topic 49: Argo CD — Kubernetes Expert Course</title>
+<link rel="stylesheet" href="styles.css">
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+</head>
+<body>
+
+<header class="course-header">
+  <div class="kicker">Topic 49 of 70</div>
+  <h1>Argo CD</h1>
+  <div class="subtitle">A CNCF GitOps controller: the Application CRD, continuous sync/self-heal, and the App-of-Apps pattern.</div>
+</header>
+
+<nav class="topic-nav">
+  <a href="48-gitops.html">&larr; GitOps</a>
+  <a href="index.html">Course Index</a>
+  <a href="50-observability.html">Observability &rarr;</a>
+</nav>
+
+<h2 id="explanation">Explanation</h2>
+
+<p><strong>Argo CD</strong> is the most widely adopted implementation of the GitOps pattern (Topic 48) for
+Kubernetes — it is itself a Kubernetes-native controller, installed as a set of Pods in your cluster, that watches
+its own CRD, <code>Application</code>, and continuously reconciles a target cluster/namespace to match a given Git
+path. Where the previous topic described GitOps conceptually, Argo CD is the concrete, production-grade tool most
+teams reach for to implement it.</p>
+
+<p>An <code>Application</code> object declares three things: a <strong>source</strong> (Git repo + path + revision,
+optionally a Helm chart or Kustomize overlay), a <strong>destination</strong> (which cluster and namespace to deploy
+into — Argo CD can manage many clusters from one control instance), and a <strong>sync policy</strong> (manual, or
+automated with optional self-heal and pruning). Argo CD's core loop continuously renders the source, compares it
+against the live destination via the API Server, and reports a <code>SyncStatus</code> (<code>Synced</code> /
+<code>OutOfSync</code>) plus a <code>HealthStatus</code> (aggregated from each resource's own health — e.g. a
+Deployment is "Healthy" once its rollout completes and Pods are Ready).</p>
+
+<p>With <strong>automated sync</strong> enabled, Argo CD applies any detected diff without human intervention;
+<strong>self-heal</strong> goes further and actively reverts manual out-of-band changes (like a rogue
+<code>kubectl edit</code>) back to what Git specifies, closing the drift gap discussed in the GitOps topic. Manual
+sync mode instead just surfaces <code>OutOfSync</code> and waits for a human (or a promotion pipeline) to click
+"Sync" — commonly used for production environments where a deliberate approval gate is wanted even though the
+desired state is already in Git.</p>
+
+<p>The <strong>App-of-Apps pattern</strong> solves the "how do I manage a whole platform's worth of Applications,
+not just one" problem: a parent <code>Application</code> object's source is itself a Git directory containing many
+child <code>Application</code> manifests. Applying the parent causes Argo CD to create/reconcile all the children —
+this is how platform teams manage dozens or hundreds of Applications (one per microservice, or one per
+tenant/environment) declaratively, using the exact same CRD recursively, rather than clicking through a UI or
+scripting <code>argocd app create</code> calls.</p>
+
+<p>Argo CD's comparison of "desired (Git)" vs "live (cluster)" is continuous and visible — its UI/CLI literally shows
+a diff per resource, which is a major operational advantage over CI-push deployment: at any moment, anyone can see
+exactly what's out of sync and why, rather than trusting that the last pipeline run "probably worked."</p>
+
+<h2 id="internal-working">Internal Working / Interactions</h2>
+<ul>
+  <li><strong>repo-server component:</strong> clones the Git repo and renders manifests (plain YAML, Helm, Kustomize, or plugin-based) into final Kubernetes objects.</li>
+  <li><strong>application-controller component:</strong> the actual reconciliation loop — diffs rendered manifests against live cluster state via the API Server, computes SyncStatus/HealthStatus, and applies changes per the Application's sync policy.</li>
+  <li><strong>API Server (target cluster):</strong> receives Argo CD's apply calls via a ServiceAccount/cluster-credential scoped to what that Application is allowed to manage.</li>
+  <li><strong>argocd-server (API/UI):</strong> exposes the CLI/UI/API for humans and automation to inspect Applications and trigger manual syncs.</li>
+  <li><strong>Notifications/webhooks:</strong> Argo CD can push Slack/webhook notifications on sync state changes, and can be triggered immediately on Git push via a repo webhook instead of waiting for the poll interval.</li>
+</ul>
+
+<h2 id="architecture-diagram">Architecture Diagram</h2>
+<pre class="mermaid">
+flowchart TB
+    Git["Git repo\n(App-of-Apps: apps/*.yaml)"]
+    Parent["Parent Application\n(App-of-Apps root)"]
+    Child1["Application: checkout-service"]
+    Child2["Application: catalog-service"]
+    RepoSrv["repo-server\n(renders manifests)"]
+    AppCtrl["application-controller\n(diff + sync loop)"]
+    API["Target Cluster API Server"]
+
+    Git --> Parent
+    Parent -->|creates| Child1
+    Parent -->|creates| Child2
+    Child1 --> RepoSrv
+    Child2 --> RepoSrv
+    RepoSrv --> AppCtrl
+    AppCtrl -->|"compare live vs desired"| API
+    AppCtrl -->|"apply diff (if auto-sync)"| API
+    API -->|status| AppCtrl
+</pre>
+
+<h2 id="code-example">Code Example</h2>
+<pre><code># 1. A standard Argo CD Application — one microservice deployed from a Kustomize overlay
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: checkout-service
+  namespace: argocd
+spec:
+  project: payments
+  source:
+    repoURL: https://github.com/meesho/infra-gitops.git
+    targetRevision: main
+    path: apps/checkout-service/overlays/prod
+  destination:
+    server: https://kubernetes.default.svc   # In-cluster; could also be a remote cluster's API URL.
+    namespace: payments-prod
+  syncPolicy:
+    automated:
+      prune: true       # Delete resources removed from Git.
+      selfHeal: true     # Revert manual out-of-band changes back to Git's desired state.
+    syncOptions:
+      - CreateNamespace=true
+---
+# 2. App-of-Apps root — one Application whose "source" is a directory of other Application manifests
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: platform-root
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/meesho/infra-gitops.git
+    targetRevision: main
+    path: apps/                # Directory containing checkout-service.yaml, catalog-service.yaml, etc.
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argocd
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+</code></pre>
+
+<h2 id="kubectl-commands">kubectl Commands</h2>
+<pre><code>argocd app list                                  # List all managed Applications and their Sync/Health status
+argocd app get checkout-service                    # Detailed status + per-resource diff for one Application
+argocd app sync checkout-service                    # Manually trigger a sync (for manual sync-policy Applications)
+argocd app diff checkout-service                    # Show exactly what differs between Git and the live cluster
+argocd app history checkout-service                  # List past sync revisions (for rollback)
+argocd app rollback checkout-service 4               # Roll back to a previous synced revision
+kubectl get applications -n argocd                    # Applications are just CRs — inspect them with plain kubectl too
+kubectl describe application checkout-service -n argocd  # See conditions/events straight from the API Server
+</code></pre>
+
+<h2 id="best-practices">Best Practices &amp; Common Pitfalls</h2>
+<div class="grid-2">
+<div>
+<h4>Best Practices</h4>
+<ul>
+  <li>Use App-of-Apps to manage fleets of Applications declaratively instead of manual <code>argocd app create</code> scripting.</li>
+  <li>Enable <code>selfHeal</code> in production so drift is actively corrected, not just flagged.</li>
+  <li>Scope each Application to an ArgoCD <code>AppProject</code> restricting which repos/destinations/resource kinds it may touch.</li>
+  <li>Use manual sync + required approvals for the highest-risk production Applications if a human gate is desired.</li>
+</ul>
+</div>
+<div>
+<h4>Pitfalls</h4>
+<ul>
+  <li>Enabling <code>prune: true</code> without understanding it will delete cluster resources no longer present in Git — dangerous on shared namespaces.</li>
+  <li>Granting Argo CD's ServiceAccount cluster-admin across every managed cluster instead of least-privilege per AppProject.</li>
+  <li>Ignoring persistently <code>OutOfSync</code> Applications — it usually means either drift is happening or the rendered manifests are non-deterministic.</li>
+  <li>Storing Helm values with plaintext secrets referenced by an Application's source — pair with Sealed Secrets/external-secrets.</li>
+</ul>
+</div>
+</div>
+
+<h2 id="interview-questions">50 Interview Questions</h2>
+
+<details class="qa"><summary>1. What three things does an Argo CD Application object declare?</summary>
+<div class="qa-body"><strong>Short answer:</strong> A source (Git repo/path/revision or chart), a destination (target cluster and namespace), and a sync policy (manual or automated with self-heal/prune options).
+<br><strong>Detail:</strong> These three fields fully describe "this Git path should be reconciled into this cluster/namespace," which is the entire contract an Application represents — Argo CD is itself just a controller reconciling instances of this one CRD.
+<br><strong>Production example:</strong> An Application named checkout-service pointing at apps/checkout-service/overlays/prod, targeting the payments-prod namespace with automated sync and selfHeal enabled.
+<br><strong>Common mistake:</strong> Assuming the Application object is just configuration metadata rather than the actual object Argo CD's controller watches and reconciles like any CR.</div></details>
+
+<details class="qa"><summary>2. What's the difference between SyncStatus and HealthStatus on an Application?</summary>
+<div class="qa-body"><strong>Short answer:</strong> SyncStatus (Synced/OutOfSync) reflects whether live state matches Git; HealthStatus reflects whether the deployed resources are actually functioning correctly.
+<br><strong>Detail:</strong> A Deployment can be Synced (exactly what Git says) yet still Degraded in health if its Pods are crash-looping — the two statuses are orthogonal and both need to be green for a truly healthy deployment.
+<br><strong>Production example:</strong> An Application showing Synced but Progressing/Degraded health while a new rollout's Pods are still becoming Ready.
+<br><strong>Common mistake:</strong> Only checking SyncStatus and assuming "Synced" means the application is actually working correctly.</div></details>
+
+<details class="qa"><summary>3. What's the difference between automated sync and self-heal?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Automated sync applies any detected diff without human intervention; self-heal goes further and actively reverts manual out-of-band changes back to Git's desired state.
+<br><strong>Detail:</strong> You can have automated sync without self-heal (new Git changes auto-apply, but manual kubectl edits are only flagged, not reverted) — self-heal is the stricter setting that actively fights drift from any source.
+<br><strong>Production example:</strong> selfHeal: true reverting a rogue `kubectl scale` back to the replica count declared in Git within one reconcile cycle.
+<br><strong>Common mistake:</strong> Assuming automated: {} alone (without selfHeal: true) will revert manual cluster edits — it won't, it only handles new Git-driven changes.</div></details>
+
+<details class="qa"><summary>4. What problem does the App-of-Apps pattern solve?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Managing fleets of many Applications declaratively — a parent Application's source is itself a directory of child Application manifests.
+<br><strong>Detail:</strong> Applying the parent causes Argo CD to create/reconcile all the children, letting platform teams manage dozens or hundreds of Applications the same declarative way, using the same CRD recursively, rather than scripting `argocd app create` calls.
+<br><strong>Production example:</strong> A platform-root Application whose source path is apps/, containing checkout-service.yaml and catalog-service.yaml as child Application manifests.
+<br><strong>Common mistake:</strong> Manually creating dozens of individual Applications via the UI/CLI instead of composing them declaratively through a parent App-of-Apps.</div></details>
+
+<details class="qa"><summary>5. What do the repo-server and application-controller components each do?</summary>
+<div class="qa-body"><strong>Short answer:</strong> repo-server clones Git and renders manifests (Helm/Kustomize/plain YAML); application-controller performs the actual diff-and-sync reconciliation loop.
+<br><strong>Detail:</strong> This separation means rendering (potentially expensive, template-heavy work) is isolated from the core reconciliation logic that computes SyncStatus/HealthStatus and applies changes per the sync policy.
+<br><strong>Production example:</strong> repo-server rendering a Helm chart's templates, then application-controller diffing the rendered output against the live cluster via the target API Server.
+<br><strong>Common mistake:</strong> Debugging a stuck sync by only checking application-controller logs when the actual failure is in repo-server's manifest rendering.</div></details>
+
+<details class="qa"><summary>6. What's the risk of enabling prune: true on an Application's sync policy?</summary>
+<div class="qa-body"><strong>Short answer:</strong> It deletes any cluster resource no longer present in Git, which can be dangerous on shared namespaces if something was created outside of Argo CD's management.
+<br><strong>Detail:</strong> Prune makes Git a truly exhaustive source of truth — anything not declared there for that Application gets removed, so shared namespaces need careful scoping to avoid accidentally deleting resources another team or process manages.
+<br><strong>Production example:</strong> Enabling prune on an Application scoped too broadly accidentally deletes a manually-created debugging ConfigMap another team relied on.
+<br><strong>Common mistake:</strong> Enabling prune: true without first confirming exactly what resources the Application's manifests currently include versus what actually exists live in that namespace.</div></details>
+
+<details class="qa"><summary>7. Why might a team choose manual sync mode for a production environment even though Git already has the desired state?</summary>
+<div class="qa-body"><strong>Short answer:</strong> To keep a deliberate human approval gate before changes are actually applied, even though what would be applied is already fully declared and reviewed in Git.
+<br><strong>Detail:</strong> Manual sync surfaces OutOfSync and waits for a human (or a promotion pipeline) to click "Sync" — useful when teams want a final go/no-go moment distinct from the PR merge itself, e.g. coordinating with a release window.
+<br><strong>Production example:</strong> A prod Application using manual sync so a release manager can trigger the actual deploy at a scheduled maintenance window, independent of when the PR merged.
+<br><strong>Common mistake:</strong> Assuming manual sync mode means the change isn't "GitOps compliant" — it still tracks Git as the source of truth, it just adds an explicit apply gate.</div></details>
+
+<details class="qa"><summary>8. What's the purpose of an AppProject in Argo CD?</summary>
+<div class="qa-body"><strong>Short answer:</strong> It scopes which repos, destinations, and resource kinds an Application (or group of Applications) is allowed to use, providing multi-tenant guardrails.
+<br><strong>Detail:</strong> Without AppProject scoping, any Application could theoretically point at any repo or destination cluster the Argo CD instance has credentials for — AppProject constrains that per team/tenant.
+<br><strong>Production example:</strong> A payments AppProject restricting Applications to only the infra-gitops repo's payments/ path and only the payments-prod destination namespace.
+<br><strong>Common mistake:</strong> Leaving every Application in the default AppProject with no restrictions, giving any team's Application effectively unlimited destination/repo reach.</div></details>
+
+<details class="qa"><summary>9. How does Argo CD get notified of Git changes faster than its default poll interval?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Via a repo webhook that immediately notifies Argo CD of a push, rather than waiting for the next periodic poll.
+<br><strong>Detail:</strong> Without a webhook, Argo CD's application-controller still eventually detects changes on its regular poll cycle, but a webhook shortens the feedback loop from "next poll" to "near-instant."
+<br><strong>Production example:</strong> A GitHub webhook configured against the argocd-server endpoint triggering an immediate refresh after any push to the tracked repo.
+<br><strong>Common mistake:</strong> Assuming Argo CD requires a webhook to detect changes at all — polling alone works, just with more latency.</div></details>
+
+<details class="qa"><summary>10. Why is Argo CD's continuous, visible diff considered a major operational advantage over CI-push deployment?</summary>
+<div class="qa-body"><strong>Short answer:</strong> At any moment, anyone can see exactly what's out of sync and why, rather than trusting that the last pipeline run "probably worked."
+<br><strong>Detail:</strong> The UI/CLI shows a per-resource diff between desired (Git) and live (cluster) state continuously, not just at deploy time — turning "is prod in the state we think it's in" from a guess into a directly observable fact.
+<br><strong>Production example:</strong> During an incident, immediately checking `argocd app diff checkout-service` to rule in/out configuration drift as a root cause.
+<br><strong>Common mistake:</strong> Still relying on "the last deploy pipeline succeeded" as proof of current cluster state instead of checking Argo CD's live diff.</div></details>
+
+<details class="qa"><summary>11–50. Additional rapid-fire questions</summary>
+<div class="qa-body">
+<strong>11.</strong> What CRD does Argo CD introduce? — Application (argoproj.io/v1alpha1).<br>
+<strong>12.</strong> What command manually triggers a sync for a manual-policy Application? — <code>argocd app sync &lt;name&gt;</code>.<br>
+<strong>13.</strong> What command shows exactly what differs between Git and the live cluster? — <code>argocd app diff &lt;name&gt;</code>.<br>
+<strong>14.</strong> What command rolls back to a previous synced revision? — <code>argocd app rollback &lt;name&gt; &lt;revision&gt;</code>.<br>
+<strong>15.</strong> Can plain kubectl inspect Applications, or only the argocd CLI? — Yes — Applications are just CRs, inspectable via <code>kubectl get applications -n argocd</code>.<br>
+<strong>16.</strong> What field in destination specifies the target cluster's API server? — <code>destination.server</code>.<br>
+<strong>17.</strong> What in-cluster destination value refers to the same cluster Argo CD runs in? — <code>https://kubernetes.default.svc</code>.<br>
+<strong>18.</strong> What syncOptions flag auto-creates the destination namespace if missing? — <code>CreateNamespace=true</code>.<br>
+<strong>19.</strong> What component exposes the CLI/UI/API for humans and automation? — argocd-server.<br>
+<strong>20.</strong> Can Argo CD manage multiple remote clusters from one control instance? — Yes, that's a core capability — many destination clusters from one Argo CD install.<br>
+<strong>21.</strong> What's the purpose of syncPolicy.automated.prune? — Deletes resources removed from Git during automated sync.<br>
+<strong>22.</strong> What's the purpose of syncPolicy.automated.selfHeal? — Reverts manual out-of-band changes back to Git's desired state.<br>
+<strong>23.</strong> Does the App-of-Apps parent Application itself need automated sync enabled to create its children? — Typically yes, or a manual sync of the parent to trigger child Application creation.<br>
+<strong>24.</strong> What's a HealthStatus value indicating a rollout is still in progress? — Progressing.<br>
+<strong>25.</strong> What's a HealthStatus value indicating something is actively broken? — Degraded.<br>
+<strong>26.</strong> Can Argo CD send Slack/webhook notifications on sync state changes? — Yes, via its notifications integration.<br>
+<strong>27.</strong> What's the risk of granting Argo CD's ServiceAccount cluster-admin across every managed cluster? — Massively expands blast radius versus least-privilege per AppProject scoping.<br>
+<strong>28.</strong> What does a persistently OutOfSync Application usually indicate? — Either genuine drift happening repeatedly, or non-deterministic rendered manifests causing false diffs.<br>
+<strong>29.</strong> What's the source field's targetRevision typically set to for a floating branch? — A branch name like main, or a fixed tag/commit SHA for stricter pinning.<br>
+<strong>30.</strong> Does Argo CD support Helm charts as an Application source, not just plain YAML/Kustomize? — Yes, Helm charts (including with value overrides) are a supported source type.<br>
+<strong>31.</strong> What's the effect of scoping an AppProject's destinations narrowly? — Prevents an Application in that project from ever targeting a cluster/namespace outside the allowed list.<br>
+<strong>32.</strong> How would you find the history of past sync revisions for rollback purposes? — <code>argocd app history &lt;name&gt;</code>.<br>
+<strong>33.</strong> What's a good practice for the highest-risk production Applications regarding sync mode? — Manual sync with required human approval, even if automated sync is used elsewhere.<br>
+<strong>34.</strong> Can secrets be safely referenced by an Argo CD Application's Helm values? — Only if paired with Sealed Secrets/external-secrets — plaintext secrets in values remain a risk regardless of Argo CD.<br>
+<strong>35.</strong> What's the relationship between Argo CD and the underlying GitOps pattern (Topic 48)? — Argo CD is one concrete, production-grade implementation of that general pattern.<br>
+<strong>36.</strong> Does Argo CD's application-controller talk to etcd directly? — No, it only talks to the target cluster's API Server, same as any client.<br>
+<strong>37.</strong> What's a reason an Application might fail to sync even though the manifests look correct? — Insufficient RBAC on Argo CD's ServiceAccount for the destination cluster/namespace/resource kind.<br>
+<strong>38.</strong> How does Argo CD handle CRDs referenced by an Application's manifests? — It applies them like any other resource, subject to the same sync/health evaluation, though CRD install ordering can require sync waves/hooks.<br>
+<strong>39.</strong> What's a "sync wave" in Argo CD? — An ordering mechanism (via annotations) controlling which resources apply before others within one sync operation.<br>
+<strong>40.</strong> Why might you use sync waves for a CRD and its consuming custom resource in the same Application? — To ensure the CRD is established before the API Server needs to validate instances of that custom resource.<br>
+<strong>41.</strong> What's the effect of deleting an Application object itself (not its resources)? — By default, only removes Argo CD's tracking of it; whether managed resources are also deleted depends on cascade/finalizer settings.<br>
+<strong>42.</strong> Can an Application track a specific Git tag instead of a branch? — Yes, targetRevision can be any valid Git ref — branch, tag, or commit SHA.<br>
+<strong>43.</strong> What's a common cause of "false" OutOfSync status? — Non-deterministic rendering (e.g. timestamps or random values injected by a Helm template) causing every diff to look different.<br>
+<strong>44.</strong> How does Argo CD differ operationally from Flux in basic architecture? — Both are GitOps controllers with their own CRDs, but Argo CD centers on the Application CRD with a strong UI, while Flux is more toolkit-composed (separate Kustomization/HelmRelease/Source controllers).<br>
+<strong>45.</strong> What's the benefit of the App-of-Apps root itself being version-controlled? — Even the set of Applications managed becomes auditable and reviewable via the same Git PR process.<br>
+<strong>46.</strong> Can an Argo CD Application's destination be a namespace that doesn't exist yet? — Yes, if CreateNamespace=true is set in syncOptions.<br>
+<strong>47.</strong> What's a risk of using manual sync for every single Application in a large platform? — Operational overhead — someone has to remember to manually sync potentially hundreds of Applications after every relevant Git change.<br>
+<strong>48.</strong> What's the value of Argo CD's per-resource diff view during an incident? — Immediately distinguishes "cluster matches Git but something is still broken" from "cluster has actually drifted from Git."<br>
+<strong>49.</strong> Does self-heal interfere with legitimate automated changes made by other controllers (e.g. HPA adjusting replicas)? — It can, unless the Application is configured to ignore differences on fields managed by another controller (via ignoreDifferences).<br>
+<strong>50.</strong> What's the first thing to check when an Application is stuck Progressing and never reaches Healthy? — The underlying resource's own events/status (e.g. Pod CrashLoopBackOff) via kubectl describe, since Argo CD's health is only aggregated from the resource's own reported health.
+</div></details>
+
+<footer class="course-footer">Next: Topic 50 — Observability, the three pillars that tell you what's actually happening in the cluster.</footer>
+
+<script>
+  mermaid.initialize({ startOnLoad: true, theme: 'dark' });
+</script>
+
+</body>
+</html>

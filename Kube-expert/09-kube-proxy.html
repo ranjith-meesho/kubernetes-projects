@@ -1,0 +1,276 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Topic 9: kube-proxy — Kubernetes Expert Course</title>
+<link rel="stylesheet" href="styles.css">
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+</head>
+<body>
+
+<header class="course-header">
+  <div class="kicker">Topic 9 of 70</div>
+  <h1>kube-proxy</h1>
+  <div class="subtitle">How Service IPs become real routing rules on every node: iptables vs IPVS, and the Service/EndpointSlice watch.</div>
+</header>
+
+<nav class="topic-nav">
+  <a href="08-kubelet.html">&larr; kubelet</a>
+  <a href="index.html">Course Index</a>
+  <a href="10-container-runtime.html">Container Runtime &rarr;</a>
+</nav>
+
+<h2 id="explanation">Explanation</h2>
+<p>A Kubernetes <strong>Service</strong> is a purely virtual construct — a stable ClusterIP with no listening process
+of its own. <strong>kube-proxy</strong> is the component that makes that virtual IP actually work: it runs on every
+node and continuously programs that node's networking rules so that traffic sent to a Service's ClusterIP gets
+transparently redirected to one of the healthy backend Pod IPs, without the client ever needing to know which Pod it
+landed on.</p>
+
+<p>Kubernetes needs this to exist on every node, rather than centrally, because routing decisions must happen inline
+with every packet — a design that requires a control-plane round trip per packet would be far too slow. Instead,
+kube-proxy watches the API Server for <strong>Services</strong> and <strong>EndpointSlices</strong> (which list the
+currently-ready Pod IPs backing each Service), and translates that information into kernel-level packet-forwarding
+rules that the kernel itself executes at line rate — kube-proxy is not in the data path of any individual packet.</p>
+
+<p>kube-proxy supports multiple backend modes. In <strong>iptables mode</strong> (the long-standing default), it writes
+a chain of iptables rules per Service/endpoint — functional but with O(n) rule evaluation that scales poorly past a
+few thousand Services. In <strong>IPVS mode</strong>, it uses the kernel's IP Virtual Server module, which uses hash
+tables instead of sequential rule chains, giving O(1) lookup and much better performance in large clusters with many
+Services, plus more load-balancing algorithm choices (round-robin, least-connection, etc.) instead of iptables'
+random selection.</p>
+
+<p>Every time a Pod backing a Service becomes ready/unready, or a Service is created/deleted, kube-proxy's watch on the
+API Server fires, and it re-programs the local rules — this is why Service traffic can briefly still hit a Pod that
+just failed its readiness probe if propagation lags, and why the EndpointSlice API was introduced to reduce watch
+payload size for Services with many backend Pods (it shards endpoints into multiple slice objects instead of one
+giant Endpoints object).</p>
+
+<p>Some clusters now run without kube-proxy entirely, using an eBPF-based CNI (e.g. Cilium) to implement Service
+routing directly in the kernel via eBPF programs instead of iptables/IPVS — worth knowing as the direction the
+ecosystem is moving, even though iptables/IPVS remain the default and most widely deployed.</p>
+
+<h2 id="internal-working">Internal Working / Interactions</h2>
+<ul>
+  <li><strong>kube-proxy &harr; API Server:</strong> watches Services and EndpointSlices via informers; reacts to changes with a local rule reprogram, not a poll loop.</li>
+  <li><strong>kube-proxy &harr; kernel netfilter/IPVS:</strong> the actual data path — kube-proxy only writes rules, the kernel executes packet forwarding.</li>
+  <li><strong>kube-proxy &harr; kubelet (indirect):</strong> readiness probe results (posted by kubelet) determine whether a Pod appears in the EndpointSlice kube-proxy watches.</li>
+  <li><strong>kube-proxy &harr; CNI (coexistence):</strong> CNI handles Pod-to-Pod networking/IP assignment; kube-proxy handles Service virtual-IP translation — separate concerns that must agree on the underlying network model.</li>
+</ul>
+
+<h2 id="architecture-diagram">Architecture Diagram</h2>
+<pre class="mermaid">
+flowchart TB
+    API["API Server"] -->|watch Services + EndpointSlices| KP["kube-proxy (this node)"]
+    KP -->|program rules| NET["Kernel netfilter/IPVS tables"]
+    CLIENT["Client Pod"] -->|packet to ClusterIP:port| NET
+    NET -->|DNAT to a ready backend Pod IP| BACKEND["Backend Pod (on any node)"]
+    KLET["kubelet readiness probes"] -->|Pod Ready/NotReady| API
+</pre>
+
+<pre class="mermaid">
+sequenceDiagram
+    participant K as kubelet
+    participant A as API Server
+    participant KP as kube-proxy
+    participant NF as netfilter/IPVS
+    K->>A: Pod readiness probe passes -> Ready
+    A->>A: EndpointSlice controller adds Pod IP to slice
+    A-->>KP: Watch event: EndpointSlice updated
+    KP->>NF: Add DNAT rule: ClusterIP:80 -> PodIP:8080
+    Note over NF: Rule now live for all future packets
+    Note over NF: Existing established connections unaffected until they close
+</pre>
+
+<h2 id="code-example">Code Example</h2>
+<pre><code># kube-proxy is configured via a ConfigMap consumed by its DaemonSet, not a
+# per-Service YAML field. Key production setting: which backend mode to use.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kube-proxy-config
+  namespace: kube-system
+data:
+  config.conf: |
+    apiVersion: kubeproxy.config.k8s.io/v1alpha1
+    kind: KubeProxyConfiguration
+    mode: "ipvs"                    # "iptables" (default) or "ipvs" for large clusters
+    ipvs:
+      scheduler: "lc"                # least-connection load balancing (vs iptables' random)
+    iptables:
+      masqueradeAll: false           # avoid unnecessary SNAT for intra-cluster traffic
+    clusterCIDR: "10.244.0.0/16"     # used to distinguish cluster-internal vs external traffic
+---
+# The Service object kube-proxy is reacting to — note it has no IP of its own
+# process; it's purely a routing target that kube-proxy realizes in the kernel.
+apiVersion: v1
+kind: Service
+metadata:
+  name: checkout-service
+spec:
+  selector:
+    app: checkout-service            # determines which Pods populate the EndpointSlice
+  ports:
+    - port: 80
+      targetPort: 8080
+  type: ClusterIP
+</code></pre>
+
+<h2 id="kubectl-commands">kubectl Commands</h2>
+<pre><code># Confirm kube-proxy is running on every node (it's a DaemonSet)
+kubectl get daemonset kube-proxy -n kube-system
+
+# Check which mode kube-proxy is running in
+kubectl get configmap kube-proxy-config -n kube-system -o yaml | grep mode
+
+# See the EndpointSlice(s) backing a Service
+kubectl get endpointslices -l kubernetes.io/service-name=checkout-service
+
+# Inspect a Service and confirm selector matches Pod labels
+kubectl describe service checkout-service
+
+# On the node itself (debug pod with hostNetwork), inspect the actual rules:
+# iptables-save | grep checkout-service
+# ipvsadm -Ln
+
+# Watch kube-proxy logs for rule reprogram events
+kubectl logs -n kube-system -l k8s-app=kube-proxy --tail=50
+</code></pre>
+
+<h2 id="best-practices">Best Practices &amp; Common Pitfalls</h2>
+<div class="grid-2">
+<div>
+<h4>Best Practices</h4>
+<ul>
+  <li>Switch to IPVS mode for clusters with hundreds/thousands of Services.</li>
+  <li>Rely on readiness probes correctly — kube-proxy only routes to Ready Pods.</li>
+  <li>Monitor EndpointSlice size/count in very large Services to catch scaling issues early.</li>
+  <li>Consider an eBPF-based CNI (replacing kube-proxy) for very large or latency-sensitive clusters.</li>
+</ul>
+</div>
+<div>
+<h4>Pitfalls</h4>
+<ul>
+  <li>Assuming Service traffic instantly stops after a Pod fails readiness — rule propagation and existing connections both introduce lag.</li>
+  <li>Forgetting selector/label mismatches silently produce empty EndpointSlices (Service exists but routes nowhere).</li>
+  <li>Running iptables mode at very large Service counts and hitting linear rule-evaluation slowdowns.</li>
+  <li>Debugging Service issues by looking at the Pod instead of checking EndpointSlices and kube-proxy rules first.</li>
+</ul>
+</div>
+</div>
+
+<h2 id="interview-questions">50 Interview Questions</h2>
+
+<details class="qa"><summary>1. What is a Kubernetes Service, and why does kube-proxy need to exist at all?</summary>
+<div class="qa-body"><strong>Short answer:</strong> A Service is a virtual ClusterIP with no listening process of its own; kube-proxy is what makes that virtual IP actually route traffic to real Pods.
+<br><strong>Detail:</strong> Because a Service has no backing process, something must translate "packet to ClusterIP:port" into "packet to a specific Pod IP:port." kube-proxy does this by programming node-local kernel rules rather than proxying traffic itself.
+<br><strong>Production example:</strong> <code>checkout-service</code> has ClusterIP 10.96.5.20, but nothing is listening on that IP anywhere — it's purely a DNAT target kube-proxy configures in the kernel.
+<br><strong>Common mistake:</strong> Assuming kube-proxy is a literal proxy process that packets flow through — in iptables/IPVS mode it only writes rules; the kernel does the forwarding.</div></details>
+
+<details class="qa"><summary>2. Why does kube-proxy run on every node instead of centrally?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Routing decisions must happen inline with every packet, and a central control-plane round trip per packet would be far too slow.
+<br><strong>Detail:</strong> By running as a per-node DaemonSet and pre-programming kernel rules ahead of time, packet forwarding happens at line rate with no runtime dependency on the API Server.
+<br><strong>Production example:</strong> Even if the API Server is temporarily unreachable, existing Service routing keeps working because the rules are already resident in the local kernel.
+<br><strong>Common mistake:</strong> Believing kube-proxy is in the live data path of every packet — it only reacts to watch events and reprograms rules; it isn't invoked per-packet.</div></details>
+
+<details class="qa"><summary>3. What does kube-proxy actually watch on the API Server?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Services and EndpointSlices.
+<br><strong>Detail:</strong> Services define the virtual ClusterIP/port; EndpointSlices list the currently-ready backend Pod IPs. kube-proxy combines both to know exactly which DNAT rules to write.
+<br><strong>Production example:</strong> Creating a new Service with no matching Pods yet still produces kernel rules, but with zero backend targets until an EndpointSlice populates.
+<br><strong>Common mistake:</strong> Debugging Service routing by only checking the Service object and skipping EndpointSlices, missing that the selector matched zero Pods.</div></details>
+
+<details class="qa"><summary>4. What is the difference between iptables mode and IPVS mode?</summary>
+<div class="qa-body"><strong>Short answer:</strong> iptables mode writes a sequential rule chain per Service/endpoint (O(n) evaluation); IPVS mode uses kernel hash tables for O(1) lookup.
+<br><strong>Detail:</strong> iptables was the long-standing default but scales poorly past a few thousand Services because every packet may need to walk a long rule chain. IPVS uses the kernel's IP Virtual Server module instead, giving constant-time lookups regardless of Service count.
+<br><strong>Production example:</strong> A cluster with 5,000+ Services switching from iptables to IPVS mode to eliminate measurable per-packet latency from long rule-chain evaluation.
+<br><strong>Common mistake:</strong> Staying on iptables mode by default at very large Service counts and only noticing the slowdown after it's already impacting production traffic.</div></details>
+
+<details class="qa"><summary>5. What load-balancing algorithm choices does IPVS mode offer that iptables mode doesn't?</summary>
+<div class="qa-body"><strong>Short answer:</strong> IPVS supports round-robin, least-connection, and other algorithms; iptables mode only does random selection.
+<br><strong>Detail:</strong> This is configured via the <code>ipvs.scheduler</code> field in the kube-proxy ConfigMap (e.g. <code>lc</code> for least-connection), giving operators more control over backend distribution than iptables' uniform-random rule matching allows.
+<br><strong>Production example:</strong> Switching the IPVS scheduler to least-connection for a Service with uneven per-request cost to avoid overloading any single backend Pod.
+<br><strong>Common mistake:</strong> Assuming iptables mode has configurable load-balancing behavior — it does not; it's effectively random per connection.</div></details>
+
+<details class="qa"><summary>6. Why was the EndpointSlice API introduced to replace the single Endpoints object?</summary>
+<div class="qa-body"><strong>Short answer:</strong> To reduce watch payload size for Services with many backend Pods, by sharding endpoints across multiple slice objects.
+<br><strong>Detail:</strong> A single Endpoints object listing thousands of Pod IPs meant every watcher received the entire object on any single Pod change. EndpointSlices split this into smaller, bounded chunks so updates only touch the relevant slice.
+<br><strong>Production example:</strong> A Service backed by 3,000 Pods generates multiple EndpointSlice objects instead of one enormous Endpoints object, dramatically cutting watch traffic on every readiness flap.
+<br><strong>Common mistake:</strong> Still querying the legacy <code>Endpoints</code> object for large Services and wondering why tooling seems slow or incomplete versus checking EndpointSlices directly.</div></details>
+
+<details class="qa"><summary>7. Why can Service traffic briefly still hit a Pod that just failed its readiness probe?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Propagation lag — kubelet posts the status, the EndpointSlice controller updates the slice, and kube-proxy's watch/reprogram cycle all take nonzero time.
+<br><strong>Detail:</strong> None of these steps are instantaneous; between a probe failing and kube-proxy actually removing the DNAT rule, there's a small window where new connections could still land on the now-unready Pod.
+<br><strong>Production example:</strong> A Pod that starts failing readiness under load may absorb a handful more requests before it's fully removed from rotation, which is why graceful shutdown/drain patterns matter.
+<br><strong>Common mistake:</strong> Assuming readiness probe failure is instantaneous at the routing layer — there's an inherent propagation delay end-to-end.</div></details>
+
+<details class="qa"><summary>8. What happens to already-established connections when kube-proxy removes a DNAT rule for a Pod?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Existing established connections are typically unaffected until they close naturally; only new connections are routed away.
+<br><strong>Detail:</strong> Rule removal changes where new connection attempts land, but the kernel's connection tracking generally leaves already-open flows alone, which is why a Pod being drained can still serve in-flight long-lived connections.
+<br><strong>Production example:</strong> A long-lived gRPC stream to a Pod being terminated may keep working after the Pod is removed from the EndpointSlice, until the connection itself is closed.
+<br><strong>Common mistake:</strong> Assuming removing an endpoint immediately terminates all existing traffic to that Pod — it does not, by default.</div></details>
+
+<details class="qa"><summary>9. What is the relationship between kube-proxy and the CNI plugin?</summary>
+<div class="qa-body"><strong>Short answer:</strong> They handle separate concerns — CNI does Pod-to-Pod networking/IP assignment, kube-proxy does Service virtual-IP translation — but they must agree on the underlying network model.
+<br><strong>Detail:</strong> kube-proxy assumes Pod IPs are already routable across the cluster (CNI's job) and only adds the additional layer of translating ClusterIP:port into a specific Pod IP:port via DNAT.
+<br><strong>Production example:</strong> Some eBPF-based CNIs (e.g. Cilium) implement both concerns together, replacing kube-proxy entirely rather than coexisting with it.
+<br><strong>Common mistake:</strong> Debugging a Service routing issue by looking only at kube-proxy rules without checking whether the underlying Pod network (CNI) is even functioning.</div></details>
+
+<details class="qa"><summary>10. Why are some clusters now running without kube-proxy at all?</summary>
+<div class="qa-body"><strong>Short answer:</strong> eBPF-based CNIs like Cilium can implement Service routing directly in the kernel via eBPF programs, replacing iptables/IPVS entirely.
+<br><strong>Detail:</strong> This removes an extra layer of rule-chain/hash-table indirection and can offer better performance and observability, though iptables/IPVS remain the default and most widely deployed approach today.
+<br><strong>Production example:</strong> A cluster running Cilium in kube-proxy-replacement mode handles Service routing purely via eBPF programs attached at the network interface, with no kube-proxy DaemonSet running at all.
+<br><strong>Common mistake:</strong> Assuming kube-proxy is a mandatory, unremovable component — it's the default implementation, not the only possible one.</div></details>
+
+<details class="qa"><summary>11–50. Additional rapid-fire questions</summary>
+<div class="qa-body">
+<strong>11.</strong> What Kubernetes object type does kube-proxy run as? — A DaemonSet, ensuring one instance per node.<br>
+<strong>12.</strong> What ConfigMap field selects iptables vs IPVS mode? — <code>mode</code> in the KubeProxyConfiguration (<code>"iptables"</code> or <code>"ipvs"</code>).<br>
+<strong>13.</strong> Does kube-proxy inspect individual packets in userspace? — No, in iptables/IPVS mode the kernel does all packet forwarding; kube-proxy only writes rules.<br>
+<strong>14.</strong> What determines which Pods populate a Service's EndpointSlice? — The Service's label selector matching Pod labels, combined with each Pod's readiness state.<br>
+<strong>15.</strong> What happens if a Service's selector matches zero Pods? — The Service exists but its EndpointSlice is empty, so traffic routes nowhere.<br>
+<strong>16.</strong> What kernel module does IPVS mode rely on? — The IP Virtual Server (IPVS) module.<br>
+<strong>17.</strong> What command inspects live IPVS rules on a node? — <code>ipvsadm -Ln</code>.<br>
+<strong>18.</strong> What command inspects live iptables rules on a node? — <code>iptables-save | grep &lt;service-name&gt;</code>.<br>
+<strong>19.</strong> Why does iptables mode scale poorly with many Services? — Rule evaluation is sequential (O(n)), so packet processing time grows with Service/endpoint count.<br>
+<strong>20.</strong> Why does IPVS mode scale better? — It uses hash tables for O(1) lookup regardless of Service count.<br>
+<strong>21.</strong> What field in the ConfigMap sets the IPVS scheduling algorithm? — <code>ipvs.scheduler</code> (e.g. <code>"lc"</code> for least-connection).<br>
+<strong>22.</strong> Does kube-proxy talk to kubelet directly? — No, the relationship is indirect via the API Server: kubelet posts readiness, which affects EndpointSlices kube-proxy watches.<br>
+<strong>23.</strong> What is masqueradeAll used for in the ConfigMap? — Controls whether SNAT is applied to all traffic; disabling it avoids unnecessary SNAT for intra-cluster traffic.<br>
+<strong>24.</strong> What does clusterCIDR configure in kube-proxy? — Helps kube-proxy distinguish cluster-internal traffic from external traffic for correct rule behavior.<br>
+<strong>25.</strong> Is kube-proxy involved in Pod-to-Pod (non-Service) traffic? — No, that's handled entirely by the CNI plugin.<br>
+<strong>26.</strong> How would you confirm kube-proxy is running on every node? — <code>kubectl get daemonset kube-proxy -n kube-system</code> and check desired vs ready counts.<br>
+<strong>27.</strong> How would you check which mode a cluster's kube-proxy uses? — Inspect the kube-proxy ConfigMap for the <code>mode</code> field.<br>
+<strong>28.</strong> What kubectl command lists EndpointSlices for a specific Service? — <code>kubectl get endpointslices -l kubernetes.io/service-name=&lt;svc&gt;</code>.<br>
+<strong>29.</strong> What's the first thing to check when a Service routes to nothing? — Whether its EndpointSlice actually has any ready addresses, then whether the selector matches Pod labels.<br>
+<strong>30.</strong> What's the effect of a readiness probe flapping rapidly on kube-proxy? — Frequent EndpointSlice updates trigger frequent rule reprograms, adding node-level churn.<br>
+<strong>31.</strong> Does a Service ClusterIP change when Pods behind it change? — No, the ClusterIP is stable; only the backend set (EndpointSlice) changes.<br>
+<strong>32.</strong> What log source shows kube-proxy's rule reprogram activity? — Its own DaemonSet Pod logs, e.g. <code>kubectl logs -n kube-system -l k8s-app=kube-proxy</code>.<br>
+<strong>33.</strong> Why might switching modes (iptables&rarr;IPVS) require a kube-proxy restart? — The mode is read from its ConfigMap at startup, not hot-reloaded mid-process.<br>
+<strong>34.</strong> Is kube-proxy aware of NetworkPolicy? — No, NetworkPolicy enforcement is typically the CNI plugin's responsibility, not kube-proxy's.<br>
+<strong>35.</strong> What happens to Service routing if kube-proxy itself crashes on a node? — Already-programmed rules keep working; new Service/EndpointSlice changes stop being applied until it restarts.<br>
+<strong>36.</strong> Why is EndpointSlice sharding described as reducing "watch payload size"? — Because a change to one Pod only requires transmitting the smaller shard it belongs to, not the entire endpoint list.<br>
+<strong>37.</strong> What's an eBPF-based alternative that can replace kube-proxy? — Cilium, using eBPF programs to implement Service routing directly in the kernel.<br>
+<strong>38.</strong> Does kube-proxy handle external (Ingress/LoadBalancer) traffic entry? — Not directly — it programs rules for Service ClusterIPs; external entry is a separate concern (cloud LB, Ingress controller) that ultimately still routes into a Service.<br>
+<strong>39.</strong> What's the risk of debugging Service issues by looking only at the Pod? — You miss selector mismatches or EndpointSlice/kube-proxy rule problems that are the actual root cause.<br>
+<strong>40.</strong> Why must clusterCIDR be set correctly? — Misconfiguration can cause kube-proxy to mishandle SNAT/masquerading decisions for traffic crossing cluster boundaries.<br>
+<strong>41.</strong> What's the practical impact of choosing "random" vs "least-connection" backend selection? — Random (iptables default) can unevenly load backends with variable request cost; least-connection (IPVS) actively balances based on active connections.<br>
+<strong>42.</strong> Is kube-proxy a single point of failure for the whole cluster? — No, it's per-node — a failure only affects that node's ability to reprogram rules, not other nodes' existing routing.<br>
+<strong>43.</strong> How does kube-proxy learn a new Service was just created? — Via its watch/informer on the API Server firing a Service-add event.<br>
+<strong>44.</strong> What's the purpose of the sequence "readiness probe passes -> EndpointSlice updated -> kube-proxy reprograms"? — It's the full pipeline connecting kubelet's local probe execution to actual cluster-wide traffic routing changes.<br>
+<strong>45.</strong> Does kube-proxy make load-balancing decisions per-request or per-connection typically? — Per-connection in most cases, since rules operate at the packet/connection level, not per individual HTTP request.<br>
+<strong>46.</strong> What's a common cause of "Service exists but no traffic reaches Pods"? — Label selector typos causing zero Pods to match, producing an empty EndpointSlice.<br>
+<strong>47.</strong> Why would large clusters proactively monitor EndpointSlice count/size? — To catch scaling issues (excessive sharding or watch overhead) before they impact kube-proxy reprogram latency.<br>
+<strong>48.</strong> What does "kube-proxy is not in the data path of any individual packet" mean precisely? — It only writes rules in advance; actual packet forwarding is performed entirely by the kernel (netfilter/IPVS), not by the kube-proxy process itself.<br>
+<strong>49.</strong> Why is IPVS mode described as needing more kernel module support than iptables mode? — It depends on the IPVS kernel module being loaded/available, whereas iptables/netfilter is nearly universally present.<br>
+<strong>50.</strong> Why is understanding kube-proxy critical for diagnosing "my Service isn't working" issues? — Because Service routing is a multi-hop pipeline (probe &rarr; EndpointSlice &rarr; watch &rarr; rule reprogram &rarr; kernel forwarding), and the fault could be at any stage kube-proxy touches.
+</div></details>
+
+<footer class="course-footer">Next: Topic 10 — Container Runtime, the layer kubelet ultimately drives to actually run a container process.</footer>
+
+<script>
+  mermaid.initialize({ startOnLoad: true, theme: 'dark' });
+</script>
+
+</body>
+</html>

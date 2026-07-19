@@ -1,0 +1,282 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Topic 6: Scheduler — Kubernetes Expert Course</title>
+<link rel="stylesheet" href="styles.css">
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+</head>
+<body>
+
+<header class="course-header">
+  <div class="kicker">Topic 6 of 70</div>
+  <h1>Scheduler</h1>
+  <div class="subtitle">How kube-scheduler decides which node a Pod runs on: filtering, scoring, profiles, and preemption.</div>
+</header>
+
+<nav class="topic-nav">
+  <a href="05-etcd.html">&larr; etcd</a>
+  <a href="index.html">Course Index</a>
+  <a href="07-controller-manager.html">Controller Manager &rarr;</a>
+</nav>
+
+<h2 id="explanation">Explanation</h2>
+<p>The <strong>Scheduler</strong> (kube-scheduler) has exactly one job: watch for Pods with an empty
+<code>spec.nodeName</code> and decide which node they should run on. It does not create Pods, does not start
+containers, and does not talk to the container runtime — it only writes a binding decision back through the API
+Server. Everything downstream (kubelet noticing the assignment, the runtime starting the container) is someone else's
+responsibility.</p>
+
+<p>Kubernetes needs a dedicated scheduling component because placement is a genuinely hard constraint-satisfaction
+problem at scale: a Pod might require specific CPU/memory, GPU hardware, co-location with other Pods (affinity),
+avoidance of other Pods (anti-affinity), a specific zone, or exclusion from tainted nodes. Doing this well — and fast,
+for clusters with thousands of nodes and pending Pods — justifies a purpose-built component rather than folding
+placement logic into the API Server or kubelet.</p>
+
+<p>Scheduling happens in two phases. <strong>Filtering</strong> (formerly "predicates") eliminates every node that
+cannot possibly run the Pod — insufficient CPU/memory, a taint the Pod doesn't tolerate, a node selector mismatch, port
+conflicts. <strong>Scoring</strong> (formerly "priorities") ranks the surviving nodes — spreading Pods across zones,
+preferring nodes with more free resources (or fewer, for bin-packing), respecting soft affinity/anti-affinity
+preferences — and the highest-scoring node wins. Both phases are built from a pluggable set of "plugins," configured
+via <strong>scheduling profiles</strong>, so you can run multiple scheduler configurations (e.g. a
+bin-packing profile for batch jobs, a spread profile for stateful services) side by side.</p>
+
+<p>When no node passes filtering for a high-priority Pod, the scheduler can invoke <strong>preemption</strong>: it
+finds one or more lower-priority Pods on some node whose eviction would free enough room, evicts them, and schedules
+the higher-priority Pod in their place. This is why <code>PriorityClass</code> matters in multi-tenant clusters —
+without it, critical workloads have no mechanism to displace non-critical ones under resource pressure.</p>
+
+<p>Like the Controller Manager, the Scheduler uses leader election when run with multiple replicas for HA — only one
+instance is ever actively scheduling at a time, avoiding the possibility of two schedulers racing to bind the same Pod
+to different nodes.</p>
+
+<h2 id="internal-working">Internal Working / Interactions</h2>
+<ul>
+  <li><strong>Scheduler &harr; API Server:</strong> watches unscheduled Pods (empty <code>nodeName</code>) and the full Node/Pod state needed for filtering/scoring, via informer caches.</li>
+  <li><strong>Scheduler &rarr; API Server (bind):</strong> writes the decision as a <code>Binding</code> subresource, which the API Server persists as <code>spec.nodeName</code> in etcd.</li>
+  <li><strong>Scheduler &harr; kubelet:</strong> no direct interaction — kubelet independently notices the binding via its own watch on the API Server.</li>
+  <li><strong>Scheduler &harr; PriorityClass/PodDisruptionBudget:</strong> reads Pod priority for preemption decisions and respects PDBs when evicting during preemption.</li>
+  <li><strong>Extender/webhook scheduling:</strong> can call out to external scheduler extenders for custom constraints not expressible via built-in plugins.</li>
+</ul>
+
+<h2 id="architecture-diagram">Architecture Diagram</h2>
+<pre class="mermaid">
+flowchart TB
+    API["API Server"] -->|watch: unscheduled Pods| SCHED["Scheduler"]
+    SCHED --> F["Filtering phase\n(NodeResourcesFit, TaintToleration,\nNodeAffinity, PodAffinity...)"]
+    F -->|feasible nodes| SC["Scoring phase\n(NodeResourcesBalancedAllocation,\nInterPodAffinity, ImageLocality...)"]
+    SC -->|highest score| BIND["Bind Pod to Node"]
+    BIND -->|PATCH nodeName| API
+    F -.->|no feasible node & Pod is high-priority| PRE["Preemption:\nevict lower-priority Pods"]
+    PRE --> F
+</pre>
+
+<pre class="mermaid">
+sequenceDiagram
+    participant A as API Server
+    participant S as Scheduler
+    participant N as Node objects (cache)
+    A->>S: Watch event: new Pod, nodeName empty
+    S->>N: List candidate nodes from local cache
+    S->>S: Filter (drop nodes failing hard constraints)
+    S->>S: Score remaining nodes (weighted plugins)
+    S->>A: POST Binding {pod: x, node: worker-7}
+    A->>A: Persist nodeName = worker-7 to etcd
+    A-->>S: Ack
+</pre>
+
+<h2 id="code-example">Code Example</h2>
+<pre><code># KubeSchedulerConfiguration — defines a custom scheduling profile,
+# e.g. a bin-packing profile used only for batch workloads.
+apiVersion: kubescheduler.config.k8s.io/v1
+kind: KubeSchedulerConfiguration
+leaderElection:
+  leaderElect: true                  # only one scheduler replica active at a time
+profiles:
+  - schedulerName: default-scheduler
+  - schedulerName: batch-binpack       # Pods opt in via spec.schedulerName
+    pluginConfig:
+      - name: NodeResourcesFit
+        args:
+          scoringStrategy:
+            type: MostAllocated       # prefer already-busy nodes (bin-packing, saves cost)
+    plugins:
+      score:
+        enabled:
+          - name: NodeResourcesFit
+            weight: 5
+---
+# PriorityClass + a Pod that uses it to enable preemption over lower-priority Pods
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: high-priority-payments
+value: 1000000                        # higher value = more important, can preempt lower values
+globalDefault: false
+preemptionPolicy: PreemptLowerPriority
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: checkout-critical
+spec:
+  priorityClassName: high-priority-payments   # scheduler will evict lower-priority Pods if needed
+  schedulerName: batch-binpack                 # opt into the custom profile above
+  containers:
+    - name: checkout
+      image: registry.internal/checkout:2.4.1
+</code></pre>
+
+<h2 id="kubectl-commands">kubectl Commands</h2>
+<pre><code># Check the scheduler is running and which replica is leader
+kubectl get pods -n kube-system -l component=kube-scheduler
+kubectl get lease -n kube-system kube-scheduler -o yaml
+
+# See why a Pod is stuck Pending (filtering failures show here)
+kubectl describe pod my-pod | grep -A5 Events
+
+# Inspect a node's allocatable resources the scheduler reasons about
+kubectl describe node worker-3 | grep -A5 Allocatable
+
+# List PriorityClasses defined in the cluster
+kubectl get priorityclasses
+
+# Check which scheduler profile a Pod used
+kubectl get pod my-pod -o jsonpath='{.spec.schedulerName}'
+
+# Watch scheduling events cluster-wide
+kubectl get events --field-selector reason=Scheduled -A
+</code></pre>
+
+<h2 id="best-practices">Best Practices &amp; Common Pitfalls</h2>
+<div class="grid-2">
+<div>
+<h4>Best Practices</h4>
+<ul>
+  <li>Always set resource <code>requests</code> — the scheduler cannot reason about capacity otherwise.</li>
+  <li>Use PriorityClasses deliberately in multi-tenant clusters so critical workloads can preempt.</li>
+  <li>Use topology spread constraints for real HA across zones, not just replica count.</li>
+  <li>Tune <code>percentageOfNodesToScore</code> in very large clusters to bound scheduling latency.</li>
+</ul>
+</div>
+<div>
+<h4>Pitfalls</h4>
+<ul>
+  <li>Leaving requests unset, causing the scheduler to over-pack nodes that later hit real resource pressure.</li>
+  <li>Assuming the scheduler starts containers — it only binds; kubelet does the rest.</li>
+  <li>Setting overly aggressive preemption without PodDisruptionBudgets, causing unexpected outages.</li>
+  <li>Running multiple scheduler replicas expecting parallel throughput — only one is ever active.</li>
+</ul>
+</div>
+</div>
+
+<h2 id="interview-questions">50 Interview Questions</h2>
+
+<details class="qa"><summary>1. What exactly does the Scheduler do, and what does it explicitly NOT do?</summary>
+<div class="qa-body"><strong>Short answer:</strong> It watches for Pods with an empty <code>spec.nodeName</code> and decides which node they run on — it never creates Pods or starts containers.
+<br><strong>Detailed explanation:</strong> The Scheduler's entire output is a single write: the <code>Binding</code> subresource that sets <code>nodeName</code>. Everything downstream (kubelet noticing the binding, pulling images, starting containers) is entirely someone else's responsibility.
+<br><strong>Production example:</strong> <code>kubectl describe pod</code> shows a <code>Scheduled</code> event emitted by the Scheduler, followed by separate <code>Pulling</code>/<code>Started</code> events emitted by kubelet.
+<br><strong>Common mistake:</strong> Believing the Scheduler starts the container — it only ever binds the Pod to a node.</div></details>
+
+<details class="qa"><summary>2. Explain the two-phase filtering and scoring process.</summary>
+<div class="qa-body"><strong>Short answer:</strong> Filtering eliminates nodes that can't possibly run the Pod; scoring ranks the survivors to pick the best fit.
+<br><strong>Detailed explanation:</strong> Filtering (formerly "predicates") checks hard constraints — insufficient CPU/memory, untolerated taints, node selector mismatches, port conflicts. Scoring (formerly "priorities") ranks the feasible nodes using weighted plugins (spreading across zones, resource balance, image locality, affinity preferences) and the highest-scoring node wins.
+<br><strong>Production example:</strong> A Pod requiring a GPU is filtered down to only GPU nodes first, then scored among those based on remaining GPU/CPU headroom.
+<br><strong>Common mistake:</strong> Conflating hard requirements (should be filters, e.g. required node affinity) with soft preferences (should be scoring plugins, e.g. preferred affinity) when designing placement rules.</div></details>
+
+<details class="qa"><summary>3. Why can't the Scheduler reason about a Pod's resource needs if requests aren't set?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Without <code>resources.requests</code>, the Scheduler has no numeric basis to filter/score nodes for capacity.
+<br><strong>Detailed explanation:</strong> The filtering phase's NodeResourcesFit plugin compares a Pod's requests against a node's allocatable capacity; if requests are unset, the Scheduler effectively treats the Pod as needing ~0 resources, which can lead to overpacking a node that later hits real resource pressure.
+<br><strong>Production example:</strong> A team omits requests on a memory-heavy batch job; the Scheduler happily stacks a dozen of them onto one node, which then OOMs under real load.
+<br><strong>Common mistake:</strong> Assuming limits alone are enough — the Scheduler only reads requests for placement decisions, not limits.</div></details>
+
+<details class="qa"><summary>4. What is preemption and when does it trigger?</summary>
+<div class="qa-body"><strong>Short answer:</strong> When no node passes filtering for a high-priority pending Pod, the Scheduler can evict lower-priority Pods elsewhere to make room.
+<br><strong>Detailed explanation:</strong> The Scheduler identifies a node where evicting one or more lower-priority Pods (per <code>PriorityClass</code>) would free enough capacity, evicts them, and schedules the higher-priority Pod in their place — but it respects PodDisruptionBudgets during this process where possible.
+<br><strong>Production example:</strong> A <code>high-priority-payments</code> PriorityClass Pod preempts lower-priority batch Pods on a resource-constrained node during a traffic spike.
+<br><strong>Common mistake:</strong> Enabling aggressive preemption without setting PodDisruptionBudgets on the Pods that could be preempted, causing unexpected outages.</div></details>
+
+<details class="qa"><summary>5. What are scheduling profiles and why would you run more than one?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Profiles are named, independently configured sets of scheduling plugins that Pods opt into via <code>spec.schedulerName</code>.
+<br><strong>Detailed explanation:</strong> You might run a bin-packing profile (MostAllocated scoring strategy) for batch/cost-sensitive workloads to consolidate nodes for autoscaler efficiency, alongside a spread profile (default) for stateful/critical services needing maximum HA.
+<br><strong>Production example:</strong> A <code>batch-binpack</code> profile with <code>scoringStrategy: MostAllocated</code> intentionally packs jobs tightly to enable cluster-autoscaler scale-down.
+<br><strong>Common mistake:</strong> Forgetting a Pod must explicitly set <code>schedulerName</code> to use anything other than <code>default-scheduler</code> — profiles aren't applied automatically.</div></details>
+
+<details class="qa"><summary>6. Why does the Scheduler use leader election even though it's not doing distributed consensus itself?</summary>
+<div class="qa-body"><strong>Short answer:</strong> To guarantee exactly one active instance so two replicas never race to bind the same Pod to different nodes.
+<br><strong>Detailed explanation:</strong> Multiple Scheduler replicas run for HA/failover speed, but only the lease holder actively schedules; standbys wait to take over if the leader fails, avoiding conflicting binding decisions.
+<br><strong>Production example:</strong> <code>kubectl get lease -n kube-system kube-scheduler -o yaml</code> shows exactly which replica currently holds the lease.
+<br><strong>Common mistake:</strong> Expecting more Scheduler replicas to parallelize scheduling throughput — they never do.</div></details>
+
+<details class="qa"><summary>7. How do topology spread constraints differ from just increasing replica count?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Topology spread constraints explicitly instruct the Scheduler to distribute Pods across failure domains (zones/nodes), while replica count alone says nothing about placement.
+<br><strong>Detailed explanation:</strong> Without spread constraints, the Scheduler could legally place all replicas of a Deployment in the same zone if that zone scores highest, defeating the purpose of having multiple replicas for resilience; <code>maxSkew</code> and <code>whenUnsatisfiable: DoNotSchedule</code> enforce real distribution.
+<br><strong>Production example:</strong> A payments Deployment with 6 replicas and a zone-based topology spread constraint (maxSkew: 1) guarantees no more than a 1-Pod imbalance between zones.
+<br><strong>Common mistake:</strong> Assuming "6 replicas" automatically means HA across zones without an explicit spread constraint.</div></details>
+
+<details class="qa"><summary>8. What's a scheduler extender and when would you use one?</summary>
+<div class="qa-body"><strong>Short answer:</strong> An external service the Scheduler calls out to for custom filtering/scoring logic not expressible via built-in plugins.
+<br><strong>Detailed explanation:</strong> Extenders let organizations bolt on proprietary constraints (e.g. license availability, custom hardware topology) without forking or rebuilding the scheduler binary, at the cost of added latency per scheduling decision.
+<br><strong>Production example:</strong> A company with specialized hardware licensing uses an extender to filter out nodes lacking a valid license token before the Scheduler considers them.
+<br><strong>Common mistake:</strong> Reaching for an extender when a native scheduling plugin or affinity rule would solve the same problem with less operational overhead.</div></details>
+
+<details class="qa"><summary>9. Why does <code>percentageOfNodesToScore</code> matter in very large clusters?</summary>
+<div class="qa-body"><strong>Short answer:</strong> It bounds scheduling latency by not scoring every single node when the cluster is huge.
+<br><strong>Detailed explanation:</strong> In a cluster with thousands of nodes, scoring all of them for every pending Pod would be slow; this setting lets the Scheduler stop after evaluating a representative percentage of feasible nodes, trading a small amount of placement optimality for much faster scheduling decisions.
+<br><strong>Production example:</strong> A 3,000-node cluster tunes this down from 100% to keep scheduling throughput acceptable during rapid autoscaling events.
+<br><strong>Common mistake:</strong> Leaving it at default in an extremely large cluster and then being surprised scheduling latency climbs as node count grows.</div></details>
+
+<details class="qa"><summary>10–50. Additional rapid-fire questions</summary>
+<div class="qa-body">
+<strong>10.</strong> What field does the Scheduler look for to find unscheduled Pods? — An empty <code>spec.nodeName</code>.<br>
+<strong>11.</strong> What subresource does the Scheduler write to bind a Pod? — The <code>Binding</code> subresource, which the API Server persists as <code>spec.nodeName</code>.<br>
+<strong>12.</strong> What were filtering and scoring plugins formerly called? — Predicates and priorities, respectively.<br>
+<strong>13.</strong> What plugin checks whether a node has enough CPU/memory for a Pod? — NodeResourcesFit.<br>
+<strong>14.</strong> What's a taint, and how does it interact with scheduling? — A repellent applied to a node that only Pods with a matching toleration can be scheduled onto.<br>
+<strong>15.</strong> What object lets a Pod preempt lower-priority Pods? — <code>PriorityClass</code>, referenced via <code>spec.priorityClassName</code>.<br>
+<strong>16.</strong> How does a Pod opt into a non-default scheduling profile? — By setting <code>spec.schedulerName</code> to match a configured profile.<br>
+<strong>17.</strong> What's the risk of setting <code>preemptionPolicy: Never</code> on a high-priority Pod? — It waits in the normal queue like any other Pod instead of being able to evict lower-priority Pods for room.<br>
+<strong>18.</strong> Why does the Scheduler have no direct interaction with kubelet? — kubelet independently discovers Pods bound to its node via its own watch on the API Server; the Scheduler never talks to kubelet directly.<br>
+<strong>19.</strong> What's ImageLocality scoring? — A plugin that favors nodes which already have the Pod's image cached, reducing pull time.<br>
+<strong>20.</strong> Why might a Pod stay Pending with "0/5 nodes are available: insufficient cpu"? — Every node failed the filtering phase due to a hard CPU resource constraint.<br>
+<strong>21.</strong> What's the difference between required and preferred node affinity? — Required affinity acts as a hard filter (Pod won't schedule if unmet); preferred affinity only influences scoring.<br>
+<strong>22.</strong> How would you check which scheduler profile a specific Pod used? — <code>kubectl get pod my-pod -o jsonpath='{.spec.schedulerName}'</code>.<br>
+<strong>23.</strong> What's the effect of running two Scheduler replicas without leader election disabled accidentally? — This shouldn't normally be possible with correct config, but if both became active it would risk race conditions binding the same Pod to conflicting nodes.<br>
+<strong>24.</strong> Why is PodAffinity/PodAntiAffinity evaluated during both filtering and scoring? — Required affinity/anti-affinity acts as a hard filter; preferred forms only influence the score.<br>
+<strong>25.</strong> What's a MostAllocated scoring strategy used for? — Bin-packing — preferring already-busy nodes to consolidate workloads and free up whole nodes for autoscaler removal.<br>
+<strong>26.</strong> What's a LeastAllocated scoring strategy used for? — Spreading Pods across nodes to keep headroom evenly available, the opposite goal of bin-packing.<br>
+<strong>27.</strong> How does the Scheduler discover Node capacity/allocatable info? — From cached Node objects populated via its own watch/informer against the API Server.<br>
+<strong>28.</strong> Why does preemption respect PodDisruptionBudgets where possible? — To avoid violating an application's minimum-availability guarantee even while making room for a higher-priority Pod.<br>
+<strong>29.</strong> What's the operational risk of disabling all preemption in a multi-tenant cluster? — Critical workloads have no mechanism to displace non-critical ones under resource pressure, risking outages during contention.<br>
+<strong>30.</strong> Why is "Scheduled" one of the very first events in a Pod's lifecycle? — It marks the moment the Scheduler's decision is persisted, before kubelet has done any actual work.<br>
+<strong>31.</strong> What happens if a Pod's node affinity requires a zone that has zero nodes? — The Pod remains Pending indefinitely — filtering finds zero feasible nodes.<br>
+<strong>32.</strong> How would you debug why the Scheduler picked a seemingly suboptimal node? — Check the scoring plugin weights in the scheduler profile and compare candidate node resource states at decision time.<br>
+<strong>33.</strong> Why does the Scheduler need to be aware of PodDisruptionBudgets during preemption specifically, not during normal scheduling? — Normal scheduling never removes existing Pods; only preemption does, so PDBs are only relevant there.<br>
+<strong>34.</strong> What's the risk of using scheduler extenders heavily? — Added per-scheduling-decision latency and an external dependency the Scheduler now relies on for every decision.<br>
+<strong>35.</strong> Why is <code>globalDefault: false</code> typically set on custom PriorityClasses? — To avoid silently making every Pod cluster-wide inherit an unintended elevated priority.<br>
+<strong>36.</strong> What's the difference between a Pod being Pending due to scheduling vs. due to image pulling? — Scheduling-phase Pending has no nodeName yet; image-pull Pending is already bound to a node and waiting on kubelet/runtime.<br>
+<strong>37.</strong> Why do batch workloads commonly use a separate bin-packing scheduler profile? — To maximize node consolidation for cost savings, since batch jobs are typically more tolerant of being packed tightly than latency-sensitive services.<br>
+<strong>38.</strong> What's the effect of setting an extremely high PriorityClass value on every workload? — It defeats the purpose of prioritization — if everything is "high priority," preemption can't meaningfully distinguish importance.<br>
+<strong>39.</strong> Why does port conflict count as a filtering-phase failure, not a scoring one? — It's a hard constraint (the Pod literally cannot run there), not a preference to be weighed.<br>
+<strong>40.</strong> How does InterPodAffinity scoring differ from required PodAffinity? — Scoring only nudges preference toward co-location; required affinity makes it a hard scheduling constraint.<br>
+<strong>41.</strong> What's a real production reason to lower <code>percentageOfNodesToScore</code>? — To keep scheduling throughput acceptable during rapid scale-out events in very large clusters.<br>
+<strong>42.</strong> Why is understanding owner references relevant when debugging scheduling issues? — A Pod's controller (ReplicaSet/Deployment) will recreate it if deleted, so scheduling problems often need fixing at the template level, not the individual Pod.<br>
+<strong>43.</strong> What's the risk of manually setting <code>spec.nodeName</code> on a Pod yourself? — It bypasses the Scheduler's filtering/scoring entirely, potentially placing the Pod on a node that can't actually satisfy its resource needs.<br>
+<strong>44.</strong> Why might increasing scheduler scoring plugin weights change placement behavior unexpectedly? — Weights determine relative influence between plugins; increasing one can dominate the total score and override other considerations.<br>
+<strong>45.</strong> What's the purpose of the <code>kubectl get events --field-selector reason=Scheduled</code> command? — Quickly audits all recent scheduling decisions cluster-wide for troubleshooting or capacity review.<br>
+<strong>46.</strong> Why doesn't the Scheduler retry a failed binding forever on the exact same node? — It re-evaluates filtering/scoring fresh on each scheduling attempt against current cluster state, which may have changed.<br>
+<strong>47.</strong> What's a symptom that the Scheduler itself (not resource constraints) is the problem? — All Pods across the cluster stay Pending with no nodeName, regardless of available capacity — check the Scheduler pod/lease first.<br>
+<strong>48.</strong> Why is affinity/anti-affinity evaluation more expensive than simple resource filtering? — It requires inspecting labels of other Pods across the cluster/topology domain, not just a single node's static capacity.<br>
+<strong>49.</strong> What's a good way to validate a new scheduling profile before rolling it out broadly? — Test it on a non-critical workload with <code>schedulerName</code> set, comparing actual placement against expectations before switching production Pods.<br>
+<strong>50.</strong> Why is "Pods stuck Pending cluster-wide" almost always a Scheduler-health issue rather than a resource issue? — True resource exhaustion normally produces per-Pod filtering-failure events; a total, cluster-wide freeze instead points to the Scheduler process/leader-election itself being down.
+</div></details>
+
+<footer class="course-footer">Next: Topic 7 — Controller Manager, which reconciles everything the Scheduler and API Server set in motion.</footer>
+
+<script>
+  mermaid.initialize({ startOnLoad: true, theme: 'dark' });
+</script>
+
+</body>
+</html>

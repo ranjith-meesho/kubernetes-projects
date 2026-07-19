@@ -1,0 +1,281 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Topic 8: kubelet — Kubernetes Expert Course</title>
+<link rel="stylesheet" href="styles.css">
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+</head>
+<body>
+
+<header class="course-header">
+  <div class="kicker">Topic 8 of 70</div>
+  <h1>kubelet</h1>
+  <div class="subtitle">The node agent: PLEG, the CRI, static pods, and how probes actually get executed.</div>
+</header>
+
+<nav class="topic-nav">
+  <a href="07-controller-manager.html">&larr; Controller Manager</a>
+  <a href="index.html">Course Index</a>
+  <a href="09-kube-proxy.html">kube-proxy &rarr;</a>
+</nav>
+
+<h2 id="explanation">Explanation</h2>
+<p><strong>kubelet</strong> is the agent that runs on every node (control-plane and worker alike) and is the only
+component that actually turns a Pod spec into running containers. It is not itself a Kubernetes-managed Pod — it runs
+as a systemd service (or equivalent) directly on the host OS, because it has to exist before any Pod, including the
+control plane's own static pods, can run.</p>
+
+<p>Kubernetes needs kubelet because the control plane only ever produces <em>desired state</em> — some local agent
+must translate "this Pod belongs on this node" into actual OS-level work: pulling images, creating network
+namespaces, setting cgroup limits, mounting volumes, running health checks, and reporting back what actually
+happened. kubelet is deliberately node-local and mostly stateless relative to the cluster — it reconstructs its view
+of "what should be running here" primarily from the API Server (plus any local static pod manifests) on every
+restart.</p>
+
+<p>Internally, kubelet's core loop relies on the <strong>PLEG (Pod Lifecycle Event Generator)</strong>: rather than
+inspecting every container's state constantly (expensive at scale), PLEG periodically polls the container runtime for
+state changes and generates internal events, which kubelet's sync loop then reacts to. A slow or wedged container
+runtime shows up as <code>PLEG is not healthy</code> in kubelet logs — one of the most common node-level failure
+signatures in production.</p>
+
+<p>kubelet talks to the container runtime exclusively through the <strong>CRI (Container Runtime Interface)</strong>,
+a gRPC API — this decoupling is what let Kubernetes drop direct Docker integration in favor of any CRI-compliant
+runtime (containerd, CRI-O) without changing kubelet's code. kubelet also executes all three probe types
+(liveness, readiness, startup) locally by directly invoking the configured check (HTTP GET, TCP dial, exec into the
+container, or gRPC) on its own schedule — the API Server is not involved in probe execution at all, only in receiving
+the resulting status updates.</p>
+
+<p>A special kubelet feature, <strong>static pods</strong>, lets it run Pods purely from local manifest files (e.g.
+<code>/etc/kubernetes/manifests/</code>) with no API Server involvement — this is precisely how kubeadm bootstraps the
+control plane itself: kubelet starts kube-apiserver, etcd, and friends as static pods before any API Server exists to
+schedule them normally.</p>
+
+<h2 id="internal-working">Internal Working / Interactions</h2>
+<ul>
+  <li><strong>kubelet &harr; API Server:</strong> watches for Pods bound to its node; posts Node/Pod status and heartbeats back.</li>
+  <li><strong>kubelet &harr; Container Runtime (via CRI):</strong> RunPodSandbox, PullImage, CreateContainer, StartContainer, container status queries.</li>
+  <li><strong>kubelet &harr; PLEG:</strong> internal polling loop that detects container state transitions and feeds kubelet's pod-sync workers.</li>
+  <li><strong>kubelet &harr; CNI plugin:</strong> invoked once per Pod sandbox creation to set up networking and assign an IP.</li>
+  <li><strong>kubelet &harr; probes:</strong> executes liveness/readiness/startup checks locally on its own timer, restarts containers on liveness failure, and reports readiness for Service endpoint inclusion.</li>
+  <li><strong>kubelet &harr; static pod manifests:</strong> reads a local directory independent of the API Server, used for control-plane bootstrapping.</li>
+</ul>
+
+<h2 id="architecture-diagram">Architecture Diagram</h2>
+<pre class="mermaid">
+flowchart TB
+    API["API Server"] <-->|watch Pods bound to node + report status| KL["kubelet"]
+    KL -->|gRPC CRI calls| CRI["Container Runtime (containerd)"]
+    CRI -->|poll state| PLEG["PLEG"]
+    PLEG -->|internal events| SYNC["Pod Sync Loop"]
+    SYNC --> KL
+    KL -->|invoke| CNI["CNI plugin"]
+    KL -->|read manifests| STATIC["/etc/kubernetes/manifests/*.yaml"]
+    KL -->|execute checks| PROBE["Liveness / Readiness / Startup probes"]
+    PROBE -->|restart on failure| CRI
+</pre>
+
+<pre class="mermaid">
+sequenceDiagram
+    participant A as API Server
+    participant K as kubelet
+    participant P as PLEG
+    participant R as Container Runtime
+    A->>K: Watch event: Pod assigned to this node
+    K->>R: RunPodSandbox + CreateContainer + StartContainer (CRI)
+    R-->>K: Container started
+    loop Every ~1s
+        P->>R: ListPodSandboxes / ListContainers (poll)
+        R-->>P: Current container states
+        P->>K: Emit lifecycle event on change
+    end
+    K->>R: Exec readiness probe command
+    R-->>K: Probe result
+    K->>A: Update Pod status (Ready/NotReady)
+</pre>
+
+<h2 id="code-example">Code Example</h2>
+<pre><code># Static pod manifest — kubelet reads this directly from disk, no API Server needed.
+# Used for bootstrapping (control-plane components) or node-local agents.
+# /etc/kubernetes/manifests/nginx-static.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: nginx-static
+  namespace: kube-system
+spec:
+  containers:
+    - name: nginx
+      image: nginx:1.25
+      livenessProbe:
+        httpGet:
+          path: /healthz
+          port: 80
+        initialDelaySeconds: 5
+        periodSeconds: 10          # kubelet itself re-runs this check every 10s, no API Server round trip
+      readinessProbe:
+        tcpSocket:
+          port: 80
+        periodSeconds: 5
+  # Note: kubelet appends a suffix (node hostname) to the pod name and mirrors
+  # a read-only copy to the API Server so `kubectl get pods` can still see it,
+  # but you cannot delete/edit it via kubectl — only by editing/removing the file.
+</code></pre>
+
+<h2 id="kubectl-commands">kubectl Commands</h2>
+<pre><code># Check kubelet version and health per node
+kubectl get nodes -o custom-columns=NAME:.metadata.name,KUBELET:.status.nodeInfo.kubeletVersion
+
+# See PLEG or kubelet errors surfaced in node conditions/events
+kubectl describe node worker-3 | grep -A10 Conditions
+kubectl get events --field-selector involvedObject.kind=Node
+
+# Inspect a Pod's probe configuration and recent probe failures
+kubectl describe pod my-pod | grep -A5 Liveness
+kubectl get events --field-selector reason=Unhealthy
+
+# Static pods show up with a node-suffixed name
+kubectl get pods -n kube-system | grep static
+
+# Directly view kubelet's own logs (on the node, or via journalctl over SSH)
+# journalctl -u kubelet -f
+kubectl logs -n kube-system <static-pod-name>
+</code></pre>
+
+<h2 id="best-practices">Best Practices &amp; Common Pitfalls</h2>
+<div class="grid-2">
+<div>
+<h4>Best Practices</h4>
+<ul>
+  <li>Set realistic probe timings — too-aggressive liveness probes cause needless restart loops under load.</li>
+  <li>Match kubelet's cgroup driver to the container runtime's exactly.</li>
+  <li>Reserve resources for kubelet/system daemons via <code>--system-reserved</code>/<code>--kube-reserved</code>.</li>
+  <li>Use static pods only for genuinely node-local, bootstrap-critical agents — not general workloads.</li>
+</ul>
+</div>
+<div>
+<h4>Pitfalls</h4>
+<ul>
+  <li>Ignoring <code>PLEG is not healthy</code> warnings — usually indicates an overloaded or misbehaving container runtime.</li>
+  <li>Setting liveness probes identical to readiness probes — a slow dependency then causes unnecessary restarts instead of just removal from Service endpoints.</li>
+  <li>Trying to <code>kubectl delete</code> a static pod — it will simply be recreated from the local manifest.</li>
+  <li>Not monitoring kubelet's own resource usage — a starved kubelet delays every Pod lifecycle operation on that node.</li>
+</ul>
+</div>
+</div>
+
+<h2 id="interview-questions">50 Interview Questions</h2>
+
+<details class="qa"><summary>1. What is kubelet and why does it run as a systemd service rather than a Kubernetes Pod?</summary>
+<div class="qa-body"><strong>Short answer:</strong> kubelet is the per-node agent that turns a Pod spec into actual running containers; it can't be a Pod itself because it must exist before any Pod, including control-plane static pods, can run.
+<br><strong>Detail:</strong> It runs directly on the host OS (systemd unit or equivalent), watches the API Server for Pods bound to its node, and is the only component that actually drives image pulls, namespace/cgroup creation, volume mounts, and probe execution.
+<br><strong>Production example:</strong> kubeadm bootstraps kube-apiserver itself as a static pod started by kubelet before any API Server exists to schedule it normally.
+<br><strong>Common mistake:</strong> Assuming kubelet is "just another controller" that could be restarted like a Deployment — it's foundational infrastructure the rest of the node depends on.</div></details>
+
+<details class="qa"><summary>2. What is PLEG and why does kubelet need it?</summary>
+<div class="qa-body"><strong>Short answer:</strong> PLEG (Pod Lifecycle Event Generator) periodically polls the container runtime for state changes instead of kubelet inspecting every container constantly.
+<br><strong>Detail:</strong> Constant per-container inspection doesn't scale; PLEG polls at a fixed interval (~1s), diffs state, and emits internal events that drive kubelet's pod-sync workers, decoupling the runtime's actual state from kubelet's reconciliation loop.
+<br><strong>Production example:</strong> <code>PLEG is not healthy</code> in kubelet logs is one of the most common node-level failure signatures, usually pointing at an overloaded or wedged container runtime.
+<br><strong>Common mistake:</strong> Treating a PLEG warning as a kubelet bug rather than investigating the underlying container runtime's health first.</div></details>
+
+<details class="qa"><summary>3. What is the CRI and why was it introduced?</summary>
+<div class="qa-body"><strong>Short answer:</strong> The Container Runtime Interface is a gRPC API that decouples kubelet from any specific container runtime implementation.
+<br><strong>Detail:</strong> Before CRI, kubelet had Docker-specific integration code baked in; CRI let Kubernetes support any CRI-compliant runtime (containerd, CRI-O) without ever changing kubelet's own code.
+<br><strong>Production example:</strong> Migrating a cluster from dockershim to containerd required no kubelet code changes — only runtime-level configuration.
+<br><strong>Common mistake:</strong> Assuming kubelet talks to Docker directly today — direct Docker integration (dockershim) was removed; everything goes through CRI.</div></details>
+
+<details class="qa"><summary>4. Who actually executes liveness/readiness/startup probes, and how?</summary>
+<div class="qa-body"><strong>Short answer:</strong> kubelet itself, executing the configured check (HTTP GET, TCP dial, exec, or gRPC) locally on its own schedule.
+<br><strong>Detail:</strong> The API Server is never involved in probe execution — it only receives the resulting status updates kubelet posts back after running the check.
+<br><strong>Production example:</strong> A readiness probe failing removes a Pod from Service EndpointSlices purely because kubelet reports NotReady to the API Server, which kube-proxy's watch then reacts to.
+<br><strong>Common mistake:</strong> Believing probe failures are detected centrally — probe execution is entirely node-local and decentralized.</div></details>
+
+<details class="qa"><summary>5. What is a static pod and what problem does it solve?</summary>
+<div class="qa-body"><strong>Short answer:</strong> A Pod kubelet starts directly from a local manifest file, with no API Server involved at all.
+<br><strong>Detail:</strong> This solves the chicken-and-egg bootstrap problem — kubeadm needs kube-apiserver running before anything can schedule it normally, so kubelet reads manifests from <code>/etc/kubernetes/manifests/</code> and starts them unconditionally.
+<br><strong>Production example:</strong> kube-apiserver, etcd, kube-scheduler, and kube-controller-manager all run as static pods on kubeadm control-plane nodes.
+<br><strong>Common mistake:</strong> Running <code>kubectl delete</code> on a static pod expecting it to stay deleted — kubelet just recreates it from the file.</div></details>
+
+<details class="qa"><summary>6. Why does the cgroup driver need to match between kubelet and the container runtime?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Both must agree on the same cgroup management mechanism (systemd vs cgroupfs) or resource enforcement becomes inconsistent and unstable.
+<br><strong>Detail:</strong> kubelet and the runtime both write cgroup settings for the same containers; a mismatch causes two different managers competing over the same cgroup hierarchy, leading to subtle instability that's hard to diagnose.
+<br><strong>Production example:</strong> Setting <code>SystemdCgroup = true</code> in containerd's config specifically to match kubelet's <code>cgroupDriver=systemd</code> flag.
+<br><strong>Common mistake:</strong> Changing kubelet's cgroup driver without updating the runtime's matching setting, or vice versa.</div></details>
+
+<details class="qa"><summary>7. How does kubelet learn what Pods should run on its node after a restart?</summary>
+<div class="qa-body"><strong>Short answer:</strong> It reconstructs its view primarily from the API Server (plus any local static pod manifests), rather than persisting cluster state itself.
+<br><strong>Detail:</strong> kubelet is deliberately mostly stateless relative to the cluster — on restart it re-watches Pods bound to its node and re-derives what should be running, rather than trusting stale local state.
+<br><strong>Production example:</strong> A kubelet restart after a node reboot doesn't lose track of which Pods belong there — it re-syncs from the API Server's bound-Pod list.
+<br><strong>Common mistake:</strong> Assuming kubelet caches authoritative state — the API Server (backed by etcd) remains the source of truth.</div></details>
+
+<details class="qa"><summary>8. What is the difference between a liveness probe and a readiness probe from kubelet's perspective?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Both are executed identically by kubelet, but liveness failure triggers a container restart while readiness failure only removes the Pod from Service endpoints.
+<br><strong>Detail:</strong> kubelet runs each on its own configured schedule and reports each result independently to the API Server; the difference is purely in the consuming action, not in how kubelet executes the check.
+<br><strong>Production example:</strong> Setting liveness identical to readiness causes unnecessary restarts on a slow dependency instead of just a temporary Service removal.
+<br><strong>Common mistake:</strong> Conflating the two and using overly aggressive liveness probes that cause restart loops under normal load spikes.</div></details>
+
+<details class="qa"><summary>9. What role does kubelet play in Pod networking?</summary>
+<div class="qa-body"><strong>Short answer:</strong> kubelet invokes the CNI plugin once per Pod sandbox creation to set up networking and assign an IP.
+<br><strong>Detail:</strong> kubelet itself doesn't implement networking — it delegates to the CNI plugin at the right point in sandbox creation, after the runtime has created the network namespace.
+<br><strong>Production example:</strong> A misconfigured CNI plugin surfaces as Pods stuck in <code>ContainerCreating</code> even though the runtime and image pull succeeded.
+<br><strong>Common mistake:</strong> Debugging Pod network issues by looking at kubelet logs only, instead of checking CNI plugin logs/config directly.</div></details>
+
+<details class="qa"><summary>10. Why is reserving CPU/memory for kubelet itself (via --system-reserved/--kube-reserved) important?</summary>
+<div class="qa-body"><strong>Short answer:</strong> A starved kubelet delays every Pod lifecycle operation on that node, including probe execution and status reporting.
+<br><strong>Detail:</strong> Without reserved capacity, workload Pods can consume enough node resources to slow or block kubelet's own sync loop, cascading into missed heartbeats and delayed reconciliation.
+<br><strong>Production example:</strong> A node running at 100% CPU utilization from workloads showing delayed <code>NodeReady</code> heartbeats because kubelet itself can't get scheduled CPU time.
+<br><strong>Common mistake:</strong> Not monitoring kubelet's own resource usage separately from workload Pod usage on the same node.</div></details>
+
+<details class="qa"><summary>11–50. Additional rapid-fire questions</summary>
+<div class="qa-body">
+<strong>11.</strong> What CRI calls does kubelet make to start a container? — RunPodSandbox, PullImage, CreateContainer, StartContainer, in that order.<br>
+<strong>12.</strong> What transport does the CRI gRPC API use? — A Unix domain socket on the node, between kubelet and the runtime process.<br>
+<strong>13.</strong> What happens if the container runtime hangs? — PLEG polling stalls, kubelet logs "PLEG is not healthy", and the node may be marked NotReady if it persists.<br>
+<strong>14.</strong> Can kubelet schedule Pods onto other nodes? — No — kubelet only ever manages Pods already bound to its own node; placement is the Scheduler's job.<br>
+<strong>15.</strong> How does kubelet report Node health to the API Server? — Periodic heartbeats/status updates via the API Server, reflected as Node Conditions.<br>
+<strong>16.</strong> What's a mirror pod? — The read-only, API-Server-visible representation of a static pod that <code>kubectl get pods</code> can see but not edit/delete.<br>
+<strong>17.</strong> Why can't you edit a static pod via kubectl? — kubectl edits go to the API Server, but the source of truth for a static pod is the local manifest file kubelet reads directly.<br>
+<strong>18.</strong> What kubelet flag controls where static pod manifests are read from? — <code>--pod-manifest-path</code> (defaults to <code>/etc/kubernetes/manifests/</code> in kubeadm).<br>
+<strong>19.</strong> How often does PLEG poll the runtime by default? — Roughly every second, though this is configurable.<br>
+<strong>20.</strong> What does an exec probe actually invoke? — kubelet runs the configured command inside the container's namespace via the CRI's exec mechanism.<br>
+<strong>21.</strong> What happens to a container after N consecutive liveness probe failures? — kubelet kills and restarts it, subject to the Pod's restart policy and backoff.<br>
+<strong>22.</strong> Does a failing startup probe affect liveness/readiness probes? — Yes — liveness and readiness probes are disabled until the startup probe first succeeds.<br>
+<strong>23.</strong> What's the risk of setting periodSeconds too low on probes? — Excess load on the container and runtime from constant checks, worsening any existing performance issue.<br>
+<strong>24.</strong> How does kubelet know a Pod has been deleted from the API Server? — Its watch on Pods bound to its node fires a delete event, triggering graceful termination locally.<br>
+<strong>25.</strong> What's the relationship between kubelet and the kubelet config file vs command-line flags? — Both configure kubelet; the KubeletConfiguration file is the modern, preferred approach over scattered flags.<br>
+<strong>26.</strong> Why must static pods run in kube-system namespace by convention? — Not a hard requirement, but standard practice since they're typically control-plane/infra components.<br>
+<strong>27.</strong> What happens if kubelet itself crashes? — Running containers keep running (the runtime manages them independently); no new lifecycle operations occur until kubelet restarts.<br>
+<strong>28.</strong> How does kubelet enforce that a container respects its resource limits? — It doesn't directly — it passes the limits to the container runtime, which configures cgroups; enforcement happens at the kernel level.<br>
+<strong>29.</strong> What log would you check first for a Pod stuck in ContainerCreating? — kubelet logs and CRI-level tooling (crictl) to see which CRI call is failing or slow.<br>
+<strong>30.</strong> Why is kubelet described as "mostly stateless relative to the cluster"? — It rebuilds its worldview from the API Server on every restart rather than depending on persisted local cluster state.<br>
+<strong>31.</strong> What's the effect of a node's kubelet losing network connectivity to the API Server? — The node eventually shows NotReady from other components' perspective, but kubelet keeps running already-started Pods locally.<br>
+<strong>32.</strong> Does kubelet handle volume mounting itself? — kubelet coordinates the mount via volume plugins/CSI, invoked as part of Pod sandbox/container setup.<br>
+<strong>33.</strong> What determines whether a probe failure causes a restart vs just an endpoint removal? — Whether it's a liveness probe (restart) or a readiness probe (endpoint removal only).<br>
+<strong>34.</strong> How would you check which CRI runtime a node is using? — <code>kubectl get nodes -o custom-columns=...containerRuntimeVersion</code> or checking kubelet's <code>--container-runtime-endpoint</code> flag.<br>
+<strong>35.</strong> What's the purpose of a gRPC-based probe type? — Directly calls a container's gRPC health-check service instead of relying on HTTP/TCP/exec.<br>
+<strong>36.</strong> Why is kubelet's sync loop described as reactive rather than polling every container state directly? — PLEG's diffing shields the sync loop from expensive constant per-container inspection.<br>
+<strong>37.</strong> What's a common misdiagnosis when kubelet reports PLEG unhealthy? — Assuming it's a kubelet bug rather than an overloaded/misconfigured container runtime or disk I/O bottleneck.<br>
+<strong>38.</strong> Can a Pod exist without kubelet ever seeing it? — No — no Pod runs anywhere without some kubelet driving it through the CRI on its bound node.<br>
+<strong>39.</strong> What's the operational value of static pods beyond control-plane bootstrapping? — Running genuinely node-local, bootstrap-critical agents that must survive even if the API Server is unreachable.<br>
+<strong>40.</strong> Why shouldn't static pods be used for general application workloads? — They bypass the Scheduler, ReplicaSet self-healing, and standard rollout mechanisms entirely.<br>
+<strong>41.</strong> What kubelet component decides which volume plugin/CSI driver to invoke? — kubelet's volume manager, based on the Pod spec's volume source type.<br>
+<strong>42.</strong> How does kubelet detect a container has crashed? — Via PLEG polling the runtime and detecting a state transition from Running to Exited.<br>
+<strong>43.</strong> What happens to probe results if kubelet itself is under CPU pressure? — Probes may run late or be delayed, potentially causing false liveness failures under severe starvation.<br>
+<strong>44.</strong> Why does removing dockershim not affect most workloads? — Because kubelet's CRI-based design meant workloads never depended on Docker-specific behavior directly, only CRI-compliant behavior.<br>
+<strong>45.</strong> What's the first place to look when a node shows repeated container restarts cluster-wide? — kubelet logs and PLEG health, then the container runtime's own logs (containerd/CRI-O).<br>
+<strong>46.</strong> How does kubelet expose Pod status changes to the rest of the cluster? — By posting Pod status updates back to the API Server, which other watchers (kube-proxy, controllers) react to.<br>
+<strong>47.</strong> What's the significance of kubelet running "before any Pod, including control-plane static pods"? — It establishes kubelet as more foundational than the API Server itself in a bootstrapping cluster.<br>
+<strong>48.</strong> Why is matching kubelet and runtime cgroup drivers considered a common pitfall, not just a config detail? — Because the failure mode is subtle instability rather than an obvious startup error, making it hard to trace back.<br>
+<strong>49.</strong> What's the relationship between kubelet and node conditions like MemoryPressure/DiskPressure? — kubelet computes and reports these based on local node resource observation, used by the Scheduler and eviction manager.<br>
+<strong>50.</strong> Why is kubelet considered the single most operationally critical node-level component to monitor? — Every Pod lifecycle operation (start, probe, restart, terminate) on that node depends on kubelet functioning correctly.
+</div></details>
+
+<footer class="course-footer">Next: Topic 9 — kube-proxy, which programs the networking rules that route traffic to the Pods kubelet starts.</footer>
+
+<script>
+  mermaid.initialize({ startOnLoad: true, theme: 'dark' });
+</script>
+
+</body>
+</html>

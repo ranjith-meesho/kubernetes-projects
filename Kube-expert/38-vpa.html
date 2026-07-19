@@ -1,0 +1,312 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Topic 38: Vertical Pod Autoscaler (VPA) — Kubernetes Expert Course</title>
+<link rel="stylesheet" href="styles.css">
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+</head>
+<body>
+
+<header class="course-header">
+  <div class="kicker">Topic 38 of 70</div>
+  <h1>Vertical Pod Autoscaler (VPA)</h1>
+  <div class="subtitle">Right-sizing container CPU and memory requests/limits automatically instead of guessing once and never revisiting.</div>
+</header>
+
+<nav class="topic-nav">
+  <a href="37-hpa.html">&larr; HPA</a>
+  <a href="index.html">Course Index</a>
+  <a href="39-cluster-autoscaler.html">Cluster Autoscaler &rarr;</a>
+</nav>
+
+<h2 id="explanation">Explanation</h2>
+<p>The <strong>Vertical Pod Autoscaler (VPA)</strong> is a set of components (not built into core Kubernetes — it's a
+separate project under <code>kubernetes/autoscaler</code>) that automatically adjusts a container's
+<strong>resource requests and limits</strong> based on observed historical usage, rather than relying on a developer's
+initial guess. Where HPA (topic 37) changes <em>how many</em> Pods run, VPA changes <em>how big</em> each Pod is
+allowed to be — the two are complementary, not competing, though they should generally not both manage the exact same
+metric on the exact same workload simultaneously.</p>
+
+<p>Kubernetes needs this because manually set resource requests are almost always wrong in one direction or the other:
+set too high and you waste cluster capacity (paying for CPU/memory nobody uses); set too low and the Pod gets
+throttled or OOM-killed under real load. Getting requests right requires observing actual usage over time — exactly
+the kind of continuous, data-driven adjustment a human operator is bad at doing repeatedly across hundreds of
+services, and exactly what VPA automates.</p>
+
+<p>VPA is composed of three cooperating components, each with a distinct job:</p>
+<ul>
+  <li><strong>Recommender</strong> — watches historical and current resource usage (via metrics-server/Prometheus) for Pods matching a VPA object's target, and computes recommended requests (lower bound, target, upper bound) using a decayed histogram model.</li>
+  <li><strong>Updater</strong> — checks running Pods against the Recommender's current recommendation; if a Pod's requests are significantly out of line, it evicts the Pod (respecting PodDisruptionBudgets) so it can be recreated with updated values — because requests are immutable on a running Pod, updating them requires recreation.</li>
+  <li><strong>Admission Controller (webhook)</strong> — intercepts Pod creation and mutates the incoming Pod's resource requests/limits to match the current recommendation, before it ever reaches the Scheduler.</li>
+</ul>
+
+<p>The <code>updateMode</code> field controls how aggressively VPA acts: <code>Off</code> (recommendations only, nothing
+applied automatically — a very common safe starting point), <code>Initial</code> (apply only at Pod creation, never
+evict running Pods), <code>Recreate</code> (evict and recreate Pods when recommendations drift), and
+<code>Auto</code> (currently equivalent to Recreate, reserved for future in-place resize support). Because updating
+requests today requires deleting and recreating the Pod, VPA in <code>Recreate</code>/<code>Auto</code> mode causes
+real disruption — this is the single biggest operational caveat teams need to plan around (PodDisruptionBudgets,
+multiple replicas, avoiding VPA on singleton stateful workloads).</p>
+
+<p>In production, VPA's most common use is running in <code>Off</code> mode purely for its recommendations — teams pipe
+the Recommender's output into dashboards or CI checks to catch egregiously over/under-provisioned workloads, then
+apply changes deliberately through code review rather than letting VPA evict pods automatically. Full <code>Auto</code>
+mode is more common for stateless, horizontally-redundant workloads with generous PodDisruptionBudgets, and is
+explicitly discouraged for anything combined with HPA on the same resource dimension.</p>
+
+<div class="callout warn">
+  <strong>VPA + HPA conflict:</strong> Never let VPA manage CPU requests for a workload where HPA also scales on CPU
+  utilization — VPA changing the request changes the denominator HPA uses for utilization, causing the two controllers
+  to fight. If you need both, have HPA scale on a custom/external metric and let VPA manage CPU/memory sizing.
+</div>
+
+<h2 id="internal-working">Internal Working / Interactions</h2>
+<ul>
+  <li><strong>metrics-server / Prometheus:</strong> the Recommender's raw usage data source — same pipeline HPA depends on for resource metrics.</li>
+  <li><strong>VPA Recommender:</strong> maintains an in-memory (and optionally checkpointed) decayed histogram of usage per container, computing target/lower-bound/upper-bound recommendations continuously.</li>
+  <li><strong>VPA Updater:</strong> periodically compares live Pods against current recommendations; if a Pod is far enough out of range and its update policy allows it, evicts the Pod via the Eviction API (respecting PodDisruptionBudget).</li>
+  <li><strong>VPA Admission Controller:</strong> registered as a mutating admission webhook; intercepts Pod CREATE requests matching an active VPA object and rewrites <code>resources.requests</code>/<code>limits</code> before the API Server persists the object.</li>
+  <li><strong>Scheduler:</strong> sees only the already-mutated resource values by the time it schedules the recreated Pod — it has no direct awareness of VPA.</li>
+  <li><strong>PodDisruptionBudget:</strong> consulted by the Updater before evicting — VPA will not evict a Pod if doing so would violate the target workload's PDB.</li>
+</ul>
+
+<h2 id="architecture-diagram">Architecture Diagram</h2>
+<pre class="mermaid">
+flowchart TB
+    MS["metrics-server / Prometheus"] --> REC["VPA Recommender\n(histogram of usage over time)"]
+    REC -->|"Writes recommendation to"| VPAOBJ["VerticalPodAutoscaler object\n.status.recommendation"]
+    VPAOBJ --> UPD["VPA Updater"]
+    UPD -->|"Pod out of range + updateMode=Auto"| PDB["Check PodDisruptionBudget"]
+    PDB -->|"Allowed"| EVICT["Evict pod"]
+    EVICT --> RC["ReplicaSet Controller recreates pod"]
+    RC --> ADM["VPA Admission Webhook"]
+    ADM -->|"Mutates requests/limits"| API["API Server persists updated pod"]
+    API --> SCHED["Scheduler places pod with new sizing"]
+</pre>
+
+<pre class="mermaid">
+sequenceDiagram
+    participant R as Recommender
+    participant V as VPA object
+    participant U as Updater
+    participant A as API Server
+    participant W as Admission Webhook
+    participant S as Scheduler
+
+    R->>V: Update recommendation (cpu: 250m -> 400m)
+    U->>V: Poll current recommendation
+    U->>A: Compare against running pod's actual requests (250m)
+    U->>A: Evict pod (PDB allows it)
+    A->>A: ReplicaSet controller creates replacement pod
+    A->>W: AdmissionReview for new pod
+    W->>W: Mutate requests.cpu = 400m per current recommendation
+    W-->>A: Return mutated pod spec
+    A->>S: Schedule pod with updated resources
+</pre>
+
+<h2 id="code-example">Code Example</h2>
+<pre><code>apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: checkout-vpa
+  namespace: payments
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: checkout-service
+  updatePolicy:
+    updateMode: "Off"          # SAFE default: only produce recommendations, never evict/mutate pods
+  resourcePolicy:
+    containerPolicies:
+      - containerName: checkout
+        minAllowed:               # floor - never recommend below this
+          cpu: "100m"
+          memory: "128Mi"
+        maxAllowed:               # ceiling - never recommend above this
+          cpu: "2"
+          memory: "2Gi"
+        controlledResources: ["cpu", "memory"]
+</code></pre>
+
+<pre><code>apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: batch-worker-vpa
+  namespace: batch
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: batch-worker
+  updatePolicy:
+    updateMode: "Auto"          # actively evict + resize - only safe because batch-worker is
+                                  # stateless, horizontally redundant, and has a permissive PDB
+  resourcePolicy:
+    containerPolicies:
+      - containerName: worker
+        controlledValues: RequestsAndLimits   # update both requests and limits, not just requests
+        minAllowed: { cpu: "200m", memory: "256Mi" }
+        maxAllowed: { cpu: "4", memory: "4Gi" }
+</code></pre>
+
+<h2 id="kubectl-commands">kubectl Commands</h2>
+<pre><code># View current VPA recommendation
+kubectl describe vpa checkout-vpa -n payments
+
+# See just the recommendation block
+kubectl get vpa checkout-vpa -n payments -o jsonpath='{.status.recommendation}'
+
+# List all VPA objects and their target workloads
+kubectl get vpa -A
+
+# Check VPA component health (recommender/updater/admission-controller pods)
+kubectl get pods -n kube-system -l app=vpa-recommender
+kubectl get pods -n kube-system -l app=vpa-updater
+kubectl get pods -n kube-system -l app=vpa-admission-controller
+
+# Confirm the admission webhook is registered
+kubectl get mutatingwebhookconfigurations | grep vpa
+
+# Watch a pod get evicted and recreated with new resources
+kubectl get pods -n payments -l app=checkout -w
+</code></pre>
+
+<h2 id="best-practices">Best Practices &amp; Common Pitfalls</h2>
+<div class="grid-2">
+<div>
+<h4>Do's</h4>
+<ul>
+  <li>Start every VPA rollout in <code>updateMode: Off</code> and review recommendations before enabling eviction.</li>
+  <li>Always set <code>minAllowed</code>/<code>maxAllowed</code> bounds to prevent runaway recommendations from a noisy usage spike.</li>
+  <li>Ensure a permissive PodDisruptionBudget exists before enabling <code>Auto</code>/<code>Recreate</code> mode.</li>
+  <li>Reserve VPA for workloads where usage is relatively stable/predictable over time — it reacts slowly to sudden shifts.</li>
+</ul>
+</div>
+<div>
+<h4>Don'ts</h4>
+<ul>
+  <li>Don't run VPA in <code>Auto</code> mode on singleton StatefulSets or workloads with no redundancy — evictions cause real downtime.</li>
+  <li>Don't let VPA and HPA both control CPU on the same workload — they will fight and cause instability.</li>
+  <li>Don't expect VPA to resize a running pod in place today — it always works via evict + recreate, which is disruptive.</li>
+  <li>Don't skip monitoring VPA's own resource usage — the Recommender keeps histograms per container and can become memory-heavy in very large clusters.</li>
+</ul>
+</div>
+</div>
+
+<h2 id="interview-questions">50 Interview Questions</h2>
+
+<details class="qa"><summary>1. What does VPA change about a Pod, and how is that different from HPA?</summary>
+<div class="qa-body"><strong>Short answer:</strong> VPA changes a container's resource requests/limits ("how big" a Pod is) rather than the replica count ("how many" Pods exist), which is HPA's job.
+<br><strong>Detail:</strong> The two are complementary axes of autoscaling — vertical (size) vs horizontal (count) — and generally should not both manage the same metric on the same workload.
+<br><strong>Production example:</strong> checkout-vpa adjusts the checkout container's CPU/memory requests based on observed usage, while a separate HPA (topic 37) would scale replica count on an unrelated metric.
+<br><strong>Common mistake:</strong> Treating VPA as "just HPA but for resources" rather than understanding it operates on a completely different, and disruptive, mechanism (evict + recreate).</div></details>
+
+<details class="qa"><summary>2. Name and describe VPA's three components.</summary>
+<div class="qa-body"><strong>Short answer:</strong> Recommender (computes recommendations from historical usage), Updater (evicts out-of-range running Pods), and Admission Controller (mutates new Pods' resources at creation time).
+<br><strong>Detail:</strong> Each has a single responsibility: the Recommender never touches live Pods, the Updater only decides *whether* to evict, and the Admission Controller is the only component that actually writes new resource values, and only at Pod creation.
+<br><strong>Production example:</strong> A recommendation drift is computed by the Recommender, acted on by the Updater (eviction), and then applied by the Admission Controller when the replacement Pod is created.
+<br><strong>Common mistake:</strong> Assuming the Updater directly resizes a Pod — it can only evict; the Admission Controller does the actual mutation on the recreated Pod.</div></details>
+
+<details class="qa"><summary>3. Why can't VPA resize a running Pod in place today?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Because resource requests/limits are immutable on a running Pod spec — the only way to change them is to delete and recreate the Pod.
+<br><strong>Detail:</strong> This is why <code>Auto</code>/<code>Recreate</code> mode is inherently disruptive, and why <code>updateMode: Off</code> (recommendations only) is a common safe starting point.
+<br><strong>Production example:</strong> batch-worker-vpa in Auto mode evicts and recreates Pods whenever the recommendation drifts, relying on the workload being stateless and horizontally redundant to absorb the disruption.
+<br><strong>Common mistake:</strong> Expecting VPA in Auto mode to behave like a live, in-place resize with zero disruption.</div></details>
+
+<details class="qa"><summary>4. What are the four <code>updateMode</code> values and what does each do?</summary>
+<div class="qa-body"><strong>Short answer:</strong> <code>Off</code> (recommend only), <code>Initial</code> (apply only at Pod creation, never evict), <code>Recreate</code> (evict and recreate when recommendations drift), <code>Auto</code> (currently equivalent to Recreate).
+<br><strong>Detail:</strong> <code>Auto</code> is reserved for future in-place resize support but today behaves identically to <code>Recreate</code> — both cause eviction-driven disruption.
+<br><strong>Production example:</strong> checkout-vpa uses <code>updateMode: "Off"</code> so teams review recommendations before ever letting VPA touch a running Pod.
+<br><strong>Common mistake:</strong> Assuming <code>Auto</code> already supports true in-place resizing rather than still relying on evict + recreate under the hood.</div></details>
+
+<details class="qa"><summary>5. Where does the Recommender get its usage data from, and what does it compute?</summary>
+<div class="qa-body"><strong>Short answer:</strong> It watches historical/current usage via metrics-server or Prometheus and computes recommended requests as lower bound, target, and upper bound using a decayed histogram model.
+<br><strong>Detail:</strong> This is the same underlying metrics pipeline HPA depends on for resource metrics, just consumed for a different purpose — sizing rather than scaling.
+<br><strong>Production example:</strong> checkout-vpa's Recommender maintains a per-container histogram feeding <code>.status.recommendation</code>, which teams pipe into dashboards even in Off mode.
+<br><strong>Common mistake:</strong> Assuming the Recommender needs its own dedicated metrics pipeline rather than reusing metrics-server/Prometheus.</div></details>
+
+<details class="qa"><summary>6. Why does the Updater check PodDisruptionBudgets before evicting?</summary>
+<div class="qa-body"><strong>Short answer:</strong> To avoid violating availability guarantees — VPA will not evict a Pod if doing so would drop the workload below its PDB's <code>minAvailable</code>.
+<br><strong>Detail:</strong> This is the same Eviction API mechanism used elsewhere in Kubernetes (e.g. node drains); VPA doesn't bypass it just because it's an autoscaler.
+<br><strong>Production example:</strong> batch-worker-vpa is only safe in Auto mode because batch-worker has a permissive PDB allowing evictions without breaching availability.
+<br><strong>Common mistake:</strong> Enabling Auto/Recreate mode on a workload with no PDB or a singleton replica count, causing real downtime on every eviction.</div></details>
+
+<details class="qa"><summary>7. What happens architecturally when the Admission Controller intercepts a Pod?</summary>
+<div class="qa-body"><strong>Short answer:</strong> It's registered as a mutating admission webhook that rewrites <code>resources.requests</code>/<code>limits</code> on matching Pod CREATE requests before the API Server persists the object.
+<br><strong>Detail:</strong> Because this happens before persistence, the Scheduler only ever sees the already-mutated values — it has no direct awareness that VPA exists.
+<br><strong>Production example:</strong> When batch-worker-vpa evicts a Pod, the ReplicaSet controller's replacement Pod gets its CPU/memory rewritten by the webhook before the Scheduler ever places it.
+<br><strong>Common mistake:</strong> Assuming the Scheduler applies VPA's recommendation itself — it never does; mutation happens strictly earlier, at admission.</div></details>
+
+<details class="qa"><summary>8. Why is it dangerous to run VPA and HPA on the same metric for the same workload?</summary>
+<div class="qa-body"><strong>Short answer:</strong> VPA changing a Pod's CPU request changes the denominator HPA uses to compute utilization percentage, causing the two controllers to fight and destabilize replica count.
+<br><strong>Detail:</strong> The fix is to have HPA scale on a custom/external metric unrelated to the dimension VPA manages, or use VPA only in <code>Off</code> mode for recommendations.
+<br><strong>Production example:</strong> A workload with both HPA (CPU) and VPA (CPU, Auto mode) churned replicas erratically until VPA was switched to Off mode.
+<br><strong>Common mistake:</strong> Enabling VPA Auto mode on a workload already scaled by CPU-based HPA without redesigning which controller owns which dimension.</div></details>
+
+<details class="qa"><summary>9. Why do most production teams run VPA in <code>Off</code> mode?</summary>
+<div class="qa-body"><strong>Short answer:</strong> To get the Recommender's sizing insights (piped into dashboards or CI checks) without letting the Updater evict Pods automatically.
+<br><strong>Detail:</strong> This lets teams apply changes deliberately through code review, catching egregiously over/under-provisioned workloads without risking unplanned disruption.
+<br><strong>Production example:</strong> checkout-vpa runs in Off mode purely so <code>kubectl describe vpa</code> output can inform a manual resource-request PR.
+<br><strong>Common mistake:</strong> Jumping straight to Auto mode on a new workload without first observing what Off-mode recommendations look like.</div></details>
+
+<details class="qa"><summary>10. What is the purpose of <code>minAllowed</code>/<code>maxAllowed</code> in a VPA's resourcePolicy?</summary>
+<div class="qa-body"><strong>Short answer:</strong> They bound the Recommender's output so a noisy usage spike can't produce a runaway recommendation far outside sane limits.
+<br><strong>Detail:</strong> <code>minAllowed</code> acts as a floor (never recommend below this) and <code>maxAllowed</code> as a ceiling (never recommend above this), regardless of what the histogram computes.
+<br><strong>Production example:</strong> checkout-vpa bounds CPU between 100m and 2 cores so a brief traffic anomaly can't push the recommendation to an absurd value.
+<br><strong>Common mistake:</strong> Omitting min/maxAllowed bounds entirely, letting a transient spike produce an unrealistic recommendation that then gets applied.</div></details>
+
+<details class="qa"><summary>11–50. Additional rapid-fire questions</summary>
+<div class="qa-body">
+<strong>11.</strong> Is VPA built into core Kubernetes? — No, it's a separate project under <code>kubernetes/autoscaler</code>, installed separately.<br>
+<strong>12.</strong> What API group/kind defines a VPA object? — <code>autoscaling.k8s.io/v1</code>, kind <code>VerticalPodAutoscaler</code>.<br>
+<strong>13.</strong> What field on a VPA object points at the workload it manages? — <code>spec.targetRef</code>.<br>
+<strong>14.</strong> What problem does VPA solve that manual resource-request tuning doesn't scale to? — Continuously re-evaluating actual usage across hundreds of services, which a human operator can't do repeatedly and accurately.<br>
+<strong>15.</strong> What happens if requests are set too high manually? — Wasted cluster capacity — paying for CPU/memory nobody uses.<br>
+<strong>16.</strong> What happens if requests are set too low manually? — The Pod gets throttled (CPU) or OOM-killed (memory) under real load.<br>
+<strong>17.</strong> What command shows a VPA's current recommendation? — <code>kubectl describe vpa &lt;name&gt; -n &lt;namespace&gt;</code>.<br>
+<strong>18.</strong> What command extracts just the recommendation block via jsonpath? — <code>kubectl get vpa &lt;name&gt; -o jsonpath='{.status.recommendation}'</code>.<br>
+<strong>19.</strong> What labels identify the three VPA component Pods in kube-system? — <code>app=vpa-recommender</code>, <code>app=vpa-updater</code>, <code>app=vpa-admission-controller</code>.<br>
+<strong>20.</strong> How do you confirm the VPA admission webhook is registered? — <code>kubectl get mutatingwebhookconfigurations | grep vpa</code>.<br>
+<strong>21.</strong> What field controls whether both requests and limits are updated, or requests only? — <code>controlledValues</code> (e.g. <code>RequestsAndLimits</code>).<br>
+<strong>22.</strong> What field restricts VPA to only certain resource types? — <code>controlledResources</code> (e.g. <code>["cpu", "memory"]</code>).<br>
+<strong>23.</strong> Why is VPA discouraged on singleton StatefulSets? — Evictions in Auto/Recreate mode cause real downtime with no redundant replica to absorb it.<br>
+<strong>24.</strong> What kind of workloads is full Auto mode most appropriate for? — Stateless, horizontally-redundant workloads with generous PodDisruptionBudgets.<br>
+<strong>25.</strong> Does the Recommender ever directly modify a running Pod? — No — it only writes recommendations to the VPA object's status; the Updater and Admission Controller act on them.<br>
+<strong>26.</strong> What model does the Recommender use internally? — A decayed histogram of usage per container, maintained in-memory (optionally checkpointed).<br>
+<strong>27.</strong> What's a known operational cost of running VPA in very large clusters? — The Recommender's per-container histograms can become memory-heavy at scale.<br>
+<strong>28.</strong> What API does the Updater use to remove a Pod? — The Eviction API, same mechanism used for node drains.<br>
+<strong>29.</strong> If a Pod's requests are already close to the recommendation, does the Updater evict it? — No — eviction only happens when a Pod is "significantly out of line" with the current recommendation.<br>
+<strong>30.</strong> What's the risk of using <code>Initial</code> mode instead of <code>Recreate</code>/<code>Auto</code>? — Recommendations are only applied at Pod creation — a long-running Pod whose usage drifts afterward never gets resized until it's naturally recreated.<br>
+<strong>31.</strong> Why does the Scheduler have "no direct awareness" of VPA? — By the time the Scheduler sees a Pod, its resources have already been mutated by the Admission Controller — VPA's involvement is invisible to scheduling logic.<br>
+<strong>32.</strong> What kubectl command lists all VPA objects across the cluster? — <code>kubectl get vpa -A</code>.<br>
+<strong>33.</strong> What's the safest way to roll out VPA on a new workload? — Start in <code>updateMode: Off</code>, review recommendations, then graduate to Recreate/Auto deliberately.<br>
+<strong>34.</strong> Why must PodDisruptionBudgets exist before enabling Recreate/Auto mode? — Because the Updater consults the PDB before evicting, and without one (or a too-strict one) evictions may be blocked or cause outages.<br>
+<strong>35.</strong> What's the interview one-liner distinguishing VPA's axis from HPA and Cluster Autoscaler? — HPA changes replica count, VPA changes per-Pod resource sizing, Cluster Autoscaler changes node count — three independent layers of the autoscaling stack.<br>
+<strong>36.</strong> Is VPA a good fit for workloads with rapidly, unpredictably changing usage? — No — VPA reacts slowly (historical/decayed data), so it suits relatively stable, predictable usage patterns.<br>
+<strong>37.</strong> What happens to a Pod's requests if no VPA object targets it? — Nothing — VPA only mutates Pods matched by an active VerticalPodAutoscaler's <code>targetRef</code>.<br>
+<strong>38.</strong> Why is watching a Pod get evicted and recreated a useful way to validate VPA end-to-end? — It confirms the full chain — Recommender computed a new value, Updater evicted, Admission Controller applied it on the replacement Pod.<br>
+<strong>39.</strong> What's the danger of setting <code>maxAllowed</code> too low? — VPA can never recommend enough resources for genuine growth in usage, causing chronic throttling/OOM despite VPA being enabled.<br>
+<strong>40.</strong> What's the danger of setting <code>minAllowed</code> too low? — A quiet period could cause VPA to recommend unrealistically small requests, risking throttling when load returns.<br>
+<strong>41.</strong> How does VPA's evict+recreate approach interact with a Deployment's rolling update logic? — The recreated Pod goes through the same Deployment/ReplicaSet reconciliation as any other replacement Pod — VPA doesn't bypass rollout mechanics.<br>
+<strong>42.</strong> Why is VPA described as "one Pod at a time" disruptive rather than a whole-Deployment resize? — The Updater evicts individual Pods based on their own drift from the recommendation, not the Deployment as a whole.<br>
+<strong>43.</strong> What's the production reason for piping Recommender output into CI checks rather than acting on it live? — To catch egregiously over/under-provisioned workloads and apply the fix deliberately via code review, avoiding automatic disruption.<br>
+<strong>44.</strong> Does VPA require metrics-server to function? — Effectively yes for the Recommender's usage data, mirroring HPA's dependency on the same resource-metrics pipeline.<br>
+<strong>45.</strong> What's a realistic incident VPA in Auto mode without a PDB could cause? — A workload gets evicted below its minimum safe replica count with no PDB to block it, causing an availability drop.<br>
+<strong>46.</strong> Why is <code>Auto</code> currently "reserved for future in-place resize support"? — Kubernetes doesn't yet support resizing a running Pod's resources without recreation, so Auto behaves exactly like Recreate until that capability lands.<br>
+<strong>47.</strong> What's the relationship between VPA's recommendation and QoS class? — Changing requests/limits changes which QoS class (Guaranteed/Burstable/BestEffort) a Pod falls into, tying VPA activity to eviction-priority behavior elsewhere in the cluster.<br>
+<strong>48.</strong> Why should a monitoring/observability team care about VPA recommendations even in Off mode? — They reveal systemic over/under-provisioning trends across services without requiring any live risk of eviction.<br>
+<strong>49.</strong> What's the fastest way to check if VPA's components themselves are healthy? — Check the three component Pods' status in kube-system via their respective app labels.<br>
+<strong>50.</strong> What's the one-line interview summary of VPA? — Three cooperating components (Recommender, Updater, Admission Controller) that observe real usage and right-size a container's requests/limits via evict-and-recreate, gated by an <code>updateMode</code> that ranges from purely advisory to fully automatic.
+</div></details>
+
+<footer class="course-footer">Next up: Topic 39 — Cluster Autoscaler, which adds or removes entire nodes based on Pod scheduling pressure.</footer>
+
+<script>
+  mermaid.initialize({ startOnLoad: true, theme: 'dark' });
+</script>
+
+</body>
+</html>

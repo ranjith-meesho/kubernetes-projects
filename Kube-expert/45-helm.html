@@ -1,0 +1,276 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Topic 45: Helm — Kubernetes Expert Course</title>
+<link rel="stylesheet" href="styles.css">
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+</head>
+<body>
+
+<header class="course-header">
+  <div class="kicker">Topic 45 of 70</div>
+  <h1>Helm</h1>
+  <div class="subtitle">The package manager for Kubernetes: templated manifests bundled into versioned, installable charts.</div>
+</header>
+
+<nav class="topic-nav">
+  <a href="44-pod-security.html">&larr; Pod Security</a>
+  <a href="index.html">Course Index</a>
+  <a href="46-operators.html">Operators &rarr;</a>
+</nav>
+
+<h2 id="explanation">Explanation</h2>
+
+<p>A real application is rarely one YAML file — it's a Deployment, a Service, a ConfigMap, an Ingress, maybe an HPA
+and a NetworkPolicy, and every environment (dev/staging/prod) needs slightly different values (replica counts,
+resource limits, image tags). Copy-pasting and hand-editing YAML across environments doesn't scale and is error-prone.
+<strong>Helm</strong> solves this by treating a Kubernetes application as a <strong>chart</strong>: a directory of
+templated YAML plus a single <code>values.yaml</code> file of parameters, rendered into concrete manifests at install
+time.</p>
+
+<p>A chart's structure is: <code>Chart.yaml</code> (name, version, dependencies — chart metadata), <code>values.yaml</code>
+(default parameter values), and a <code>templates/</code> directory containing Go-template YAML files that reference
+those values (<code>{{ .Values.replicaCount }}</code>) plus built-in objects like <code>{{ .Release.Name }}</code>.
+Helm's templating engine is just Go's <code>text/template</code> with Sprig functions added, run entirely
+client-side (by the <code>helm</code> binary or, in cluster automation, by Argo CD/Flux) — the API Server never sees
+templates, only the final rendered manifests.</p>
+
+<p>Kubernetes needs Helm (or something like it) because raw manifests have no concept of parameterization, versioning,
+or release lifecycle. Helm introduces a <strong>Release</strong>: a named, versioned instance of a chart installed
+into a cluster, tracked via a Secret Helm stores in the target namespace recording exactly what was applied. This is
+what makes <code>helm upgrade</code> and <code>helm rollback</code> possible — Helm diffs your new render against the
+last recorded release state and can revert to any previous revision.</p>
+
+<p>The release lifecycle is: <code>helm install</code> renders the chart with your values and applies the resulting
+manifests, recording revision 1. <code>helm upgrade</code> re-renders with new values/chart version, applies the diff,
+and records a new revision. <code>helm rollback &lt;revision&gt;</code> re-applies a prior revision's rendered
+manifests without needing the original chart source. Helm also supports <strong>hooks</strong> (e.g.
+<code>pre-install</code>, <code>post-upgrade</code>) — special annotated resources (often Jobs) that run at specific
+lifecycle points, commonly used for database migrations before a new app version goes live.</p>
+
+<p>Helm charts can declare <strong>dependencies</strong> on other charts (subcharts) in <code>Chart.yaml</code>,
+letting you compose a complex stack (e.g. an umbrella chart pulling in Redis, Postgres, and your app chart) from
+reusable public or internal building blocks — this is the same compositional idea GitOps tools later build the
+"App-of-Apps" pattern on top of.</p>
+
+<h2 id="internal-working">Internal Working / Interactions</h2>
+<ul>
+  <li><strong>Helm client:</strong> renders templates locally using values.yaml + <code>--set</code> overrides + the chart's Go templates; the API Server is never aware templating happened.</li>
+  <li><strong>API Server:</strong> receives only the final, rendered plain YAML/JSON manifests via normal <code>kubectl apply</code>-equivalent calls — same authn/authz/admission pipeline as any other request.</li>
+  <li><strong>Release storage:</strong> Helm 3 stores each release's rendered manifest and metadata as a Secret (type <code>helm.sh/release.v1</code>) in the target namespace — this is Helm's "database," with no separate Tiller server (removed in Helm 3).</li>
+  <li><strong>Controllers:</strong> once manifests are applied, ordinary Kubernetes controllers (Deployment, ReplicaSet, etc.) reconcile them exactly as if you'd written them by hand — Helm has no runtime involvement after apply.</li>
+</ul>
+
+<h2 id="architecture-diagram">Architecture Diagram</h2>
+<pre class="mermaid">
+flowchart TB
+    Chart["Chart: Chart.yaml + values.yaml + templates/"]
+    Values["values-prod.yaml (override)"]
+    HelmCLI["helm install/upgrade\n(client-side template render)"]
+    Rendered["Rendered plain YAML manifests"]
+    API["API Server"]
+    Secret["Release Secret\n(helm.sh/release.v1, revision N)"]
+    Ctrl["Controllers reconcile\n(Deployment, Service, etc.)"]
+
+    Chart --> HelmCLI
+    Values --> HelmCLI
+    HelmCLI --> Rendered
+    Rendered -->|kubectl-apply-equivalent| API
+    API --> Secret
+    API --> Ctrl
+</pre>
+
+<h2 id="code-example">Code Example</h2>
+<pre><code># Chart.yaml — chart metadata
+apiVersion: v2
+name: checkout-service
+version: 1.4.0          # Chart version (semver) — bump on any template change.
+appVersion: "2.4.1"      # Version of the application the chart deploys — informational.
+description: Checkout microservice Helm chart
+
+---
+# values.yaml — default parameters, overridable per environment
+replicaCount: 3
+image:
+  repository: registry.internal/checkout-service
+  tag: "2.4.1"
+resources:
+  requests: { cpu: 250m, memory: 256Mi }
+  limits:   { cpu: 500m, memory: 512Mi }
+service:
+  port: 8080
+
+---
+# templates/deployment.yaml — Go-templated manifest referencing values above
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-checkout       # {{ .Release.Name }} = the release name at install time.
+  labels:
+    app: {{ .Chart.Name }}
+spec:
+  replicas: {{ .Values.replicaCount }}      # Pulled straight from values.yaml (or --set override).
+  selector:
+    matchLabels: { app: {{ .Chart.Name }} }
+  template:
+    metadata:
+      labels: { app: {{ .Chart.Name }} }
+    spec:
+      containers:
+        - name: checkout
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}   {# Sprig 'toYaml' + 'nindent' for nested blocks #}
+          ports:
+            - containerPort: {{ .Values.service.port }}
+</code></pre>
+
+<h2 id="kubectl-commands">kubectl Commands</h2>
+<pre><code>helm install checkout ./checkout-service -f values-prod.yaml   # Install chart with an environment-specific overrides file
+helm upgrade checkout ./checkout-service --set replicaCount=6    # Upgrade an existing release with an inline override
+helm rollback checkout 3                                          # Roll back to revision 3 of this release
+helm history checkout                                              # List all revisions and their status
+helm template ./checkout-service -f values-prod.yaml               # Render manifests locally without installing (great for review/CI)
+helm diff upgrade checkout ./checkout-service -f values-prod.yaml   # (helm-diff plugin) preview exact changes before upgrading
+helm uninstall checkout                                             # Remove the release and its resources
+helm lint ./checkout-service                                        # Validate chart templates/values for common errors
+</code></pre>
+
+<h2 id="best-practices">Best Practices &amp; Common Pitfalls</h2>
+<div class="grid-2">
+<div>
+<h4>Best Practices</h4>
+<ul>
+  <li>Keep one values file per environment (values-dev.yaml, values-prod.yaml) rather than scattering <code>--set</code> flags across CI scripts.</li>
+  <li>Always run <code>helm template</code> or <code>helm diff</code> in CI to review rendered output before applying.</li>
+  <li>Pin exact chart and image versions in production — never install against a floating <code>latest</code> tag or unpinned dependency.</li>
+  <li>Use <code>helm lint</code> and schema validation (<code>values.schema.json</code>) to catch bad values early.</li>
+</ul>
+</div>
+<div>
+<h4>Pitfalls</h4>
+<ul>
+  <li>Overusing template logic (deeply nested conditionals) until charts become unreadable — prefer simple, composable templates.</li>
+  <li>Forgetting that <code>helm upgrade</code> doesn't automatically delete resources removed from templates in some edge cases (orphaned resources) — audit periodically.</li>
+  <li>Storing secrets in plaintext values.yaml committed to git — use Sealed Secrets, SOPS, or external-secrets instead.</li>
+  <li>Treating Helm as a full GitOps solution — it's a packaging/templating tool, not a continuous reconciler (that's what Argo CD/Flux add on top).</li>
+</ul>
+</div>
+</div>
+
+<h2 id="interview-questions">50 Interview Questions</h2>
+
+<details class="qa"><summary>1. What are the three core pieces of a Helm chart's structure?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Chart.yaml (metadata), values.yaml (default parameters), and templates/ (Go-template YAML files).
+<br><strong>Detail:</strong> Chart.yaml declares name/version/dependencies, values.yaml supplies the default parameter values templates reference, and templates/ contains the actual manifest templates rendered against those values.
+<br><strong>Production example:</strong> A checkout-service chart with Chart.yaml at version 1.4.0, values.yaml defining replicaCount and image tag, and templates/deployment.yaml referencing both.
+<br><strong>Common mistake:</strong> Hardcoding environment-specific values directly into templates instead of parameterizing via values.yaml.</div></details>
+
+<details class="qa"><summary>2. Does the Kubernetes API Server ever see Helm's Go templates?</summary>
+<div class="qa-body"><strong>Short answer:</strong> No — templating happens entirely client-side; the API Server only ever receives fully-rendered plain YAML/JSON.
+<br><strong>Detail:</strong> The helm binary (or Argo CD/Flux acting as the client) renders templates locally using values.yaml plus overrides, then applies the resulting concrete manifests via the normal API pipeline.
+<br><strong>Production example:</strong> Running <code>helm template</code> to inspect exactly what would be sent to the API Server, with zero cluster interaction.
+<br><strong>Common mistake:</strong> Assuming the cluster stores or is aware of the templated source — it only ever sees rendered output.</div></details>
+
+<details class="qa"><summary>3. What is a Helm "Release" and how is its state tracked?</summary>
+<div class="qa-body"><strong>Short answer:</strong> A named, versioned instance of a chart installed into a cluster, tracked as a Secret of type helm.sh/release.v1 in the target namespace.
+<br><strong>Detail:</strong> Each install/upgrade records a new revision in that Secret, storing the rendered manifest and metadata — this is what makes rollback possible without needing the original chart source again.
+<br><strong>Production example:</strong> <code>helm history checkout</code> listing revisions 1 through 5, each backed by its own release Secret revision.
+<br><strong>Common mistake:</strong> Manually deleting a release Secret, breaking Helm's ability to track or roll back that release.</div></details>
+
+<details class="qa"><summary>4. What happened to Tiller, and why does Helm 3 not need it?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Tiller was Helm 2's in-cluster server component; Helm 3 removed it entirely, doing all rendering client-side and storing state as Secrets instead.
+<br><strong>Detail:</strong> Tiller required broad, often cluster-admin-level RBAC to operate, which was a major security concern; Helm 3's client-only architecture eliminates that standing privileged component.
+<br><strong>Production example:</strong> Helm 3 clusters have no tiller-deploy Pod at all — install/upgrade calls go straight from the helm CLI to the API Server.
+<br><strong>Common mistake:</strong> Following outdated Helm 2 documentation that references Tiller RBAC setup on a Helm 3 cluster.</div></details>
+
+<details class="qa"><summary>5. How does helm rollback work without access to the original chart source?</summary>
+<div class="qa-body"><strong>Short answer:</strong> It re-applies the already-rendered manifest stored in a prior revision's release Secret, not the chart template.
+<br><strong>Detail:</strong> Because each revision's fully-rendered output is persisted, Helm can revert to any past revision purely from that stored state, even if the chart repo has since changed or is unavailable.
+<br><strong>Production example:</strong> <code>helm rollback checkout 3</code> reverting to exactly what was applied at revision 3, regardless of what the chart looks like today.
+<br><strong>Common mistake:</strong> Assuming rollback re-renders the chart with old values — it replays the stored rendered manifest directly.</div></details>
+
+<details class="qa"><summary>6. What is a Helm hook, and what's a common production use case?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Specially annotated resources (often Jobs) that run at specific lifecycle points like pre-install or post-upgrade.
+<br><strong>Detail:</strong> Hooks let you sequence operations around the main install/upgrade — most commonly running database migrations before the new application version's Pods actually start serving traffic.
+<br><strong>Production example:</strong> A pre-upgrade hook Job running Flyway/Django migrations before the Deployment's new image is rolled out.
+<br><strong>Common mistake:</strong> Relying on hooks for ongoing reconciliation logic — hooks run once per lifecycle event, they're not a continuous controller.</div></details>
+
+<details class="qa"><summary>7. Why is Helm described as "not a full GitOps solution"?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Helm renders and applies once per command invocation — it has no continuous reconciliation loop watching for drift.
+<br><strong>Detail:</strong> A GitOps tool like Argo CD or Flux continuously compares live cluster state against desired state and can auto-correct drift; Helm itself just performs a one-time templating+apply operation when invoked.
+<br><strong>Production example:</strong> Argo CD invoking `helm template` under the hood to render manifests, then handling the ongoing sync/self-heal loop itself.
+<br><strong>Common mistake:</strong> Treating a scheduled `helm upgrade` cron job as equivalent to a real GitOps reconciler.</div></details>
+
+<details class="qa"><summary>8. What's the risk of "orphaned resources" after a helm upgrade?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Resources removed from a chart's templates aren't always automatically deleted from the cluster on upgrade in certain edge cases, leaving stale objects behind.
+<br><strong>Detail:</strong> This can lead to unexpected leftover ConfigMaps, Services, or other objects that no longer correspond to anything in the current chart version, silently consuming resources or causing confusion.
+<br><strong>Production example:</strong> Renaming a ConfigMap in a template and later discovering the old-named ConfigMap still exists in the cluster from a previous release.
+<br><strong>Common mistake:</strong> Never auditing for orphaned resources, assuming helm upgrade is always a perfectly clean state transition.</div></details>
+
+<details class="qa"><summary>9. Why should charts avoid storing secrets directly in values.yaml committed to git?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Plaintext secrets in values.yaml become plaintext secrets in git history, readable by anyone with repo access, forever (even if later removed).
+<br><strong>Detail:</strong> The recommended pattern is to keep values.yaml free of real secret material and instead reference Sealed Secrets, SOPS-encrypted values, or an external-secrets operator that pulls from a vault at deploy time.
+<br><strong>Production example:</strong> A values-prod.yaml referencing a Sealed Secret's name rather than embedding a raw database password.
+<br><strong>Common mistake:</strong> Committing a values-prod.yaml with a literal API key or password "just for now" during a rushed deploy.</div></details>
+
+<details class="qa"><summary>10. What's the purpose of subcharts / chart dependencies declared in Chart.yaml?</summary>
+<div class="qa-body"><strong>Short answer:</strong> They let one "umbrella" chart compose several reusable charts (e.g. Redis, Postgres, your app) into a single installable unit.
+<br><strong>Detail:</strong> Each dependency is itself a normal chart, and the parent's values.yaml can override subchart values under a namespaced key — the same compositional idea GitOps tools later build "App-of-Apps" on top of.
+<br><strong>Production example:</strong> An umbrella chart for a platform stack pulling in a public Redis chart plus an internal checkout-service chart as dependencies.
+<br><strong>Common mistake:</strong> Duplicating a common dependency's manifests by hand across many charts instead of declaring it once as a shared subchart.</div></details>
+
+<details class="qa"><summary>11–50. Additional rapid-fire questions</summary>
+<div class="qa-body">
+<strong>11.</strong> What file declares a chart's name, version, and dependencies? — Chart.yaml.<br>
+<strong>12.</strong> What templating engine does Helm use? — Go's text/template with Sprig functions added.<br>
+<strong>13.</strong> What built-in object gives the release's name inside a template? — <code>{{ .Release.Name }}</code>.<br>
+<strong>14.</strong> How do you render a chart locally without installing it? — <code>helm template</code>.<br>
+<strong>15.</strong> What command previews exact changes before an upgrade? — <code>helm diff upgrade</code> (helm-diff plugin).<br>
+<strong>16.</strong> What command validates a chart's templates/values for common errors? — <code>helm lint</code>.<br>
+<strong>17.</strong> What removes a release and its resources entirely? — <code>helm uninstall</code>.<br>
+<strong>18.</strong> What lists all revisions of a release and their status? — <code>helm history</code>.<br>
+<strong>19.</strong> What Kubernetes object type stores Helm 3 release state? — A Secret of type helm.sh/release.v1.<br>
+<strong>20.</strong> Does Helm 3 require a Tiller server component? — No, Tiller was removed entirely in Helm 3.<br>
+<strong>21.</strong> What Sprig function converts a values structure to YAML inside a template? — <code>toYaml</code>.<br>
+<strong>22.</strong> What does the `nindent` function commonly pair with toYaml for? — Correctly indenting nested YAML blocks inside a template.<br>
+<strong>23.</strong> What's a values.schema.json used for? — Validating values.yaml structure/types early, catching bad values before templating.<br>
+<strong>24.</strong> Can chart version and appVersion differ? — Yes — chart version tracks the chart's own template changes; appVersion tracks the application version it deploys.<br>
+<strong>25.</strong> What happens to the API Server's admission pipeline for Helm-applied manifests? — Nothing special — they go through the exact same authn/authz/admission pipeline as any kubectl apply.<br>
+<strong>26.</strong> What's the recommended way to manage per-environment overrides? — Separate values files per environment (values-dev.yaml, values-prod.yaml) rather than scattered --set flags.<br>
+<strong>27.</strong> What's a common failure mode of deeply nested chart template logic? — Charts become unreadable and hard to maintain — prefer simple, composable templates.<br>
+<strong>28.</strong> Does helm upgrade automatically pick up new default values from a new chart version? — Yes for any value not explicitly overridden by the caller; overridden values persist unless removed.<br>
+<strong>29.</strong> What's the purpose of pinning exact chart and image versions in production? — Avoiding unpredictable behavior from floating "latest" tags or unpinned dependency versions.<br>
+<strong>30.</strong> How does a subchart's values get referenced from the parent chart? — Under a key matching the subchart's name in the parent's values.yaml.<br>
+<strong>31.</strong> What's the risk of using `--set` flags scattered across CI scripts instead of values files? — Harder to audit/reproduce exactly what was deployed — no single reviewable source of truth.<br>
+<strong>32.</strong> Is a Helm hook Job automatically retried on failure? — Not by default — hook behavior/retry depends on annotations and the underlying Job's backoffLimit.<br>
+<strong>33.</strong> What's the effect of setting a hook's delete-policy annotation? — Controls whether the hook resource is cleaned up before creation, after success, or left behind on failure for debugging.<br>
+<strong>34.</strong> Can Argo CD or Flux use Helm charts as a GitOps source? — Yes — they invoke Helm's rendering logic and add continuous reconciliation and drift correction on top.<br>
+<strong>35.</strong> What's the difference between helm upgrade --install and plain helm upgrade? — --install creates the release if it doesn't already exist, otherwise it fails if no release is present.<br>
+<strong>36.</strong> Why is `helm lint` useful in CI? — Catches template/value errors (missing required values, YAML issues) before ever reaching the cluster.<br>
+<strong>37.</strong> What happens to a release's history if you helm uninstall it? — By default the release is fully removed including history, unless --keep-history is used.<br>
+<strong>38.</strong> What's a common reason for "helm upgrade" to hang? — A resource stuck waiting on --wait for readiness (e.g. a Deployment that never becomes Ready) if wait flags are set.<br>
+<strong>39.</strong> Can two different releases install the same chart into different namespaces? — Yes, releases are independent instances distinguished by release name and namespace.<br>
+<strong>40.</strong> What's the benefit of `helm template` in a CI pipeline specifically? — Lets you diff/review the exact manifests that would be applied without touching any cluster.<br>
+<strong>41.</strong> How does Helm handle CRDs shipped inside a chart's crds/ directory? — They're installed once on first install and not upgraded/deleted automatically on subsequent helm upgrade or uninstall.<br>
+<strong>42.</strong> What's a risk of relying on the crds/ directory's install-once behavior? — Schema changes to a chart's CRD in a new version won't automatically apply — you must update the CRD manually.<br>
+<strong>43.</strong> Does helm rollback re-run pre-install/pre-upgrade hooks? — It runs rollback-specific hooks (pre-rollback/post-rollback) rather than install/upgrade hooks.<br>
+<strong>44.</strong> What's the purpose of chart annotations vs labels in Chart.yaml? — Annotations carry non-identifying metadata (e.g. category), while labels can be used for selection/categorization by tooling.<br>
+<strong>45.</strong> Is Helm aware of resources it didn't create but that happen to match its manifests? — Generally no — Helm tracks ownership via its own release metadata, not by matching arbitrary existing resources.<br>
+<strong>46.</strong> What's a best practice for validating values before templating in CI? — Running `helm lint` plus schema validation against values.schema.json.<br>
+<strong>47.</strong> Why might `helm diff upgrade` show unexpected changes even with no values modified? — A new chart version's template logic itself changed, altering rendered output independent of values.<br>
+<strong>48.</strong> Can a single Helm chart deploy resources across multiple namespaces? — Yes, if templates explicitly set differing metadata.namespace fields, though this is uncommon and often discouraged for clarity.<br>
+<strong>49.</strong> What's the tradeoff of an umbrella chart pulling in many subcharts vs separate independent charts? — Simplifies coordinated deploys of a stack but couples their release lifecycle together, making independent upgrades harder.<br>
+<strong>50.</strong> What's the first thing to check when a helm upgrade silently doesn't change anything? — Whether the values/chart version actually changed, and whether `helm diff` shows any difference at all before assuming a bug.
+</div></details>
+
+<footer class="course-footer">Next: Topic 46 — Operators, encoding operational knowledge into custom controllers.</footer>
+
+<script>
+  mermaid.initialize({ startOnLoad: true, theme: 'dark' });
+</script>
+
+</body>
+</html>

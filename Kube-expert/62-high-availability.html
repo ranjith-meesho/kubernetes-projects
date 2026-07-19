@@ -1,0 +1,323 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Topic 62: High Availability — Kubernetes Expert Course</title>
+<link rel="stylesheet" href="styles.css">
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+</head>
+<body>
+
+<header class="course-header">
+  <div class="kicker">Topic 62 of 70</div>
+  <h1>High Availability</h1>
+  <div class="subtitle">Designing a control plane and worker fleet that survives node, zone, and quorum-member failure without an outage.</div>
+</header>
+
+<nav class="topic-nav">
+  <a href="61-multi-cluster.html">&larr; Multi-cluster</a>
+  <a href="index.html">Course Index</a>
+  <a href="63-backup-restore.html">Backup &amp; Restore &rarr;</a>
+</nav>
+
+<h2 id="explanation">Explanation</h2>
+<p>High Availability (HA) in Kubernetes means the cluster keeps accepting API requests and keeps scheduling/running
+workloads even when individual machines, network links, or entire availability zones fail. There are two separate
+HA problems that people often conflate: <strong>control-plane HA</strong> (can I still talk to the API server and get
+new scheduling decisions?) and <strong>data-plane / workload HA</strong> (do my application Pods keep serving traffic?).
+Both need deliberate design — Kubernetes does not make either of these free by default on a single-node or
+single-AZ cluster.</p>
+
+<p>The control plane's core dependency is <strong>etcd</strong>, a Raft-based distributed key-value store. Raft
+requires a strict majority (quorum) of members to agree before any write commits, which is why etcd is always run
+with an <strong>odd number</strong> of members — 3 or 5. With 3 members you can lose 1 and still have a majority (2/3);
+with 5 you can lose 2. An even number like 4 gives you no extra fault tolerance over 3 (you can still only lose 1
+before losing majority) while adding an extra vote to coordinate — pure downside. This is the single most
+important number to get right in an HA design.</p>
+
+<p>On top of etcd, you typically run 3 (or more) <strong>kube-apiserver</strong> replicas, all stateless and all
+reading/writing the same etcd cluster, fronted by a load balancer (cloud LB, or a simple keepalived+HAProxy VIP for
+on-prem/kubeadm clusters). Because the API server is stateless, this scales linearly and requires no leader
+election — any replica can serve any request. The controller-manager and scheduler, by contrast, are
+<strong>active-passive</strong>: multiple replicas run, but only one is active at a time (enforced via a lease-based
+leader election using the <code>coordination.k8s.io/Lease</code> object), because having two schedulers or two
+replica-set controllers acting simultaneously would cause conflicting decisions.</p>
+
+<p>Worker-node HA is a different concern: spread your Deployment/StatefulSet replicas across multiple nodes AND
+multiple availability zones using <code>topologySpreadConstraints</code> or pod anti-affinity, so that losing one
+node — or one entire zone — doesn't take your whole application down. Pair this with <code>PodDisruptionBudgets</code>
+so voluntary disruptions (node drains, cluster upgrades) never take down more replicas than your minimum availability
+tolerates.</p>
+
+<p>In production, the real failure modes worth designing for are: a single node dying (handled by the ReplicaSet
+controller + kube-scheduler rescheduling), an entire AZ losing power or network (handled by multi-AZ node groups +
+topology spread), and etcd leader loss (handled by Raft re-election, typically sub-second, invisible to users). The
+scenario people forget is <strong>network partition</strong> between AZs — a minority partition of etcd members will
+correctly stop accepting writes rather than risk split-brain, which is why quorum math (not just "more replicas is
+better") governs your AZ count too: 3 etcd members across 3 AZs, never 2, so no single AZ loss removes your quorum
+majority.</p>
+
+<h2 id="internal-working">Internal Working / Interactions</h2>
+<ul>
+  <li><strong>etcd Raft group:</strong> members elect a leader; all writes go through the leader and must be
+  replicated to a majority before ack. Losing the leader triggers a new election (typically 1-2s) using randomized
+  election timeouts to avoid split votes.</li>
+  <li><strong>kube-apiserver replicas:</strong> stateless, sit behind an L4/L7 load balancer or a VIP; each opens its
+  own watch connections to etcd; no coordination needed between them.</li>
+  <li><strong>Leader election for controller-manager/scheduler:</strong> each replica tries to acquire a Lease object;
+  the holder renews it periodically; if it fails to renew (crash, GC pause, network issue) another replica takes over
+  within the lease's <code>leaseDurationSeconds</code>.</li>
+  <li><strong>kubelet/node health:</strong> node-lifecycle-controller marks a node <code>NotReady</code> after missed
+  heartbeats, then after <code>pod-eviction-timeout</code> begins evicting pods so the ReplicaSet controller can
+  recreate them elsewhere.</li>
+  <li><strong>Cloud LB / kube-vip / keepalived:</strong> provides the single stable endpoint (e.g. the value in
+  kubeconfig's <code>server:</code>) that clients use regardless of which API server replica is currently healthy.</li>
+</ul>
+
+<h2 id="architecture-diagram">Architecture Diagram</h2>
+<pre class="mermaid">
+flowchart TB
+  subgraph AZ1["Availability Zone A"]
+    E1[etcd member 1]
+    A1[kube-apiserver 1]
+    C1[controller-mgr / scheduler<br/>standby]
+    W1[Worker node 1]
+  end
+  subgraph AZ2["Availability Zone B"]
+    E2[etcd member 2]
+    A2[kube-apiserver 2]
+    C2[controller-mgr / scheduler<br/>ACTIVE leader]
+    W2[Worker node 2]
+  end
+  subgraph AZ3["Availability Zone C"]
+    E3[etcd member 3]
+    A3[kube-apiserver 3]
+    C3[controller-mgr / scheduler<br/>standby]
+    W3[Worker node 3]
+  end
+
+  LB[Load Balancer / VIP]
+  LB --> A1
+  LB --> A2
+  LB --> A3
+  A1 <--> E1
+  A2 <--> E2
+  A3 <--> E3
+  E1 <-. Raft quorum .-> E2
+  E2 <-. Raft quorum .-> E3
+  E1 <-. Raft quorum .-> E3
+  A1 --> W1
+  A2 --> W2
+  A3 --> W3
+</pre>
+
+<h2 id="code-example">Code Example</h2>
+<pre><code>#############################################
+# 1. kubeadm HA control-plane init (first node)
+#############################################
+kubeadm init \
+  --control-plane-endpoint "k8s-api.internal.example.com:6443" \  # stable LB endpoint, NOT a single node IP
+  --upload-certs \                                                 # share certs so other CP nodes can join
+  --pod-network-cidr=10.244.0.0/16
+
+# Join additional control-plane nodes (repeat on 2 more machines, one per AZ)
+kubeadm join k8s-api.internal.example.com:6443 \
+  --token <token> \
+  --discovery-token-ca-cert-hash sha256:<hash> \
+  --control-plane \                                                # joins as a control-plane node, not just worker
+  --certificate-key <key-from-upload-certs>
+
+---
+# 2. topologySpreadConstraints — spread replicas across zones AND nodes
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: checkout-service
+spec:
+  replicas: 6
+  selector:
+    matchLabels: { app: checkout }
+  template:
+    metadata:
+      labels: { app: checkout }
+    spec:
+      topologySpreadConstraints:
+        - maxSkew: 1                              # allow at most 1 extra pod imbalance per zone
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: DoNotSchedule         # hard requirement: never pack all replicas in one zone
+          labelSelector:
+            matchLabels: { app: checkout }
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname      # also spread across individual nodes within a zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels: { app: checkout }
+      containers:
+        - name: checkout
+          image: registry.example.com/checkout:v2.3.1
+
+---
+# 3. PodDisruptionBudget — protect availability during voluntary disruption (drains/upgrades)
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: checkout-pdb
+spec:
+  minAvailable: 4        # out of 6 replicas, never let voluntary drains take more than 2 down at once
+  selector:
+    matchLabels: { app: checkout }
+</code></pre>
+
+<h2 id="kubectl-cli-commands">kubectl / CLI Commands</h2>
+<pre><code># Check etcd member health and quorum status (from an etcd pod/host)
+etcdctl member list --endpoints=https://127.0.0.1:2379 --cacert=... --cert=... --key=...
+
+# Confirm Raft leader / cluster health across all 3 members
+etcdctl endpoint status --cluster -w table
+
+# See which controller-manager/scheduler replica currently holds the leader Lease
+kubectl -n kube-system get lease kube-controller-manager -o yaml
+kubectl -n kube-system get lease kube-scheduler -o yaml
+
+# List control-plane nodes and confirm they're spread across zones
+kubectl get nodes -l node-role.kubernetes.io/control-plane -L topology.kubernetes.io/zone
+
+# Verify a Deployment's actual pod-to-node/zone distribution
+kubectl get pods -o wide -l app=checkout
+
+# Check PodDisruptionBudget status before performing a drain
+kubectl get pdb checkout-pdb
+
+# Safely drain a node while respecting PDBs
+kubectl drain <node> --ignore-daemonsets --delete-emptydir-data
+</code></pre>
+
+<h2 id="best-practices">Best Practices &amp; Common Pitfalls</h2>
+<div class="grid-2">
+  <div class="lab-card">
+    <h4>Best Practices</h4>
+    <ul>
+      <li>Run etcd with 3 or 5 members, one per AZ, never an even count.</li>
+      <li>Put a real load balancer or VIP in front of API servers — never point kubeconfig at one node's IP.</li>
+      <li>Use topologySpreadConstraints plus PodDisruptionBudgets together, not either alone.</li>
+      <li>Monitor etcd leader-change frequency and Raft proposal latency as first-class SLIs.</li>
+      <li>Prefer managed control planes (EKS/GKE/AKS) unless you have a dedicated platform team to run etcd.</li>
+    </ul>
+  </div>
+  <div class="lab-card">
+    <h4>Common Pitfalls</h4>
+    <ul>
+      <li>Running 2 or 4 etcd members — no quorum benefit, extra fragility.</li>
+      <li>Co-locating all 3 control-plane nodes in one AZ "for low latency" — defeats the purpose.</li>
+      <li>Forgetting PodDisruptionBudgets, so a routine node drain or cluster upgrade causes a real outage.</li>
+      <li>Anti-affinity set to <code>preferredDuringScheduling</code> only, silently ignored under resource pressure.</li>
+      <li>Treating HA as "done" after setup — not chaos-testing node/AZ failure regularly.</li>
+    </ul>
+  </div>
+</div>
+
+<h2 id="interview-questions">50 Interview Questions</h2>
+
+<details class="qa"><summary>1. What are the two separate HA problems in Kubernetes, and why shouldn't they be conflated?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Control-plane HA (can I still reach the API server and schedule?) and data-plane/workload HA (do my app Pods keep serving traffic?).
+<br><strong>Detail:</strong> Control-plane HA depends on etcd quorum and API server/leader-election design; workload HA depends on how you spread replicas across nodes/zones and enforce disruption budgets. Solving one doesn't solve the other.
+<br><strong>Production example:</strong> A 3-AZ etcd cluster with fully healthy quorum can still let an entire application go down if all 6 replicas of a Deployment happen to land in one AZ.
+<br><strong>Common mistake:</strong> Assuming "the control plane is HA" means the applications are automatically HA too.</div></details>
+
+<details class="qa"><summary>2. Why must etcd always run with an odd number of members?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Raft requires a strict majority to commit writes, and an odd count maximizes fault tolerance per member added.
+<br><strong>Detail:</strong> With 3 members you tolerate losing 1 (2/3 majority remains); with 5 you tolerate losing 2. A 4-member cluster still only tolerates losing 1 (needs 3/4) — the 4th member adds coordination overhead with zero extra fault tolerance.
+<br><strong>Production example:</strong> A kubeadm HA cluster deliberately runs 3 etcd members, one per AZ, never 2 or 4.
+<br><strong>Common mistake:</strong> Adding a 4th etcd member "for extra safety" — it makes the cluster strictly worse, not better.</div></details>
+
+<details class="qa"><summary>3. Why is kube-apiserver active-active while controller-manager and scheduler are active-passive?</summary>
+<div class="qa-body"><strong>Short answer:</strong> The API server is stateless so any replica can serve any request; controller-manager/scheduler must have exactly one active instance to avoid conflicting decisions.
+<br><strong>Detail:</strong> Multiple schedulers acting simultaneously could double-bind Pods to nodes, or two ReplicaSet controllers could race on scale decisions — leader election via a Lease object prevents this.
+<br><strong>Production example:</strong> A 3-master kubeadm cluster runs 3 API server replicas behind a VIP, but only one controller-manager and one scheduler are ever "active" at a time.
+<br><strong>Common mistake:</strong> Assuming more scheduler replicas means more scheduling throughput — it doesn't; only one is ever doing work.</div></details>
+
+<details class="qa"><summary>4. How does leader election for controller-manager/scheduler actually work?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Each replica races to acquire a <code>coordination.k8s.io/Lease</code> object; the holder renews it periodically, and another replica takes over if it fails to renew in time.
+<br><strong>Detail:</strong> Failure to renew (crash, GC pause, network issue) surfaces within the lease's configured duration, so failover is typically seconds, not minutes.
+<br><strong>Production example:</strong> <code>kubectl -n kube-system get lease kube-scheduler -o yaml</code> shows the current holder's identity and renewal timestamp.
+<br><strong>Common mistake:</strong> Not monitoring lease renewal failures/flapping as a leading indicator of control-plane resource starvation.</div></details>
+
+<details class="qa"><summary>5. What's the difference between topologySpreadConstraints and pod anti-affinity for zone spread?</summary>
+<div class="qa-body"><strong>Short answer:</strong> topologySpreadConstraints allows fine-grained, quantified skew control (<code>maxSkew</code>) across a topology key; anti-affinity is a binary "avoid/prefer to avoid" rule.
+<br><strong>Detail:</strong> topologySpreadConstraints can enforce even distribution across an arbitrary number of zones/nodes with a hard <code>DoNotSchedule</code> or soft <code>ScheduleAnyway</code> policy, which scales better than anti-affinity rules as replica/zone counts grow.
+<br><strong>Production example:</strong> A 6-replica Deployment spread with <code>maxSkew: 1</code> across 3 zones guarantees no zone holds more than 1 extra replica versus any other.
+<br><strong>Common mistake:</strong> Using only <code>preferredDuringSchedulingIgnoredDuringExecution</code> anti-affinity, which is silently ignored under resource pressure, defeating the intended spread.</div></details>
+
+<details class="qa"><summary>6. Why are PodDisruptionBudgets necessary in addition to topology spread?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Topology spread controls placement; PDBs control how many replicas can be voluntarily removed at once (drains, upgrades) regardless of placement.
+<br><strong>Detail:</strong> Without a PDB, a node drain during a cluster upgrade could evict enough replicas simultaneously to cause an outage, even if replicas were well spread across zones.
+<br><strong>Production example:</strong> <code>minAvailable: 4</code> on a 6-replica Deployment ensures a rolling node drain never takes more than 2 replicas down at once.
+<br><strong>Common mistake:</strong> Deploying topology spread but forgetting PDBs, so a routine kubectl drain becomes an unplanned outage.</div></details>
+
+<details class="qa"><summary>7. What happens during a network partition that isolates a minority of etcd members?</summary>
+<div class="qa-body"><strong>Short answer:</strong> The minority partition correctly stops accepting writes rather than risking split-brain, since it cannot reach quorum.
+<br><strong>Detail:</strong> This is why AZ placement of etcd members matters as much as the count — 3 members spread across 3 AZs ensures no single AZ loss removes the majority; 2 members in one AZ and 1 in another risks losing quorum on a single AZ failure.
+<br><strong>Production example:</strong> An AZ-wide network blip isolating 1 of 3 etcd members causes zero disruption — the remaining 2 still hold quorum and continue serving writes.
+<br><strong>Common mistake:</strong> Placing 2 of 3 control-plane nodes in the same AZ "for low latency," which reintroduces a single point of failure for quorum.</div></details>
+
+<details class="qa"><summary>8. What is the purpose of <code>--control-plane-endpoint</code> in a kubeadm HA setup?</summary>
+<div class="qa-body"><strong>Short answer:</strong> It gives the cluster a single stable DNS/VIP endpoint that survives any individual API server replica going down.
+<br><strong>Detail:</strong> Without it, kubeconfig would point at one control-plane node's IP directly, defeating HA entirely — that node's failure would break all client access even though other API servers are healthy.
+<br><strong>Production example:</strong> <code>kubeadm init --control-plane-endpoint "k8s-api.internal.example.com:6443"</code> fronts 3 API server replicas via a load balancer or keepalived VIP.
+<br><strong>Common mistake:</strong> Bootstrapping with a single node's IP, then discovering during a later HA upgrade that kubeconfig can't be cleanly repointed at a VIP.</div></details>
+
+<details class="qa"><summary>9–50. Additional rapid-fire questions</summary>
+<div class="qa-body">
+<strong>9.</strong> Why is running exactly 2 control-plane nodes worse than running 1? — 2 etcd members require both to be up for quorum (majority of 2 is 2), so you've added a node with zero fault tolerance benefit.<br>
+<strong>10.</strong> What triggers a Raft leader re-election in etcd? — Loss of heartbeat from the current leader within a randomized election timeout, used to avoid split votes.<br>
+<strong>11.</strong> Why are etcd election timeouts randomized rather than fixed? — Prevents multiple followers from timing out simultaneously and starting competing elections at once.<br>
+<strong>12.</strong> What's the role of node-lifecycle-controller in worker HA? — Marks a node NotReady after missed heartbeats, then evicts its Pods after pod-eviction-timeout so they reschedule elsewhere.<br>
+<strong>13.</strong> Why does kube-vip/keepalived matter for on-prem/kubeadm HA? — Provides the stable VIP that a cloud load balancer would otherwise provide automatically in managed environments.<br>
+<strong>14.</strong> Can the API server scale horizontally without coordination? — Yes — it's stateless, so adding replicas behind the LB requires no leader election or state sync between them.<br>
+<strong>15.</strong> What does <code>maxSkew</code> control in a topologySpreadConstraint? — The maximum allowed difference in matching Pod count between any two topology domains.<br>
+<strong>16.</strong> What does <code>whenUnsatisfiable: DoNotSchedule</code> mean versus <code>ScheduleAnyway</code>? — DoNotSchedule hard-blocks placement that would violate maxSkew; ScheduleAnyway allows it as a best-effort preference.<br>
+<strong>17.</strong> Why combine a zone-level and a hostname-level topologySpreadConstraint? — Zone spread survives AZ failure; hostname spread also survives single-node failure within a zone.<br>
+<strong>18.</strong> What's the first SLI to monitor for etcd health? — Raft proposal/commit latency and leader-change frequency — both spike before a quorum problem becomes visible elsewhere.<br>
+<strong>19.</strong> Why should you avoid running application workloads on control-plane nodes? — They compete for CPU/memory with etcd and the API server, degrading control-plane responsiveness cluster-wide.<br>
+<strong>20.</strong> What happens to a Deployment's Pods if the ReplicaSet controller (via controller-manager) is briefly unavailable? — Existing Pods keep running; only new reconciliation (recreating failed Pods, scaling) is paused until a leader is re-elected.<br>
+<strong>21.</strong> How do you verify etcd quorum health from the CLI? — <code>etcdctl endpoint status --cluster -w table</code> shows leader, term, and raft index per member.<br>
+<strong>22.</strong> Why is chaos-testing node/AZ failure part of a real HA strategy? — HA design that's never exercised commonly has silent gaps (missing PDBs, anti-affinity ignored under pressure) that only surface during a real failure.<br>
+<strong>23.</strong> What's the risk of setting a PDB's <code>minAvailable</code> too high? — It can block legitimate node drains/upgrades entirely if the cluster can't temporarily spare more replicas.<br>
+<strong>24.</strong> Does a load balancer in front of API servers need health checks? — Yes — it must route only to API servers currently able to reach etcd, not just processes that are technically running.<br>
+<strong>25.</strong> What is <code>topology.kubernetes.io/zone</code> used for beyond spread constraints? — It's also the label the Scheduler and node-affinity rules use generically to reason about zone placement.<br>
+<strong>26.</strong> Why is losing the etcd leader typically invisible to end users? — Raft re-election is normally sub-second, and the API server transparently retries against the new leader.<br>
+<strong>27.</strong> What's the operational difference between a managed control plane (EKS/GKE/AKS) and self-managed for HA? — Managed control planes come with the HA topology, quorum management, and failover already engineered and SLA-backed.<br>
+<strong>28.</strong> Can you achieve HA with all worker nodes in a single AZ? — No — a single AZ outage takes down every replica regardless of how well they're spread across nodes within that zone.<br>
+<strong>29.</strong> What does <code>--upload-certs</code> do in a kubeadm HA join flow? — Shares control-plane certificates securely so additional control-plane nodes can join without manually copying cert material.<br>
+<strong>30.</strong> How many etcd members can a 5-node etcd cluster lose and still function? — 2 — majority of 5 is 3, so quorum survives with 3 remaining.<br>
+<strong>31.</strong> Why not just run etcd with 7 or 9 members for extra safety? — Each added member increases the number of nodes required to agree per write, raising write latency without proportional fault-tolerance gain in most deployments.<br>
+<strong>32.</strong> What's a symptom of etcd running on slow disks in an HA cluster? — Frequent, unexplained leader elections caused by fsync latency delaying heartbeats past the election timeout.<br>
+<strong>33.</strong> Why should control-plane nodes be tainted against scheduling regular workloads? — Prevents application Pods from starving etcd/API-server of CPU and memory during load spikes.<br>
+<strong>34.</strong> What's the practical effect of losing the active scheduler for 30 seconds? — New Pods stay Pending; already-scheduled Pods are completely unaffected.<br>
+<strong>35.</strong> How does a rolling cluster upgrade interact with HA design? — It relies on PDBs and topology spread to ensure control-plane and worker upgrades never remove more capacity than the cluster can tolerate at once.<br>
+<strong>36.</strong> What's the difference between a Deployment's <code>replicas</code> count and actual availability during a zone outage? — Replica count is desired state; actual availability depends on how those replicas were distributed before the outage happened.<br>
+<strong>37.</strong> Why is HA design considered incomplete without a tested backup/restore process? — HA absorbs component failures, not data corruption or catastrophic misconfiguration — that's what backup/restore protects against.<br>
+<strong>38.</strong> What object type coordinates leader election in modern Kubernetes (vs older ConfigMap-based election)? — <code>coordination.k8s.io/Lease</code>, a lighter-weight purpose-built object replacing the older ConfigMap/Endpoints annotation approach.<br>
+<strong>39.</strong> Why must you check PDB status before running <code>kubectl drain</code>? — A drain waits/fails if evicting the node's Pods would violate a PDB, so pre-checking avoids a stuck operation mid-maintenance.<br>
+<strong>40.</strong> What's the tradeoff of running 5 etcd members instead of 3? — Higher fault tolerance (tolerate 2 losses) at the cost of higher write latency and more nodes to operate.<br>
+<strong>41.</strong> How does the Scheduler use zone labels differently from topologySpreadConstraints? — Zone labels are the raw topology data; topologySpreadConstraints is the policy that consumes those labels to enforce even distribution.<br>
+<strong>42.</strong> What's a realistic RTO for a single etcd leader failure versus a full AZ loss? — Leader failure: sub-second to a few seconds (Raft re-election); full AZ loss: minutes, bounded by rescheduling and traffic rebalancing across surviving zones.<br>
+<strong>43.</strong> Why is "3 nodes total" not the same as "HA" if they're all worker nodes? — Worker-node count alone says nothing about control-plane quorum or Pod distribution across failure domains.<br>
+<strong>44.</strong> What's the risk of an HA design that was correct at launch but never revisited? — Team growth, new namespaces, or workload changes can silently violate original topology-spread/PDB assumptions over time.<br>
+<strong>45.</strong> How do you detect that anti-affinity rules are being silently ignored? — Inspect actual Pod-to-node/zone placement (<code>kubectl get pods -o wide</code>) rather than trusting the manifest's stated intent.<br>
+<strong>46.</strong> What's the relationship between etcd quorum size and the number of AZs you should use? — They should match — 3 etcd members should map to 3 AZs, not 3 members crammed into 2 AZs.<br>
+<strong>47.</strong> Why does stateless API-server scaling not require a Lease object? — There's no shared mutable decision being made between replicas — every replica independently serves whatever request it receives.<br>
+<strong>48.</strong> What's the first thing to check if PDBs seem to be blocking all drains cluster-wide? — Whether <code>minAvailable</code>/<code>maxUnavailable</code> values were set unrealistically tight relative to actual replica counts.<br>
+<strong>49.</strong> Why is monitoring leader-election flapping a leading indicator, not just a lagging one? — Frequent leader changes usually reflect underlying resource starvation or network instability that will cause bigger problems if untreated.<br>
+<strong>50.</strong> What's the single most important number to get right in an HA design, per this topic? — The etcd member count and its odd/even parity — it's the one decision that silently determines your entire quorum fault tolerance.
+</div></details>
+
+<footer class="course-footer">Continue to Topic 63: Backup &amp; Restore.</footer>
+
+<script>
+  mermaid.initialize({ startOnLoad: true, theme: 'dark' });
+</script>
+
+</body>
+</html>

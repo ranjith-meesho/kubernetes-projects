@@ -1,0 +1,261 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Topic 44: Pod Security — Kubernetes Expert Course</title>
+<link rel="stylesheet" href="styles.css">
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+</head>
+<body>
+
+<header class="course-header">
+  <div class="kicker">Topic 44 of 70</div>
+  <h1>Pod Security</h1>
+  <div class="subtitle">Pod Security Standards and Pod Security Admission — the successor to the removed PodSecurityPolicy.</div>
+</header>
+
+<nav class="topic-nav">
+  <a href="43-network-policies.html">&larr; Network Policies</a>
+  <a href="index.html">Course Index</a>
+  <a href="45-helm.html">Helm &rarr;</a>
+</nav>
+
+<h2 id="explanation">Explanation</h2>
+
+<p>A Pod's spec can request powerful, dangerous capabilities on its node: running as root, mounting the host
+filesystem, running privileged containers with full kernel access, adding Linux capabilities like
+<code>SYS_ADMIN</code>. Left unchecked, any user who can create Pods can effectively achieve root on the underlying
+node — turning "I have permission to deploy an app" into "I have permission to compromise the whole cluster." Pod
+security controls exist to close this gap by restricting which of these settings a Pod is allowed to request.</p>
+
+<p>Kubernetes' original answer was <strong>PodSecurityPolicy (PSP)</strong> — a cluster-scoped admission-controller
+object, removed in Kubernetes 1.25 after years of being deprecated, largely because its API design (indirect binding
+via RBAC to PSP objects) was notoriously confusing and easy to misconfigure. Its replacement is the <strong>Pod
+Security Standards (PSS)</strong>, a set of three predefined policy levels, enforced via a built-in admission
+controller called <strong>Pod Security Admission (PSA)</strong> that requires no separate object at all — you just
+label the namespace.</p>
+
+<p>The three PSS levels are: <strong>Privileged</strong> (unrestricted — for trusted system/infra namespaces like
+<code>kube-system</code>), <strong>Baseline</strong> (blocks known privilege escalations — no privileged containers,
+no host namespaces, no dangerous capabilities — but stays broadly compatible with common workloads), and
+<strong>Restricted</strong> (the hardened tier — enforces running as non-root, drops all Linux capabilities except
+what's explicitly re-added, requires <code>seccompProfile: RuntimeDefault</code>, disallows privilege escalation).
+Most application namespaces in a mature production cluster should target Restricted.</p>
+
+<p>PSA is applied per-namespace via three independent labels — <code>pod-security.kubernetes.io/enforce</code>,
+<code>...warn</code>, and <code>...audit</code> — each set to one of the three levels. <code>enforce</code> actually
+rejects non-compliant Pods at admission time; <code>warn</code> and <code>audit</code> let you roll out a stricter
+level gradually by surfacing violations (as kubectl warnings, or audit log entries) before you flip enforcement on —
+this staged rollout is the main reason PSA's design is considered a major usability improvement over PSP.</p>
+
+<p>PSA is intentionally coarse — it enforces a fixed menu of security-relevant fields, not arbitrary custom policy.
+For anything beyond the three standard levels (e.g. "images must come from our internal registry," "all Pods must
+have resource limits"), production clusters layer a policy engine like <strong>Kyverno</strong> or <strong>OPA
+Gatekeeper</strong> on top via validating/mutating admission webhooks.</p>
+
+<h2 id="internal-working">Internal Working / Interactions</h2>
+<ul>
+  <li><strong>API Server (built-in admission plugin):</strong> Pod Security Admission runs as a built-in (not webhook-based) admission controller, checking each Pod's spec against the level(s) configured for its namespace.</li>
+  <li><strong>Namespace object:</strong> the source of truth for which PSS level applies — read via labels at admission time, no separate cluster-scoped policy object needed.</li>
+  <li><strong>kubelet / container runtime:</strong> ultimately enforce the resulting security context (seccomp, capabilities, non-root UID) when actually starting the container via the CRI.</li>
+  <li><strong>External policy engines (Kyverno/OPA):</strong> run as validating/mutating admission webhooks alongside PSA for rules beyond the fixed PSS menu.</li>
+</ul>
+
+<h2 id="architecture-diagram">Architecture Diagram</h2>
+<pre class="mermaid">
+stateDiagram-v2
+    [*] --> PodSubmitted: kubectl apply
+    PodSubmitted --> PSA_Check: Pod Security Admission reads ns labels
+    PSA_Check --> Rejected: enforce level violated
+    PSA_Check --> Warned: warn level violated (still admitted)
+    PSA_Check --> Passed: compliant with enforce level
+    Warned --> Passed
+    Passed --> ExternalPolicyCheck: Kyverno/OPA webhook (if installed)
+    ExternalPolicyCheck --> Rejected: custom rule violated
+    ExternalPolicyCheck --> PersistedInEtcd: all checks pass
+    Rejected --> [*]
+    PersistedInEtcd --> [*]
+</pre>
+
+<h2 id="code-example">Code Example</h2>
+<pre><code># 1. Namespace enforcing the Restricted Pod Security Standard,
+#    warning/auditing against it too so violations are visible even before enforce is tightened further
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: payments
+  labels:
+    pod-security.kubernetes.io/enforce: restricted   # Rejects non-compliant Pods.
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/warn: restricted        # Surfaces warnings for anything still borderline.
+    pod-security.kubernetes.io/audit: restricted        # Logs violations to the audit log.
+---
+# 2. A Pod spec that actually satisfies the Restricted standard
+apiVersion: v1
+kind: Pod
+metadata:
+  name: checkout-worker
+  namespace: payments
+spec:
+  securityContext:
+    runAsNonRoot: true            # Restricted requires this — no running as UID 0.
+    runAsUser: 10001
+    seccompProfile:
+      type: RuntimeDefault        # Restricted requires an explicit seccomp profile.
+  containers:
+    - name: worker
+      image: registry.internal/checkout-worker:3.1.0
+      securityContext:
+        allowPrivilegeEscalation: false   # Blocks setuid-style privilege escalation.
+        capabilities:
+          drop: ["ALL"]                    # Restricted requires dropping all capabilities...
+          add: ["NET_BIND_SERVICE"]        # ...then only re-adding what's explicitly needed.
+        readOnlyRootFilesystem: true
+</code></pre>
+
+<h2 id="kubectl-commands">kubectl Commands</h2>
+<pre><code>kubectl label ns payments pod-security.kubernetes.io/enforce=restricted   # Apply enforcement to a namespace
+kubectl label ns payments pod-security.kubernetes.io/warn=restricted --overwrite  # Add warn-only staging first
+kubectl apply --dry-run=server -f pod.yaml                                  # See PSA warnings before real apply
+kubectl get ns --show-labels | grep pod-security                            # Audit which namespaces enforce what
+kubectl get events -n payments --field-selector reason=FailedCreate          # See PSA rejections as events
+kubectl auth can-i create pods --as=system:serviceaccount:payments:default -n payments  # Confirm identity separately from PSA
+</code></pre>
+
+<h2 id="best-practices">Best Practices &amp; Common Pitfalls</h2>
+<div class="grid-2">
+<div>
+<h4>Best Practices</h4>
+<ul>
+  <li>Default every new application namespace to at least Baseline, target Restricted for anything handling sensitive data.</li>
+  <li>Roll out stricter levels via <code>warn</code>/<code>audit</code> first, then flip <code>enforce</code> once violations are cleared.</li>
+  <li>Reserve Privileged strictly for trusted system namespaces (CNI, storage drivers) that genuinely need host access.</li>
+  <li>Layer Kyverno/OPA Gatekeeper on top of PSA for org-specific rules PSA doesn't cover.</li>
+</ul>
+</div>
+<div>
+<h4>Pitfalls</h4>
+<ul>
+  <li>Assuming PodSecurityPolicy still exists — it was removed in 1.25; any cluster still referencing it will break on upgrade.</li>
+  <li>Enforcing Restricted cluster-wide in one shot without a warn/audit staging period, breaking legitimate workloads.</li>
+  <li>Forgetting PSA is namespace-scoped only — it can't express per-workload exceptions within the same namespace.</li>
+  <li>Confusing PSA (built-in, fixed levels) with a full policy engine — PSA won't enforce custom business rules.</li>
+</ul>
+</div>
+</div>
+
+<h2 id="interview-questions">50 Interview Questions</h2>
+
+<details class="qa"><summary>1. Why was PodSecurityPolicy (PSP) removed in Kubernetes 1.25?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Its API design — indirect binding via RBAC to cluster-scoped PSP objects — was notoriously confusing and easy to misconfigure.
+<br><strong>Detail:</strong> Determining which PSP actually applied to a given Pod required tracing through RBAC bindings rather than a direct, readable relationship, making audits and troubleshooting difficult.
+<br><strong>Production example:</strong> Clusters upgrading to 1.25+ that still referenced PSP objects broke outright and had to migrate to Pod Security Admission beforehand.
+<br><strong>Common mistake:</strong> Assuming PSP still exists in a modern cluster and referencing it in new tooling or docs.</div></details>
+
+<details class="qa"><summary>2. What are the three Pod Security Standards (PSS) levels and what does each restrict?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Privileged (unrestricted), Baseline (blocks known privilege escalations), Restricted (hardened — non-root, dropped capabilities, seccomp required).
+<br><strong>Detail:</strong> Privileged is meant for trusted system namespaces; Baseline stays broadly compatible while blocking dangerous settings; Restricted is the tier most application namespaces handling sensitive data should target.
+<br><strong>Production example:</strong> kube-system stays Privileged for CNI/storage driver Pods, while a payments namespace enforces Restricted.
+<br><strong>Common mistake:</strong> Applying Restricted cluster-wide in one shot without checking which existing workloads would break.</div></details>
+
+<details class="qa"><summary>3. How is Pod Security Admission (PSA) configured — via an object or something else?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Via three labels on the Namespace object itself — no separate policy object needed at all.
+<br><strong>Detail:</strong> <code>pod-security.kubernetes.io/enforce</code>, <code>...warn</code>, and <code>...audit</code>, each independently set to one of the three levels.
+<br><strong>Production example:</strong> <code>kubectl label ns payments pod-security.kubernetes.io/enforce=restricted</code> applies enforcement with a single command.
+<br><strong>Common mistake:</strong> Looking for a PSA CRD or cluster-scoped object to create — PSA is intentionally label-driven, not object-driven.</div></details>
+
+<details class="qa"><summary>4. What's the difference between the enforce, warn, and audit PSA labels?</summary>
+<div class="qa-body"><strong>Short answer:</strong> enforce actually rejects non-compliant Pods at admission; warn surfaces a kubectl warning without blocking; audit logs a violation without blocking or warning interactively.
+<br><strong>Detail:</strong> This three-tier design lets teams roll out a stricter level gradually — turning on warn/audit first to observe violations, then flipping enforce once things are clean.
+<br><strong>Production example:</strong> Setting warn=restricted and audit=restricted while enforce stays at baseline, to see what would break before tightening.
+<br><strong>Common mistake:</strong> Setting only enforce to a strict level with no staged warn/audit period first, causing surprise Pod rejections.</div></details>
+
+<details class="qa"><summary>5. What specific fields does the Restricted PSS level require on a Pod?</summary>
+<div class="qa-body"><strong>Short answer:</strong> runAsNonRoot: true, seccompProfile.type: RuntimeDefault, allowPrivilegeEscalation: false, and capabilities.drop: ["ALL"] (with only explicit re-adds allowed).
+<br><strong>Detail:</strong> These map directly onto the securityContext at both Pod and container level; missing any of them causes admission rejection under enforce=restricted.
+<br><strong>Production example:</strong> A checkout-worker Pod explicitly setting runAsUser: 10001, dropping ALL capabilities, then re-adding only NET_BIND_SERVICE.
+<br><strong>Common mistake:</strong> Dropping ALL capabilities but forgetting to re-add one the app actually needs (like NET_BIND_SERVICE for binding to low ports), causing runtime failures instead of admission failures.</div></details>
+
+<details class="qa"><summary>6. What kind of admission controller is Pod Security Admission — webhook-based or built-in?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Built-in — it runs as part of the API Server binary itself, not as an external webhook call.
+<br><strong>Detail:</strong> This makes it faster and more reliable than webhook-based checks (no network round-trip, no webhook availability dependency) but also fixed in scope to the three predefined PSS levels.
+<br><strong>Production example:</strong> PSA continues functioning even if all external admission webhooks (Kyverno, OPA) are temporarily down, since it's compiled into the API Server.
+<br><strong>Common mistake:</strong> Assuming PSA has the same extensibility as a webhook-based policy engine — it doesn't; it's fixed-menu by design.</div></details>
+
+<details class="qa"><summary>7. Why do production clusters still layer Kyverno or OPA Gatekeeper on top of PSA?</summary>
+<div class="qa-body"><strong>Short answer:</strong> PSA only enforces a fixed set of security-relevant fields; it can't express arbitrary custom business rules.
+<br><strong>Detail:</strong> Rules like "images must come from our internal registry" or "all Pods must declare resource limits" fall outside PSS's scope entirely and need a general-purpose policy engine.
+<br><strong>Production example:</strong> Kyverno enforcing "no :latest image tags" alongside PSA enforcing Restricted-level security context fields.
+<br><strong>Common mistake:</strong> Expecting PSA alone to cover organizational compliance requirements beyond core Pod security settings.</div></details>
+
+<details class="qa"><summary>8. Is PSA scoped per-namespace or can it express per-workload exceptions within a namespace?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Namespace-scoped only — it cannot carve out per-workload exceptions inside a single namespace.
+<br><strong>Detail:</strong> If one workload in a namespace genuinely needs a Baseline-level exception while everything else is Restricted, you need a separate namespace for it, since PSA has no per-Pod override mechanism.
+<br><strong>Production example:</strong> Splitting a legacy privileged sidecar into its own namespace rather than weakening the whole namespace's enforce level for it.
+<br><strong>Common mistake:</strong> Trying to annotate a single Pod to bypass its namespace's PSA enforce level — there's no such per-Pod escape hatch in PSA itself.</div></details>
+
+<details class="qa"><summary>9. What ultimately enforces the security context fields PSA validates?</summary>
+<div class="qa-body"><strong>Short answer:</strong> kubelet and the container runtime (via the CRI), which actually apply seccomp, capabilities, and non-root UID when starting the container.
+<br><strong>Detail:</strong> PSA's job stops at admission-time rejection of non-compliant specs; the runtime enforcement of "actually run as this UID, actually apply this seccomp profile" happens later, at container start.
+<br><strong>Production example:</strong> A Pod passing PSA admission still relies on containerd/CRI-O correctly applying the requested seccompProfile at runtime.
+<br><strong>Common mistake:</strong> Believing PSA itself sandboxes the container — it only validates the declared intent; the runtime does the actual enforcement.</div></details>
+
+<details class="qa"><summary>10. How would you preview PSA violations before actually applying a Pod manifest?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Use <code>kubectl apply --dry-run=server -f pod.yaml</code>, which runs the request through real admission (including PSA) without persisting it.
+<br><strong>Detail:</strong> Server-side dry-run exercises the full admission chain, so PSA warnings/rejections show up exactly as they would on a real apply.
+<br><strong>Production example:</strong> CI pipelines running dry-run applies against a staging cluster with the target namespace's real PSA labels before merging a PR.
+<br><strong>Common mistake:</strong> Using client-side dry-run (`--dry-run=client`), which never contacts the API Server and so skips admission checks entirely.</div></details>
+
+<details class="qa"><summary>11–50. Additional rapid-fire questions</summary>
+<div class="qa-body">
+<strong>11.</strong> What replaced PodSecurityPolicy? — Pod Security Standards enforced via Pod Security Admission.<br>
+<strong>12.</strong> Which PSS level is meant for kube-system-style trusted namespaces? — Privileged.<br>
+<strong>13.</strong> Which PSS level should most application namespaces handling sensitive data target? — Restricted.<br>
+<strong>14.</strong> How is a namespace opted into PSA enforcement? — By labeling it with <code>pod-security.kubernetes.io/enforce=&lt;level&gt;</code>.<br>
+<strong>15.</strong> What does the enforce-version label control? — Which PSS spec version's rule-set to apply (e.g. "latest" tracks the newest release's definitions).<br>
+<strong>16.</strong> Does PSA require restarting the API Server to take effect on a namespace? — No, it's evaluated live on every Pod admission based on current namespace labels.<br>
+<strong>17.</strong> What field disallows setuid-style privilege escalation? — <code>allowPrivilegeEscalation: false</code>.<br>
+<strong>18.</strong> What capabilities does Restricted require dropping? — ALL, with only explicitly needed ones re-added.<br>
+<strong>19.</strong> What seccomp profile type does Restricted require? — RuntimeDefault.<br>
+<strong>20.</strong> Can a Pod run as root under Baseline? — Baseline doesn't require non-root, only Restricted does.<br>
+<strong>21.</strong> What kubectl command shows PSA rejection events? — <code>kubectl get events --field-selector reason=FailedCreate</code>.<br>
+<strong>22.</strong> How do you audit which namespaces enforce which PSS level? — <code>kubectl get ns --show-labels | grep pod-security</code>.<br>
+<strong>23.</strong> Is PSA a webhook or compiled into the API Server? — Compiled in as a built-in admission plugin.<br>
+<strong>24.</strong> Can PSA express "images must come from this registry"? — No, that's outside PSS's fixed scope — needs Kyverno/OPA.<br>
+<strong>25.</strong> What happens to a Pod that violates enforce level? — It's rejected at admission and never created.<br>
+<strong>26.</strong> What happens to a Pod that only violates warn level? — It's still admitted; kubectl shows a warning message.<br>
+<strong>27.</strong> Can a single namespace have different enforce and warn levels simultaneously? — Yes, they're independent labels — e.g. enforce=baseline, warn=restricted.<br>
+<strong>28.</strong> What's the risk of jumping straight to enforce=restricted cluster-wide? — Breaking legitimate workloads that weren't already compliant, without any staged visibility first.<br>
+<strong>29.</strong> Does PSA replace the need for NetworkPolicy? — No — PSA governs container/Pod privilege settings, NetworkPolicy governs network traffic; they're orthogonal.<br>
+<strong>30.</strong> What does readOnlyRootFilesystem: true accomplish alongside Restricted? — Prevents writes to the container's root filesystem, reducing tamper/persistence risk, though not itself a PSS-mandated field.<br>
+<strong>31.</strong> Is PSA per-cluster or per-namespace configurable? — Per-namespace via labels (a cluster-wide default can also be set via AdmissionConfiguration).<br>
+<strong>32.</strong> What replaced the old PSP-to-RBAC binding indirection? — Direct namespace labeling — no binding object required at all.<br>
+<strong>33.</strong> Can PSA enforce resource requests/limits presence? — No, that's outside its scope — needs LimitRanger admission or a policy engine.<br>
+<strong>34.</strong> Why is Restricted considered the hardened tier? — It closes off nearly all privilege-escalation vectors: root, capabilities, privilege escalation, and unconfined syscalls.<br>
+<strong>35.</strong> What's a safe way to validate a Restricted rollout without breaking prod? — Apply warn/audit=restricted first, review logs/warnings across a full deploy cycle, then flip enforce.<br>
+<strong>36.</strong> Does removing the pod-security labels from a namespace disable enforcement? — Yes, an unlabeled namespace has no PSA enforcement (defaults apply per cluster admission config, often Privileged).<br>
+<strong>37.</strong> Can a Baseline-compliant Pod also pass Restricted? — Not necessarily — Restricted adds stricter requirements (non-root, dropped capabilities) Baseline doesn't require.<br>
+<strong>38.</strong> What's the relationship between PSA and the container runtime's CRI? — PSA validates the declared spec at admission; the CRI/runtime applies the actual OS-level enforcement when starting the container.<br>
+<strong>39.</strong> Why can't PSA alone stop a malicious image from being pulled? — It only checks security-context fields, not image provenance or content — that's a policy-engine or admission-webhook concern.<br>
+<strong>40.</strong> What's the audit label's use case if enforce already blocks violations? — Auditing a stricter level than what's currently enforced, to gather compliance evidence before eventually raising enforce.<br>
+<strong>41.</strong> Is there a way to see PSA warnings without applying the Pod? — Yes, via server-side dry-run (`--dry-run=server`).<br>
+<strong>42.</strong> Can PSA be bypassed by a cluster-admin creating Pods directly via etcd access? — Technically yes if bypassing the API Server entirely, but that's outside normal operational access and considered a severe security violation itself.<br>
+<strong>43.</strong> What's a common mistake when re-adding capabilities under Restricted? — Forgetting the app actually needs a specific capability (e.g. NET_BIND_SERVICE) and only discovering it via a runtime crash, not an admission error.<br>
+<strong>44.</strong> Does Pod Security Admission validate init containers too? — Yes, all containers in the Pod spec (including init and ephemeral containers) are checked against the enforced level.<br>
+<strong>45.</strong> How does PSA interact with existing running Pods when a namespace's enforce label is tightened? — Already-running Pods aren't retroactively evicted; enforcement only applies to new admission requests (create/update).<br>
+<strong>46.</strong> What's the benefit of PSA being label-driven over object-driven (like PSP)? — Directly visible on `kubectl get ns --show-labels` with no indirection through bindings to trace.<br>
+<strong>47.</strong> Can third-party policy engines fully replace PSA? — Yes technically, but most clusters use PSA for the baseline built-in guarantee and layer engines for anything extra, rather than replacing it.<br>
+<strong>48.</strong> What's the risk of using enforce-version: latest in a long-lived namespace? — Behavior can change on cluster upgrades as "latest" tracks new Kubernetes releases' PSS definitions, potentially causing new rejections after an upgrade.<br>
+<strong>49.</strong> How would you migrate a legacy PSP-based cluster to PSA? — Map each PSP's allowed settings to the closest PSS level, apply as warn/audit first, verify via events/logs, then enforce.<br>
+<strong>50.</strong> What's the first thing to check when a Pod mysteriously fails to create with no application-level error? — Whether PSA's enforce level for that namespace rejected the Pod spec — check events for a FailedCreate reason.
+</div></details>
+
+<footer class="course-footer">Next: Topic 45 — Helm, templating and packaging Kubernetes manifests.</footer>
+
+<script>
+  mermaid.initialize({ startOnLoad: true, theme: 'dark' });
+</script>
+
+</body>
+</html>

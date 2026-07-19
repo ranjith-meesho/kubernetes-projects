@@ -1,0 +1,296 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Topic 60: Kubernetes Internals — Kubernetes Expert Course</title>
+<link rel="stylesheet" href="styles.css">
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+</head>
+<body>
+
+<header class="course-header">
+  <div class="kicker">Topic 60 of 70</div>
+  <h1>Kubernetes Internals</h1>
+  <div class="subtitle">Informers, watch, resourceVersion, and client-go — the machinery that every controller, including the ones you write, is built on.</div>
+</header>
+
+<nav class="topic-nav">
+  <a href="59-troubleshooting.html">&larr; Troubleshooting</a>
+  <a href="index.html">Course Index</a>
+  <a href="61-multi-cluster.html">Multi-cluster &rarr;</a>
+</nav>
+
+<h2 id="explanation">Explanation</h2>
+<p>Every controller in Kubernetes — the built-in ReplicaSet and Deployment controllers, cluster-autoscaler, and any
+custom operator you write — is built from the same underlying primitive: a <strong>watch</strong> connection to the
+API server plus a local cache, wrapped in a pattern called an <strong>informer</strong>. Understanding this machinery
+is what separates "I can use kubectl" from "I understand why Kubernetes scales the way it does and can build on it
+myself," which is exactly why this topic exists near the end of the course, after you've seen the effects
+(reconciliation, self-healing, fast reaction to change) without yet seeing the mechanism.</p>
+
+<p>The naive way to build a controller would be to repeatedly poll the API server ("give me all Pods") on an interval.
+This doesn't scale: with thousands of controllers across a large cluster all polling, the API server would collapse
+under redundant, mostly-unchanged data. Instead, client-go's <strong>watch</strong> API lets a client open one
+long-lived HTTP connection and receive a stream of only the <em>changes</em> (Added/Modified/Deleted events) to a
+resource type, starting from a given <code>resourceVersion</code> — a monotonically increasing marker (backed by
+etcd's own revision numbering) that lets a client resume exactly where it left off after a disconnect, without
+re-fetching everything.</p>
+
+<p>An <strong>informer</strong> wraps this raw watch mechanism into something usable: it does an initial
+<code>List</code> to populate a local, thread-safe cache (backed by a <code>Store</code>/<code>Indexer</code>), then
+switches to <code>Watch</code> to keep that cache incrementally up to date, and finally dispatches
+Add/Update/Delete events to registered handler functions. Controllers read from this local cache instead of hitting
+the API server on every reconcile — this is why Kubernetes controllers can react within milliseconds and yet impose
+almost no incremental load on the API server as cluster size grows. A <strong>SharedInformerFactory</strong> lets
+multiple controllers within one process share a single underlying watch/cache per resource type, avoiding redundant
+watches when a controller needs to read several resource kinds.</p>
+
+<p>The typical custom controller pattern (used by every Kubernetes Operator, and the model <code>client-go</code>,
+<code>controller-runtime</code>, and <code>kubebuilder</code> all formalize) is: watch a resource via an informer,
+push changed object keys onto a <strong>workqueue</strong> (deduplicating rapid repeated changes to the same object),
+and run a <strong>reconcile loop</strong> that pulls a key off the queue, reads current desired+actual state (from the
+informer's cache and possibly live API calls), and takes whatever action closes the gap — retrying with exponential
+backoff on failure. This is the exact same level-triggered reconciliation pattern from Topic 1, just now visible as
+code you can write yourself.</p>
+
+<p>This topic connects everything: the "watch, don't poll" principle from Topic 1's architecture, the troubleshooting
+Events you read in Topic 59 (themselves API objects that controllers watch), and every operator you'll ever install
+(Prometheus Operator, cert-manager, the OpenTelemetry Operator, ArgoCD) — all of them are, underneath, just another
+informer-driven reconcile loop talking to the same API server.</p>
+
+<h2 id="internal-working">Internal Working / Interactions</h2>
+<ul>
+  <li><strong>API Server</strong> exposes List and Watch endpoints per resource type/namespace; every watch event carries the resource's new state plus its updated <code>resourceVersion</code>.</li>
+  <li><strong>Reflector</strong> (inside an informer) does the initial List, then opens a Watch from that <code>resourceVersion</code>, feeding events into a local <code>DeltaFIFO</code> queue.</li>
+  <li><strong>Indexer/Store</strong> is the thread-safe local cache the reflector populates; controllers query this instead of the API server for reads.</li>
+  <li><strong>Workqueue</strong> receives object keys from informer event handlers, deduplicates rapid-fire updates to the same key, and supports rate-limited retry on reconcile failure.</li>
+  <li><strong>Reconciler</strong> (your custom controller logic) pulls a key, fetches current state, compares to desired state (often from a CRD spec), and issues API calls (Create/Update/Delete) to converge — the same "compare and converge" loop used by every built-in controller.</li>
+</ul>
+
+<h2 id="architecture-diagram">Architecture Diagram</h2>
+<pre class="mermaid">
+flowchart TB
+    API["API Server"] -->|List (initial sync)| REF["Reflector"]
+    API -->|Watch (incremental, resourceVersion-based)| REF
+    REF --> DFIFO["DeltaFIFO<br/>(ordered change queue)"]
+    DFIFO --> STORE["Indexer / Local Cache<br/>(thread-safe, shared by controllers)"]
+    DFIFO -->|Add/Update/Delete events| HANDLERS["Event Handlers"]
+    HANDLERS -->|enqueue object key| WQ["Workqueue<br/>(dedup + rate-limited retry)"]
+    WQ --> RECON["Reconciler<br/>(your controller logic)"]
+    RECON -->|read| STORE
+    RECON -->|Create/Update/Delete| API
+</pre>
+
+<h2 id="code-example">Code Example</h2>
+<pre><code># Custom Resource Definition — the desired-state object a custom controller watches
+# and reconciles, following the exact same List/Watch/reconcile pattern as built-ins.
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: backupschedules.ops.example.com
+spec:
+  group: ops.example.com
+  names:
+    kind: BackupSchedule
+    plural: backupschedules
+  scope: Namespaced
+  versions:
+    - name: v1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              properties:
+                schedule: { type: string }     # cron expression - the "desired state" a controller reconciles toward
+                targetPVC: { type: string }
+            status:
+              type: object
+              properties:
+                lastBackupTime: { type: string }   # written only by the controller, never by users
+</code></pre>
+<pre><code>// Simplified Go controller using client-go's SharedInformerFactory — illustrates the
+// informer -> workqueue -> reconcile pattern described above.
+factory := informers.NewSharedInformerFactory(clientset, 30*time.Second)
+podInformer := factory.Core().V1().Pods().Informer()
+
+queue := workqueue.NewRateLimitingQueue(workqueue.DefaultControllerRateLimiter())
+
+podInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+    AddFunc: func(obj interface{}) {
+        key, _ := cache.MetaNamespaceKeyFunc(obj)
+        queue.Add(key)                     // dedup happens automatically if key already queued
+    },
+    UpdateFunc: func(old, new interface{}) {
+        key, _ := cache.MetaNamespaceKeyFunc(new)
+        queue.Add(key)
+    },
+})
+
+factory.Start(stopCh)
+factory.WaitForCacheSync(stopCh)           // block until the initial List has fully populated the cache
+
+for {
+    key, shutdown := queue.Get()
+    if shutdown { break }
+    if err := reconcile(key.(string)); err != nil {
+        queue.AddRateLimited(key)          // retry with exponential backoff on failure
+    } else {
+        queue.Forget(key)
+    }
+    queue.Done(key)
+}
+</code></pre>
+
+<h2 id="kubectl-cli-commands">kubectl / CLI Commands</h2>
+<pre><code>kubectl get --raw '/api/v1/pods?watch=1' --v=8               # observe a raw watch stream (verbose client output)
+kubectl get pods -o json | jq '.items[0].metadata.resourceVersion'   # inspect an object's resourceVersion
+kubectl api-resources                                          # list all resource types informers can watch
+kubectl get crd                                                 # list CustomResourceDefinitions registered cluster-wide
+kubectl get events --field-selector involvedObject.kind=Pod     # events are just another watched resource type
+kubectl logs -n kube-system deploy/kube-controller-manager | grep -i "sync"   # see built-in controller reconcile activity
+kubectl get leases -n kube-system                                # leader election objects controllers use to avoid duplicate reconciles
+</code></pre>
+
+<h2 id="best-practices">Best Practices &amp; Common Pitfalls</h2>
+<div class="grid-2">
+<div>
+<h4>Best Practices</h4>
+<ul>
+  <li>Always read from the informer's local cache in reconcile logic, never issue a live API GET per event — that defeats the entire pattern.</li>
+  <li>Use a workqueue with rate limiting so transient reconcile failures back off instead of hot-looping against the API server.</li>
+  <li>Build custom controllers with <code>controller-runtime</code>/<code>kubebuilder</code> rather than raw client-go — it encodes these patterns correctly by default.</li>
+  <li>Make reconcile logic idempotent and level-triggered (compute full desired vs actual state) rather than edge-triggered.</li>
+  <li>Use leader election for any controller you run with multiple replicas to avoid duplicate/conflicting reconciles.</li>
+</ul>
+</div>
+<div>
+<h4>Pitfalls</h4>
+<ul>
+  <li>Polling the API server on a timer inside a custom controller instead of using informers — reintroduces the exact scalability problem watch was built to solve.</li>
+  <li>Forgetting <code>WaitForCacheSync</code> before starting reconciliation, causing reconciles against an incomplete cache.</li>
+  <li>Not handling resourceVersion "too old" errors (etcd compaction) gracefully — the informer must re-List, not crash.</li>
+  <li>Writing non-idempotent reconcile logic (e.g. "always create") that fails or duplicates resources on a re-run.</li>
+</ul>
+</div>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="interview-questions">50 Interview Questions</h2>
+
+<details class="qa"><summary>1. Why does client-go use a watch connection instead of polling the API server?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Polling thousands of controllers on an interval would swamp the API server with mostly-redundant reads; watch streams only the changes.
+<br><strong>Detail:</strong> A watch is one long-lived HTTP connection that delivers Added/Modified/Deleted events starting from a given resourceVersion, so a client never re-fetches unchanged data.
+<br><strong>Production example:</strong> cluster-autoscaler and every built-in controller share this same watch-based approach, which is why adding more controllers doesn't linearly increase API server load.
+<br><strong>Common mistake:</strong> Writing a custom controller that polls the API server on a timer — it reintroduces the exact scalability problem watch was built to solve.</div></details>
+
+<details class="qa"><summary>2. What is an informer and what does it wrap?</summary>
+<div class="qa-body"><strong>Short answer:</strong> An informer wraps the raw List/Watch mechanism into a local cache plus event dispatch layer.
+<br><strong>Detail:</strong> It does an initial List to populate a Store/Indexer, switches to Watch to keep it incrementally current, and dispatches Add/Update/Delete events to registered handlers.
+<br><strong>Production example:</strong> The Deployment, ReplicaSet, and every custom Operator controller are all, underneath, informer-driven reconcile loops.
+<br><strong>Common mistake:</strong> Assuming informers make a live API call on every reconcile — they don't; controllers read the local cache instead.</div></details>
+
+<details class="qa"><summary>3. What is the Reflector's job inside an informer?</summary>
+<div class="qa-body"><strong>Short answer:</strong> It performs the initial List, then opens a Watch from that resourceVersion, feeding events into a local DeltaFIFO queue.
+<br><strong>Detail:</strong> The Reflector is the only piece that actually talks to the API server for List/Watch; everything downstream (Store, handlers) consumes what it produces.
+<br><strong>Production example:</strong> When a controller process restarts, its Reflector re-Lists once, then resumes Watch — that's the visible "initial sync" delay you see on startup.
+<br><strong>Common mistake:</strong> Confusing the Reflector with the Reconciler — the Reflector only syncs the cache, it never calls your reconcile logic.</div></details>
+
+<details class="qa"><summary>4. What is DeltaFIFO and why is it a queue of deltas rather than raw objects?</summary>
+<div class="qa-body"><strong>Short answer:</strong> DeltaFIFO is the ordered change queue the Reflector feeds, and it preserves both the type of change and the object so nothing about ordering is lost.
+<br><strong>Detail:</strong> It sits between the Reflector and the Indexer/Store, ensuring Add/Update/Delete events are processed in order even if several changes to the same object arrive in a burst.
+<br><strong>Production example:</strong> Rapid successive updates to a busy ConfigMap still get applied to the local cache in the correct sequence.
+<br><strong>Common mistake:</strong> Assuming the informer cache updates in the same call that dispatches your handler — the two are coupled through DeltaFIFO, not direct writes.</div></details>
+
+<details class="qa"><summary>5. What is the Indexer/Store and why do controllers read from it instead of the API server?</summary>
+<div class="qa-body"><strong>Short answer:</strong> It's the thread-safe local cache the Reflector populates; reading it avoids a network round trip and API server load on every reconcile.
+<br><strong>Detail:</strong> Reconcile logic should always query this local cache for current state, never issue a live GET per event.
+<br><strong>Production example:</strong> A controller managing thousands of Pods can look up any Pod's cached state in-memory instead of hitting the API server thousands of times per second.
+<br><strong>Common mistake:</strong> Issuing a live API GET inside the reconcile loop "just to be safe" — this defeats the entire purpose of the informer pattern.</div></details>
+
+<details class="qa"><summary>6. What problem does a SharedInformerFactory solve?</summary>
+<div class="qa-body"><strong>Short answer:</strong> It lets multiple controllers in one process share a single underlying watch/cache per resource type instead of each opening its own.
+<br><strong>Detail:</strong> Without sharing, five controllers watching Pods in the same binary would open five redundant watches and five redundant caches.
+<br><strong>Production example:</strong> A controller-runtime manager running several reconcilers for different CRDs shares informers for any resource type they have in common.
+<br><strong>Common mistake:</strong> Manually constructing a separate informer per controller in the same process, wasting memory and API server connections.</div></details>
+
+<details class="qa"><summary>7. Why does the reconcile pattern use a workqueue instead of acting directly inside the event handler?</summary>
+<div class="qa-body"><strong>Short answer:</strong> The workqueue deduplicates rapid repeated changes to the same object key and supports rate-limited retry, decoupling event arrival from processing.
+<br><strong>Detail:</strong> If ten updates to the same object arrive in a second, the workqueue collapses them to one pending key rather than running reconcile ten times.
+<br><strong>Production example:</strong> <code>workqueue.NewRateLimitingQueue(workqueue.DefaultControllerRateLimiter())</code> backs off exponentially on repeated reconcile failures instead of hot-looping.
+<br><strong>Common mistake:</strong> Doing the actual create/update/delete work inside <code>AddFunc</code>/<code>UpdateFunc</code> directly — this blocks the informer's event dispatch and loses retry/backoff semantics.</div></details>
+
+<details class="qa"><summary>8. What is resourceVersion and why does watch depend on it?</summary>
+<div class="qa-body"><strong>Short answer:</strong> A monotonically increasing marker, backed by etcd's own revision numbering, that lets a client resume a watch exactly where it left off.
+<br><strong>Detail:</strong> An informer's List returns objects plus a resourceVersion; the subsequent Watch call starts from that version so no changes are missed or duplicated across a reconnect.
+<br><strong>Production example:</strong> <code>kubectl get pods -o json | jq '.items[0].metadata.resourceVersion'</code> shows this marker on any object.
+<br><strong>Common mistake:</strong> Treating resourceVersion as a simple counter you can compare across different resource types or clusters — it's only meaningful for resuming a watch on the same collection.</div></details>
+
+<details class="qa"><summary>9. Why is WaitForCacheSync required before starting reconciliation?</summary>
+<div class="qa-body"><strong>Short answer:</strong> It blocks until the informer's initial List has fully populated the local cache, so reconcile logic never runs against incomplete data.
+<br><strong>Detail:</strong> Starting the reconcile loop before the cache is synced can cause a controller to see a partial world and take wrong or duplicate actions.
+<br><strong>Production example:</strong> <code>factory.Start(stopCh); factory.WaitForCacheSync(stopCh)</code> is the standard bootstrap sequence in a client-go controller.
+<br><strong>Common mistake:</strong> Forgetting to call <code>WaitForCacheSync</code>, causing reconciles against an incomplete cache right after controller startup.</div></details>
+
+<details class="qa"><summary>10. What happens when a watch's resourceVersion becomes "too old" due to etcd compaction?</summary>
+<div class="qa-body"><strong>Short answer:</strong> The watch fails with an error, and the informer must fall back to a fresh List rather than crash.
+<br><strong>Detail:</strong> etcd periodically compacts old revisions to bound storage growth, so a resourceVersion that's been held too long may no longer exist to resume from.
+<br><strong>Production example:</strong> A controller offline for an extended period reconnects, hits a "too old resource version" error, and re-Lists to rebuild its cache before resuming Watch.
+<br><strong>Common mistake:</strong> Not handling this error gracefully — letting the informer crash instead of re-Listing leaves the controller stuck.</div></details>
+
+<details class="qa"><summary>11–50. Additional rapid-fire questions</summary>
+<div class="qa-body">
+<strong>11.</strong> What is the reconcile loop pattern shared by every controller? — Watch via informer, push changed keys to a workqueue, pull a key, compare desired vs actual state, take action to close the gap.<br>
+<strong>12.</strong> Why is the reconcile pattern level-triggered rather than edge-triggered? — Level-triggered (recompute full desired vs actual state) is resilient to missed events; edge-triggered would lose state on a dropped message.<br>
+<strong>13.</strong> What does a CustomResourceDefinition's spec vs status split represent? — spec is the desired state written by users; status (e.g. lastBackupTime) is written only by the controller reconciling toward that spec.<br>
+<strong>14.</strong> Why must reconcile logic be idempotent? — Because it can be called repeatedly for the same object (retries, resyncs); non-idempotent logic like "always create" fails or duplicates resources on a re-run.<br>
+<strong>15.</strong> What does <code>queue.AddRateLimited(key)</code> do versus <code>queue.Forget(key)</code>? — AddRateLimited requeues the key with exponential backoff after a failure; Forget clears the backoff state after a successful reconcile.<br>
+<strong>16.</strong> What is the purpose of <code>cache.MetaNamespaceKeyFunc</code>? — Converts an object into a namespace/name string key used to identify it in the workqueue and cache lookups.<br>
+<strong>17.</strong> Why do event handlers only enqueue a key rather than the full object? — By the time the key is processed, the object may have changed again; re-reading from the cache by key always gets the freshest known state.<br>
+<strong>18.</strong> What's the difference between client-go and controller-runtime? — client-go is the low-level library (informers, workqueue, clientset); controller-runtime is a higher-level framework built on it that encodes the informer/workqueue/reconcile pattern correctly by default.<br>
+<strong>19.</strong> Why is <code>controller-runtime</code>/<code>kubebuilder</code> recommended over raw client-go for new controllers? — It handles cache sync, leader election, and workqueue wiring correctly out of the box, reducing the chance of subtle bugs.<br>
+<strong>20.</strong> Why does every Kubernetes Operator follow the informer -> workqueue -> reconcile model? — It's the same underlying primitive Kubernetes itself uses for built-in controllers, formalized by client-go/controller-runtime/kubebuilder.<br>
+<strong>21.</strong> What role does leader election play for a controller run with multiple replicas? — Ensures only one replica actively reconciles at a time, avoiding duplicate or conflicting actions from concurrent reconcilers.<br>
+<strong>22.</strong> How would you observe leader election objects for controllers in a cluster? — <code>kubectl get leases -n kube-system</code> lists the lease objects controllers use to coordinate.<br>
+<strong>23.</strong> How can you watch built-in controller reconcile activity for troubleshooting? — <code>kubectl logs -n kube-system deploy/kube-controller-manager | grep -i "sync"</code> surfaces reconcile-related log lines.<br>
+<strong>24.</strong> Why does a CRD schema define both a cron-style <code>schedule</code> field and a <code>lastBackupTime</code> status field? — The former is desired state a controller reconciles toward; the latter is observed state the controller reports back after acting.<br>
+<strong>25.</strong> What does <code>kubectl api-resources</code> reveal in the context of informers? — The full list of resource types informers can watch, since any registered API resource (built-in or CRD) is watchable the same way.<br>
+<strong>26.</strong> How are Events relevant to the informer pattern? — Events are just another watched resource type; a controller can watch Events the same way it watches Pods or CRDs.<br>
+<strong>27.</strong> Why does a raw watch stream show only Added/Modified/Deleted, not a full object list? — Because watch is a delta stream, not a re-list; you already have the prior state from the initial List, so only diffs are sent.<br>
+<strong>28.</strong> How would you inspect a raw watch stream manually? — <code>kubectl get --raw '/api/v1/pods?watch=1' --v=8</code> shows the underlying event stream.<br>
+<strong>29.</strong> Why is the initial List step necessary even though watch delivers all subsequent changes? — Watch only delivers changes going forward; without an initial List the cache would start empty and miss every object that existed before the watch began.<br>
+<strong>30.</strong> What happens if a controller's cache falls behind the actual cluster state? — Reconciles act on stale data until the next sync; this is why WaitForCacheSync and correct resourceVersion handling matter.<br>
+<strong>31.</strong> Why is the workqueue described as supporting "rate-limited retry"? — Failed reconciles are requeued with increasing backoff instead of being retried immediately, avoiding hot-looping against the API server.<br>
+<strong>32.</strong> What's the risk of not deduplicating rapid updates to the same object key? — The reconcile function would run redundantly many times for what is effectively one logical change, wasting API server calls.<br>
+<strong>33.</strong> Why does the reconciler issue Create/Update/Delete calls back to the API server rather than mutating the local cache directly? — The local cache is read-only from the controller's perspective; only the API server (and thus etcd) is the source of truth, and the informer's watch will reflect the change back into the cache.<br>
+<strong>34.</strong> What does the reconciler read from before deciding what action to take? — The informer's local cache (Indexer/Store) for current state, and the CRD/object spec for desired state, occasionally supplemented with live API calls when needed.<br>
+<strong>35.</strong> How does this topic connect to the "watch, don't poll" architecture principle from earlier in the course? — It's the same level-triggered reconciliation principle, now shown as the actual client-go code a custom controller runs.<br>
+<strong>36.</strong> Why are Prometheus Operator, cert-manager, and the OpenTelemetry Operator all described as "informer-driven reconcile loops"? — Because every Kubernetes Operator, regardless of vendor, is built from the same watch-cache-workqueue-reconcile primitive talking to the same API server.<br>
+<strong>37.</strong> Why does a CustomResourceDefinition need <code>served: true</code> and <code>storage: true</code> on a version? — served controls whether the API server exposes that version to clients; storage controls which version is persisted in etcd — exactly one version must be the storage version.<br>
+<strong>38.</strong> What's the danger of writing non-idempotent "always create" reconcile logic? — Re-running reconcile (which happens routinely on resync or retry) would attempt to create the same resource again and fail or duplicate it.<br>
+<strong>39.</strong> Why does the informer pattern reduce API server load "as cluster size grows," specifically? — Because reads happen against the local cache regardless of scale; only the initial List and the ongoing Watch touch the API server, not each reconcile.<br>
+<strong>40.</strong> What's the practical effect of forgetting to call <code>WaitForCacheSync</code> in a real controller? — Early reconciles may see zero or partial objects and take incorrect actions (e.g. thinking a resource doesn't exist yet).<br>
+<strong>41.</strong> Why is polling described as something that "collapses" the API server at scale? — With thousands of controllers each polling on a timer, the redundant, mostly-unchanged reads compound linearly with controller count, unlike watch's incremental model.<br>
+<strong>42.</strong> How does a BackupSchedule CRD's <code>targetPVC</code> field fit the reconcile model? — It's part of desired state the controller reads to know which PersistentVolumeClaim to act on when executing the reconcile.<br>
+<strong>43.</strong> What is the purpose of registering handler functions (AddFunc/UpdateFunc/DeleteFunc) on an informer? — They're the entry point that translates a cache change into a workqueue enqueue, bridging the informer's internal event stream to your controller logic.<br>
+<strong>44.</strong> Why does <code>UpdateFunc</code> receive both an old and new object? — So the handler can decide whether the change is meaningful enough to enqueue (e.g. ignore updates that only touch resourceVersion or status noise).<br>
+<strong>45.</strong> What's the relationship between the informer's resync period and correctness? — A periodic resync re-delivers all cached objects to handlers as a safety net, catching any reconcile that might have been missed due to a transient bug or dropped event.<br>
+<strong>46.</strong> Why does the diagram show the Reconciler both reading from the Store and writing to the API Server? — Reads are cheap and local (from cache); writes must go through the API server since it's the only path to persisting changes in etcd.<br>
+<strong>47.</strong> What would you check first if a custom controller seems to have stopped reacting to changes? — Whether its informer's cache is synced and its watch connection is alive — check controller logs for watch errors or a stuck leader election lease.<br>
+<strong>48.</strong> Why is the workqueue keyed by object identity rather than holding full event payloads? — Keying by identity naturally deduplicates repeated changes to the same object, since only the latest state matters at reconcile time, not the sequence of changes.<br>
+<strong>49.</strong> How does this internals topic explain why Kubernetes controllers can react within milliseconds at large scale? — Because reconciliation reads from an in-memory cache kept current by watch, not from a live API call, so reaction time is decoupled from API server load.<br>
+<strong>50.</strong> Why is understanding informers described as separating "I can use kubectl" from being able to build on Kubernetes yourself? — Because every Operator you'd write or extend is built from this exact List/Watch/cache/workqueue/reconcile machinery, not from ad-hoc polling scripts.
+</div></details>
+
+<footer class="course-footer">Next: Topic 61 — Multi-cluster patterns, applying this same control-loop thinking across cluster boundaries.</footer>
+
+<script>
+  mermaid.initialize({ startOnLoad: true, theme: 'dark' });
+</script>
+
+</body>
+</html>

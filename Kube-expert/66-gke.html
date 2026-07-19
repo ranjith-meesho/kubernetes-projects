@@ -1,0 +1,301 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Topic 66: GKE — Kubernetes Expert Course</title>
+<link rel="stylesheet" href="styles.css">
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+</head>
+<body>
+
+<header class="course-header">
+  <div class="kicker">Topic 66 of 70</div>
+  <h1>GKE (Google Kubernetes Engine)</h1>
+  <div class="subtitle">Google's managed Kubernetes: Autopilot vs Standard, node pools, and Workload Identity for keyless GCP access.</div>
+</header>
+
+<nav class="topic-nav">
+  <a href="65-cluster-upgrade.html">&larr; Cluster Upgrade</a>
+  <a href="index.html">Course Index</a>
+  <a href="67-eks.html">EKS &rarr;</a>
+</nav>
+
+<h2 id="explanation">Explanation</h2>
+<p>GKE was the first managed Kubernetes offering (Google authored Kubernetes itself, drawing on Borg), and it exposes
+this maturity as a genuine choice of operating model: <strong>Standard</strong> mode gives you a fully managed
+control plane but you still own node pools — you choose machine types, node counts, autoscaling ranges, and you pay
+for the VMs whether or not they're fully utilized. <strong>Autopilot</strong> mode goes further and manages nodes
+too: you only submit Pod specs, GKE provisions right-sized, hardened, autoscaled node capacity behind the scenes, and
+you're billed per-pod-resource-request rather than per-VM. Autopilot removes an entire category of operational work
+(node OS patching, node pool sizing, bin-packing efficiency) at the cost of some flexibility — no DaemonSets that
+need host access, no privileged pods, and a curated set of allowed configurations enforced by built-in admission
+policies.</p>
+
+<p>A <strong>node pool</strong> is GKE's unit of homogeneous worker capacity: a group of nodes sharing the same
+machine type, disk type, labels, taints, and (optionally) GPU/TPU accelerators. Real clusters run multiple node
+pools deliberately — e.g. a general-purpose pool for most workloads, a memory-optimized pool for data-processing
+jobs, and a GPU pool for ML inference, each with independent autoscaling min/max and often tainted so only intended
+workloads schedule there via matching tolerations. Node pools can also mix Spot VMs (deeply discounted, preemptible)
+for fault-tolerant batch work with on-demand pools for latency-sensitive services.</p>
+
+<p><strong>Workload Identity</strong> solves the oldest problem in cloud-native security: how does a Pod get GCP
+credentials without a long-lived service-account JSON key sitting in a Secret? Workload Identity binds a Kubernetes
+ServiceAccount to a GCP IAM service account via a trust relationship at the GKE metadata server level. When a Pod
+using that KSA calls a GCP API (e.g. via the client library, which auto-discovers credentials from the metadata
+server), GKE's metadata server transparently exchanges the Pod's Kubernetes identity for short-lived GCP IAM
+credentials — no static keys ever touch the cluster, and the binding is fully auditable and revocable via IAM alone.
+This is the same problem IRSA solves on EKS, just implemented via GCP's workload identity federation rather than
+AWS's OIDC federation.</p>
+
+<p>Operationally, GKE's biggest practical decisions are: Standard vs Autopilot (choose Autopilot by default for new
+clusters unless you have a specific need for host-level access or unusual workloads — it removes real toil),
+regional vs zonal clusters (regional replicates the control plane and, typically, node pools across zones for free
+HA — almost always the right default), and release channels (Rapid/Regular/Stable trade newer features for
+stability; Stable is the right default for production, giving Google's own upgrade-testing signal time to catch
+issues before you inherit them).</p>
+
+<h2 id="internal-working">Internal Working / Interactions</h2>
+<ul>
+  <li><strong>Control plane:</strong> fully managed and invisible — Google runs and upgrades etcd/API-server/scheduler;
+  you interact only via the GKE API/CLI/console and the cluster's kube-apiserver endpoint.</li>
+  <li><strong>Node pools (Standard):</strong> backed by a Managed Instance Group per pool; the Cluster Autoscaler
+  resizes the MIG based on unschedulable-pod pressure and pool min/max bounds.</li>
+  <li><strong>Autopilot scheduling:</strong> GKE's own controller provisions right-sized nodes on demand per Pod
+  resource requests, applying its own bin-packing and security policies before your Pod is placed.</li>
+  <li><strong>Workload Identity binding:</strong> a KSA is annotated with the target GCP service account; GKE's
+  metadata-server proxy on each node intercepts credential requests from Pods using that KSA and mints short-lived
+  tokens for the bound GSA.</li>
+  <li><strong>GKE Autoscaler + VPA:</strong> Cluster Autoscaler handles node count, HPA/VPA handle Pod replica count
+  and per-Pod resource sizing — all three cooperate but are independently configured.</li>
+</ul>
+
+<h2 id="architecture-diagram">Architecture Diagram</h2>
+<pre class="mermaid">
+flowchart TB
+  subgraph Google["Google-managed control plane"]
+    API[kube-apiserver]
+    ETCD[(etcd)]
+    SCHED[Scheduler]
+  end
+  subgraph Project["Your GCP Project"]
+    subgraph PoolA["Node Pool: general (Standard mode)"]
+      N1[Node] --- N2[Node]
+    end
+    subgraph PoolB["Node Pool: gpu-inference"]
+      N3["Node (GPU)"]
+    end
+    IAM[GCP IAM Service Account]
+  end
+  Pod[Pod using KSA: inference-sa]
+  MD[Node Metadata Server]
+
+  API --- ETCD
+  API --- SCHED
+  SCHED -.assigns.-> N3
+  Pod -->|"requests GCP creds"| MD
+  MD -->|"Workload Identity federation"| IAM
+  IAM -->|"short-lived token"| Pod
+</pre>
+
+<h2 id="code-example">Code Example</h2>
+<pre><code>#############################################
+# 1. Create a GKE Autopilot cluster (gcloud)
+#############################################
+gcloud container clusters create-auto prod-autopilot \
+  --region us-central1 \                      # regional = HA control plane across zones, by default
+  --release-channel stable                    # stable channel: slower, safer version rollout
+
+# Create a GKE Standard cluster with an explicit node pool
+gcloud container clusters create prod-standard \
+  --region us-central1 \
+  --num-nodes 2 \                              # 2 nodes per zone in the region
+  --machine-type e2-standard-4 \
+  --enable-autoscaling --min-nodes 2 --max-nodes 6 \
+  --workload-pool=my-project.svc.id.goog       # enables Workload Identity for the cluster
+
+# Add a second, GPU-backed node pool for inference workloads
+gcloud container node-pools create gpu-pool \
+  --cluster prod-standard --region us-central1 \
+  --machine-type n1-standard-8 \
+  --accelerator type=nvidia-tesla-t4,count=1 \
+  --node-taints=nvidia.com/gpu=present:NoSchedule   # only GPU-tolerant pods land here
+
+---
+# 2. Workload Identity binding (Kubernetes ServiceAccount <-> GCP IAM ServiceAccount)
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: inference-ksa
+  namespace: ml
+  annotations:
+    iam.gke.io/gcp-service-account: inference-gsa@my-project.iam.gserviceaccount.com
+---
+# Grant the GCP-side binding (run once via gcloud, not YAML):
+# gcloud iam service-accounts add-iam-policy-binding inference-gsa@my-project.iam.gserviceaccount.com \
+#   --role roles/iam.workloadIdentityUser \
+#   --member "serviceAccount:my-project.svc.id.goog[ml/inference-ksa]"
+apiVersion: v1
+kind: Pod
+metadata:
+  name: inference-worker
+  namespace: ml
+spec:
+  serviceAccountName: inference-ksa   # Pod inherits GCP creds via Workload Identity, no key files
+  containers:
+    - name: worker
+      image: gcr.io/my-project/inference:v4
+</code></pre>
+
+<h2 id="kubectl-cli-commands">kubectl / CLI Commands</h2>
+<pre><code># Fetch cluster credentials into local kubeconfig
+gcloud container clusters get-credentials prod-standard --region us-central1
+
+# List node pools and their autoscaling config
+gcloud container node-pools list --cluster prod-standard --region us-central1
+
+# Check available GKE versions / release channel status
+gcloud container get-server-config --region us-central1
+
+# Verify Workload Identity is enabled on the cluster
+gcloud container clusters describe prod-standard --region us-central1 --format="value(workloadIdentityConfig)"
+
+# List nodes and confirm which pool/machine-type they belong to
+kubectl get nodes -L cloud.google.com/gke-nodepool
+
+# Check a Pod's effective GCP identity via the Workload Identity path
+kubectl exec -it inference-worker -n ml -- curl -H "Metadata-Flavor: Google" \
+  "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/email"
+
+# Manually trigger a node pool upgrade
+gcloud container clusters upgrade prod-standard --node-pool general --region us-central1
+</code></pre>
+
+<h2 id="best-practices">Best Practices &amp; Common Pitfalls</h2>
+<div class="grid-2">
+  <div class="lab-card">
+    <h4>Best Practices</h4>
+    <ul>
+      <li>Default to Autopilot for new clusters; use Standard only when you need host-level control.</li>
+      <li>Use regional clusters for production — free HA across zones for the control plane.</li>
+      <li>Always use Workload Identity instead of service-account JSON key files.</li>
+      <li>Separate node pools by workload shape (general, memory, GPU) with taints/tolerations.</li>
+      <li>Pin production clusters to the Stable release channel.</li>
+    </ul>
+  </div>
+  <div class="lab-card">
+    <h4>Common Pitfalls</h4>
+    <ul>
+      <li>Mounting long-lived GCP service-account keys as Secrets instead of using Workload Identity.</li>
+      <li>Using zonal clusters for production and losing the control plane in a zone outage.</li>
+      <li>Expecting Autopilot to support privileged Pods, hostPath, or DaemonSets with host access.</li>
+      <li>One giant node pool for everything, causing noisy-neighbor and inefficient bin-packing.</li>
+      <li>Ignoring release-channel upgrade notifications until forced auto-upgrade happens.</li>
+    </ul>
+  </div>
+</div>
+
+<h2 id="interview-questions">50 Interview Questions</h2>
+
+<details class="qa"><summary>1. What's the fundamental difference between GKE Standard and Autopilot mode?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Standard gives you a managed control plane but you still own and pay for node pools; Autopilot manages nodes too — you submit only Pod specs and get billed per-Pod-resource-request.
+<br><strong>Detail:</strong> Autopilot removes node OS patching, node pool sizing, and bin-packing efficiency work at the cost of flexibility — no DaemonSets needing host access, no privileged Pods, and a curated set of allowed configurations enforced by built-in admission policies.
+<br><strong>Production example:</strong> A team migrating from Standard to Autopilot has to remove a privileged DaemonSet it relied on for host-level monitoring, replacing it with a supported alternative.
+<br><strong>Common mistake:</strong> Choosing Autopilot for a workload that fundamentally needs host-level access, then fighting the platform's restrictions instead of using Standard.</div></details>
+
+<details class="qa"><summary>2. What is a node pool, and why do real GKE clusters run more than one?</summary>
+<div class="qa-body"><strong>Short answer:</strong> A node pool is GKE's unit of homogeneous worker capacity — nodes sharing machine type, disk type, labels, taints, and optional accelerators.
+<br><strong>Detail:</strong> Real clusters deliberately run multiple pools (general-purpose, memory-optimized, GPU) each with independent autoscaling bounds, often tainted so only matching-toleration workloads land there, enabling workload-shape-specific bin-packing and cost control.
+<br><strong>Production example:</strong> A general pool serves most services while a separate GPU pool, tainted with <code>nvidia.com/gpu=present:NoSchedule</code>, serves only ML inference Pods with a matching toleration.
+<br><strong>Common mistake:</strong> Running one giant node pool for everything, causing noisy-neighbor effects and inefficient bin-packing across dissimilar workload shapes.</div></details>
+
+<details class="qa"><summary>3. How does Workload Identity let a Pod get GCP credentials without a long-lived service-account key?</summary>
+<div class="qa-body"><strong>Short answer:</strong> It binds a Kubernetes ServiceAccount to a GCP IAM service account via a trust relationship at the metadata-server level; GKE transparently exchanges the Pod's Kubernetes identity for short-lived GCP IAM credentials.
+<br><strong>Detail:</strong> No static keys ever touch the cluster, and the binding is fully auditable and revocable via IAM alone — client libraries auto-discover these credentials from the metadata server exactly as they would a normal GCE service account.
+<br><strong>Production example:</strong> A KSA annotated with <code>iam.gke.io/gcp-service-account: inference-gsa@my-project.iam.gserviceaccount.com</code> lets Pods using it call GCP APIs with no Secret-mounted key file anywhere.
+<br><strong>Common mistake:</strong> Mounting a downloaded service-account JSON key as a Secret instead of configuring Workload Identity, leaving a long-lived credential sitting in the cluster.</div></details>
+
+<details class="qa"><summary>4. Why should regional clusters be the default over zonal clusters for production on GKE?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Regional clusters replicate the control plane (and typically node pools) across zones for free HA; zonal clusters put the entire control plane in a single zone.
+<br><strong>Detail:</strong> A zonal cluster's control plane becomes unavailable during that zone's outage, even though it costs less — regional is almost always the right default for anything production-facing.
+<br><strong>Production example:</strong> A production cluster is created with <code>gcloud container clusters create prod-standard --region us-central1</code> rather than <code>--zone</code>, spreading control-plane replicas across zones automatically.
+<br><strong>Common mistake:</strong> Using zonal clusters for production to save cost and losing the entire control plane during a single zone outage.</div></details>
+
+<details class="qa"><summary>5. What do GKE release channels (Rapid/Regular/Stable) control, and why default to Stable in production?</summary>
+<div class="qa-body"><strong>Short answer:</strong> They trade newer Kubernetes features for stability — Stable gives Google's own upgrade-testing signal time to catch issues before you inherit them.
+<br><strong>Detail:</strong> Rapid gets new versions almost immediately (useful for testing new features early); Stable delays the same versions until they've proven themselves across the broader GKE fleet first.
+<br><strong>Production example:</strong> <code>gcloud container clusters create-auto prod-autopilot --release-channel stable</code> pins a production cluster to the safer channel.
+<br><strong>Common mistake:</strong> Leaving a production cluster on the Rapid channel and being surprised by an early, less-battle-tested version upgrade.</div></details>
+
+<details class="qa"><summary>6. How does the Cluster Autoscaler interact with node pools on GKE Standard?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Each node pool is backed by a Managed Instance Group; the Cluster Autoscaler resizes that MIG based on unschedulable-pod pressure, staying within the pool's configured min/max bounds.
+<br><strong>Detail:</strong> This is distinct from Autopilot, where GKE's own controller provisions right-sized nodes on demand per Pod resource request, applying its own bin-packing rather than resizing a pre-defined pool.
+<br><strong>Production example:</strong> <code>--enable-autoscaling --min-nodes 2 --max-nodes 6</code> on a node pool lets it grow under load and shrink back down during quiet periods.
+<br><strong>Common mistake:</strong> Setting <code>min-nodes</code> and <code>max-nodes</code> equal to each other, effectively disabling autoscaling while believing it's still active.</div></details>
+
+<details class="qa"><summary>7. Why does Autopilot bill per-Pod-resource-request instead of per-VM?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Since GKE manages node provisioning invisibly and bin-packs Pods onto right-sized capacity itself, billing is tied directly to what each Pod actually requests rather than to whole VM instances you'd otherwise have to size and pay for regardless of utilization.
+<br><strong>Detail:</strong> This removes the classic "paying for idle VM capacity" problem inherent to Standard mode's node-pool model, at the cost of losing direct control over instance shape/bin-packing decisions.
+<br><strong>Production example:</strong> A team moving batch workloads to Autopilot sees costs track actual CPU/memory requests rather than a fixed set of underutilized VMs.
+<br><strong>Common mistake:</strong> Setting unrealistically high resource requests on Autopilot Pods "just in case," which directly and immediately inflates the bill since billing follows requests.</div></details>
+
+<details class="qa"><summary>8. Why does the VPC subnet/IP model matter less on GKE than on EKS's VPC CNI approach?</summary>
+<div class="qa-body"><strong>Short answer:</strong> GKE's networking model differs from EKS's real-VPC-IP-per-Pod approach; GKE Pod IPs come from cluster-scoped alias IP ranges rather than consuming node ENI secondary IPs directly the same way, though IP planning still matters at cluster creation.
+<br><strong>Detail:</strong> This is a genuine platform difference interviewers probe for — candidates who only know EKS's VPC CNI model sometimes wrongly assume identical IP-exhaustion mechanics apply identically on GKE.
+<br><strong>Production example:</strong> Planning a large GKE cluster still requires sizing the cluster's pod and service CIDR ranges appropriately at creation time to avoid later exhaustion.
+<br><strong>Common mistake:</strong> Assuming GKE has the exact same VPC-IP-exhaustion failure mode as EKS without checking the platform-specific networking model.</div></details>
+
+<details class="qa"><summary>9–50. Additional rapid-fire questions</summary>
+<div class="qa-body">
+<strong>9.</strong> Why was GKE the first managed Kubernetes offering? — Google authored Kubernetes itself, drawing directly on its internal Borg system's decade of production experience.<br>
+<strong>10.</strong> What's the practical default recommendation for new GKE clusters? — Choose Autopilot by default unless you have a specific need for host-level access or unusual workloads.<br>
+<strong>11.</strong> Can Autopilot run DaemonSets that need host access? — No — Autopilot's curated, policy-enforced environment disallows privileged Pods and host-access DaemonSets.<br>
+<strong>12.</strong> What command fetches a GKE cluster's credentials into local kubeconfig? — <code>gcloud container clusters get-credentials &lt;cluster&gt; --region &lt;region&gt;</code>.<br>
+<strong>13.</strong> How do you check which node pool a given node belongs to? — <code>kubectl get nodes -L cloud.google.com/gke-nodepool</code>.<br>
+<strong>14.</strong> What flag enables Workload Identity at cluster creation? — <code>--workload-pool=my-project.svc.id.goog</code>.<br>
+<strong>15.</strong> How do you verify a Pod's effective GCP identity under Workload Identity? — Query the node metadata server from inside the Pod, e.g. via the service-accounts/default/email metadata path.<br>
+<strong>16.</strong> Why taint a GPU node pool rather than relying on node selectors alone? — Taints actively repel non-GPU workloads by default, whereas a node selector alone doesn't stop other Pods from being scheduled there if unconstrained.<br>
+<strong>17.</strong> What's the purpose of Spot VMs in a node pool? — Deeply discounted, preemptible capacity suited to fault-tolerant batch work, mixed alongside on-demand pools for latency-sensitive services.<br>
+<strong>18.</strong> Why shouldn't Spot VM node pools host latency-sensitive production services alone? — They can be preempted by the cloud provider at any time, which fault-tolerant batch jobs can absorb but latency-sensitive services generally cannot.<br>
+<strong>19.</strong> What does the built-in admission policy in Autopilot actually enforce? — A curated set of allowed Pod configurations (no privileged mode, no arbitrary hostPath, etc.) applied automatically without you writing your own policies.<br>
+<strong>20.</strong> How is HPA/VPA related to Cluster Autoscaler in a GKE Standard cluster? — HPA/VPA handle Pod replica count and per-Pod resource sizing; Cluster Autoscaler handles node count — all three cooperate but are configured independently.<br>
+<strong>21.</strong> What's the GKE equivalent concept to EKS's IRSA? — Workload Identity, implemented via GCP's workload identity federation instead of AWS's OIDC/STS federation.<br>
+<strong>22.</strong> Why is granting the GCP-side IAM binding done via `gcloud`, not YAML? — The IAM policy binding lives on the GCP side (IAM service), not as a Kubernetes object — YAML only configures the Kubernetes-side ServiceAccount annotation.<br>
+<strong>23.</strong> What's a symptom of forgetting the GCP-side Workload Identity binding? — The Pod's calls to GCP APIs fail with permission/authentication errors despite the KSA annotation looking correct.<br>
+<strong>24.</strong> Why does Google recommend Stable channel specifically for production, not Regular? — Regular still adopts new versions faster than Stable; Stable maximizes the time other GKE users' clusters have already exercised that version first.<br>
+<strong>25.</strong> What happens if you ignore release-channel upgrade notifications for too long? — GKE eventually forces an automatic upgrade regardless, which is riskier to encounter unplanned than a scheduled, tested upgrade.<br>
+<strong>26.</strong> How would you add a GPU-backed node pool to an existing Standard cluster? — <code>gcloud container node-pools create gpu-pool --accelerator type=...,count=... --node-taints=...</code>.<br>
+<strong>27.</strong> Why does a regional cluster typically cost more than a zonal one? — It runs control-plane replicas (and often node replicas) across multiple zones instead of one, trading cost for HA.<br>
+<strong>28.</strong> What's the risk of using Autopilot without understanding its Pod restrictions upfront? — Migrating an existing workload can require nontrivial rework to remove privileged/hostPath dependencies it silently relied on.<br>
+<strong>29.</strong> Why is Workload Identity described as "fully auditable and revocable via IAM alone"? — Because access can be reviewed or revoked entirely through IAM policy changes, without touching cluster-side Secrets or credentials.<br>
+<strong>30.</strong> What's the purpose of `gcloud container get-server-config`? — Shows available GKE versions and release channel status for a given region, useful for upgrade planning.<br>
+<strong>31.</strong> Why might a team deliberately keep a mixed fleet of Standard and Autopilot clusters? — Autopilot for most general workloads to reduce toil, Standard reserved specifically for workloads needing host-level access or unusual configurations.<br>
+<strong>32.</strong> What's a common mistake when sizing node pool autoscaling bounds? — Setting `max-nodes` too low, causing Pods to stay Pending under real load spikes despite autoscaling being technically enabled.<br>
+<strong>33.</strong> How do node pool taints and Pod tolerations work together for workload isolation? — The taint repels all Pods by default; only Pods with a matching toleration are allowed to schedule onto that tainted pool.<br>
+<strong>34.</strong> Why does Autopilot remove "node OS patching" as an operational burden specifically? — Because Google manages the underlying node lifecycle entirely; you never see or patch the OS layer yourself.<br>
+<strong>35.</strong> What's the tradeoff of Autopilot's flexibility restrictions in exchange for reduced toil? — You lose fine-grained control (privileged Pods, hostPath, custom node configuration) in exchange for GKE managing node-level operations for you.<br>
+<strong>36.</strong> Why is trigger-based node pool upgrade (`gcloud container clusters upgrade ... --node-pool`) still your responsibility on GKE Standard? — Node pools are customer-managed capacity even on managed control planes — GKE automates the control plane, not necessarily every node pool's upgrade timing by default.<br>
+<strong>37.</strong> What's a good way to confirm Workload Identity is actually enabled on an existing cluster? — <code>gcloud container clusters describe ... --format="value(workloadIdentityConfig)"</code>.<br>
+<strong>38.</strong> Why would a team choose multiple smaller node pools over one large pool even without GPU/accelerator needs? — To isolate workload shapes (memory-heavy vs CPU-heavy) for better bin-packing efficiency and blast-radius isolation.<br>
+<strong>39.</strong> What's the significance of GKE originating Kubernetes' architecture via Borg? — It explains why GKE's managed control-plane model tends to be the most mature/battle-tested among the big three cloud providers.<br>
+<strong>40.</strong> Why does Autopilot particularly suit teams without a dedicated platform/SRE function? — It removes node-level operational work (patching, sizing, bin-packing) that would otherwise require ongoing platform engineering investment.<br>
+<strong>41.</strong> What's a realistic reason to still choose GKE Standard despite Autopilot's benefits? — A workload genuinely requiring privileged access, custom node configuration, or DaemonSets with host-level access.<br>
+<strong>42.</strong> How does GKE's approach to Workload Identity differ mechanically from EKS's IRSA, despite solving the same problem? — GKE uses its own metadata-server-based federation tied to GCP IAM; EKS uses cluster OIDC federation with AWS STS `AssumeRoleWithWebIdentity` — same goal, different implementation.<br>
+<strong>43.</strong> Why is per-Pod billing in Autopilot considered more cost-transparent than per-VM billing? — Costs map directly and proportionally to what each workload actually requests, rather than to fixed VM sizes that may sit partially idle.<br>
+<strong>44.</strong> What's the risk of ignoring node pool taint/toleration mismatches during a migration? — Workloads meant for a specific pool (e.g. GPU) could either fail to schedule anywhere, or schedule onto the wrong pool if tolerations are too permissive.<br>
+<strong>45.</strong> Why does a regional cluster's node pool spread matter, not just the control plane's? — Free control-plane HA doesn't help if all your actual worker nodes still sit in a single zone — both need to be considered together.<br>
+<strong>46.</strong> What's a reasonable interview answer for "when would you NOT use Autopilot"? — Workloads needing privileged Pods, hostPath volumes, custom node-level tooling, or DaemonSets requiring host access.<br>
+<strong>47.</strong> Why is checking `workloadIdentityConfig` part of a security audit on an existing GKE cluster? — Confirms whether the safer credential mechanism is actually enabled, versus workloads potentially relying on legacy node-level service account credentials.<br>
+<strong>48.</strong> What operational category does GKE's release channel selection primarily manage? — Risk tolerance for control-plane and node version currency versus stability, not cost.<br>
+<strong>49.</strong> Why does Google explicitly recommend against one giant node pool for all workload types? — It causes noisy-neighbor effects and prevents workload-shape-specific bin-packing/cost optimization that separate pools enable.<br>
+<strong>50.</strong> What's the single biggest operational decision point this topic emphasizes for new GKE clusters? — Standard vs Autopilot — it shapes almost every other operational tradeoff (patching, cost model, flexibility) that follows.
+</div></details>
+
+<footer class="course-footer">Continue to Topic 67: EKS.</footer>
+
+<script>
+  mermaid.initialize({ startOnLoad: true, theme: 'dark' });
+</script>
+
+</body>
+</html>

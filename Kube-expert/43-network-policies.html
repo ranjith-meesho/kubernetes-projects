@@ -1,0 +1,289 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Topic 43: Network Policies — Kubernetes Expert Course</title>
+<link rel="stylesheet" href="styles.css">
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+</head>
+<body>
+
+<header class="course-header">
+  <div class="kicker">Topic 43 of 70</div>
+  <h1>Network Policies</h1>
+  <div class="subtitle">Layer-3/4 firewall rules for Pods — meaningless without a CNI plugin that actually enforces them.</div>
+</header>
+
+<nav class="topic-nav">
+  <a href="42-service-accounts.html">&larr; Service Accounts</a>
+  <a href="index.html">Course Index</a>
+  <a href="44-pod-security.html">Pod Security &rarr;</a>
+</nav>
+
+<h2 id="explanation">Explanation</h2>
+
+<p>By default, Kubernetes networking is a flat, fully-open mesh: any Pod in any namespace can send traffic to any
+other Pod's IP on any port. That's great for getting started, terrible for production security — a single
+compromised Pod could otherwise reach your database, your internal admin API, or any other service in the cluster.
+A <strong>NetworkPolicy</strong> is the API object that lets you declare, per-Pod (via label selectors), which
+ingress and egress traffic is allowed; anything not explicitly allowed by a matching policy is denied.</p>
+
+<p>Kubernetes needs this because network segmentation is a basic tenet of defense-in-depth, and because multi-tenant
+clusters (many teams/namespaces sharing one cluster) need hard boundaries between tenants that RBAC alone cannot
+provide — RBAC controls who can call the Kubernetes API, NetworkPolicy controls what Pods can talk to over the
+network, which is an entirely separate attack surface.</p>
+
+<p>Critically, <strong>NetworkPolicy is just an API object — the API Server happily accepts and stores it even if
+nothing enforces it.</strong> Enforcement is delegated entirely to the CNI (Container Network Interface) plugin
+running on each node. Plugins like Calico, Cilium, and Weave Net implement NetworkPolicy by programming
+iptables/nftables/eBPF rules on the node; plugins like the basic AWS VPC CNI (without Calico installed alongside it)
+or flannel in its default mode do <strong>not</strong> enforce NetworkPolicy at all — the object exists in etcd,
+<code>kubectl get networkpolicy</code> shows it, but zero traffic is actually blocked. This is one of the most common
+false-security assumptions in real clusters.</p>
+
+<p>The standard production pattern is <strong>default-deny</strong>: apply a policy per namespace that selects all
+Pods and denies all ingress (and often egress) by default, then layer narrow allow-rules on top for exactly the
+traffic paths that should exist (e.g. "frontend can call backend on port 8080", "backend can call the managed
+database's IP range on 5432", "everything can reach CoreDNS on 53"). This inverts the default-allow posture into an
+explicit allowlist, which is far more auditable and far harder to accidentally leave open.</p>
+
+<p>NetworkPolicies compose additively within a Pod's selector match: if any policy selects a Pod for ingress, that
+Pod's ingress becomes "allow only what matching policies permit" — but multiple policies are OR'd together, not
+AND'd, so a broad accidental allow rule can undermine an otherwise tight default-deny.</p>
+
+<h2 id="internal-working">Internal Working / Interactions</h2>
+<ul>
+  <li><strong>API Server / etcd:</strong> store the NetworkPolicy object like any other resource — no special validation of "will this actually be enforced."</li>
+  <li><strong>CNI plugin agent (per node):</strong> e.g. Calico's <code>calico-node</code> or Cilium's <code>cilium-agent</code> watches NetworkPolicy objects and Pod/Namespace labels, then programs local packet-filtering rules (iptables, nftables, or eBPF depending on plugin).</li>
+  <li><strong>kube-proxy:</strong> unrelated to NetworkPolicy enforcement — it only handles Service load-balancing (iptables/IPVS rules for ClusterIP/NodePort), not policy filtering.</li>
+  <li><strong>DNS (CoreDNS):</strong> a very common default-deny gotcha — if egress is denied and you forget to allow port 53 to <code>kube-system</code>, every Pod's DNS resolution silently breaks.</li>
+</ul>
+
+<h2 id="architecture-diagram">Architecture Diagram</h2>
+<pre class="mermaid">
+flowchart LR
+    subgraph NSfrontend["Namespace: frontend"]
+        FE["Pod: frontend"]
+    end
+    subgraph NSbackend["Namespace: backend"]
+        BE["Pod: backend"]
+        DB["Pod: postgres"]
+    end
+    CNI["CNI Agent (Calico/Cilium)\nreads NetworkPolicy objects,\nprograms node firewall rules"]
+    API["API Server / etcd\n(stores NetworkPolicy objects)"]
+
+    API -->|watch| CNI
+    FE -->|"allowed: :8080"| BE
+    BE -->|"allowed: :5432"| DB
+    FE -.->|"blocked by default-deny"| DB
+    CNI -. enforces .- FE
+    CNI -. enforces .- BE
+    CNI -. enforces .- DB
+</pre>
+
+<h2 id="code-example">Code Example</h2>
+<pre><code># 1. Default-deny ALL ingress and egress for every Pod in the namespace (baseline)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: backend
+spec:
+  podSelector: {}          # Empty selector = applies to every Pod in this namespace.
+  policyTypes:
+    - Ingress
+    - Egress
+  # No ingress/egress rules listed = nothing is allowed once this policy selects the Pod.
+---
+# 2. Explicitly allow frontend -> backend on 8080, and backend -> postgres on 5432
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-frontend-to-backend
+  namespace: backend
+spec:
+  podSelector:
+    matchLabels:
+      app: backend
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: frontend   # Only from the frontend namespace...
+          podSelector:
+            matchLabels:
+              app: frontend                            # ...and only Pods labeled app=frontend.
+      ports:
+        - protocol: TCP
+          port: 8080
+---
+# 3. Allow egress to CoreDNS (must-have whenever default-deny egress is used)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns-egress
+  namespace: backend
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+</code></pre>
+
+<h2 id="kubectl-commands">kubectl Commands</h2>
+<pre><code>kubectl get networkpolicy -A                          # List all NetworkPolicies cluster-wide
+kubectl describe networkpolicy default-deny-all -n backend  # Inspect selectors and rules
+kubectl get pods -n backend --show-labels             # Verify labels match policy selectors
+kubectl get pods -n kube-system -l k8s-app=calico-node  # Confirm the CNI enforcement agent is running
+kubectl exec -it frontend-pod -- curl -m 2 postgres.backend:5432   # Live test whether a path is actually blocked
+kubectl logs -n kube-system -l k8s-app=cilium --tail=50 | grep -i denied   # Check CNI-level deny logs (Cilium example)
+</code></pre>
+
+<h2 id="best-practices">Best Practices &amp; Common Pitfalls</h2>
+<div class="grid-2">
+<div>
+<h4>Best Practices</h4>
+<ul>
+  <li>Verify your CNI plugin actually enforces NetworkPolicy before relying on it — test with a real blocked connection, don't just check the object exists.</li>
+  <li>Start every namespace with a default-deny-all baseline, then add narrow allow rules per traffic path.</li>
+  <li>Always pair default-deny egress with an explicit DNS-egress allow rule.</li>
+  <li>Use both <code>namespaceSelector</code> and <code>podSelector</code> together for precise cross-namespace rules.</li>
+</ul>
+</div>
+<div>
+<h4>Pitfalls</h4>
+<ul>
+  <li>Assuming NetworkPolicy is enforced on every managed Kubernetes offering by default — many need Calico or Cilium explicitly enabled.</li>
+  <li>Forgetting policies are additive (OR'd) — one overly broad allow rule can defeat an otherwise tight default-deny.</li>
+  <li>Blocking egress without allowing DNS, causing silent, hard-to-diagnose resolution failures.</li>
+  <li>Writing policies against Pod labels that don't actually match the running Pods (label drift after a redeploy).</li>
+</ul>
+</div>
+</div>
+
+<h2 id="interview-questions">50 Interview Questions</h2>
+
+<details class="qa"><summary>1. What is the default networking posture in Kubernetes before any NetworkPolicy exists?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Fully open — any Pod can reach any other Pod's IP on any port, cluster-wide.
+<br><strong>Detail:</strong> There's no implicit segmentation between namespaces or workloads; it's a flat mesh by design, optimized for ease of getting started rather than security.
+<br><strong>Production example:</strong> A brand-new cluster where a compromised low-trust Pod can directly reach a database Pod in another namespace with zero policy in place.
+<br><strong>Common mistake:</strong> Assuming namespaces provide network isolation by themselves — they don't, RBAC/namespaces are API-level boundaries, not network ones.</div></details>
+
+<details class="qa"><summary>2. Who actually enforces a NetworkPolicy object once it's created?</summary>
+<div class="qa-body"><strong>Short answer:</strong> The CNI plugin running on each node, not the API Server.
+<br><strong>Detail:</strong> The API Server just stores the object like any other resource; enforcement is entirely delegated to whichever CNI (Calico, Cilium, Weave) is installed and watching these objects.
+<br><strong>Production example:</strong> A cluster on plain AWS VPC CNI without Calico shows NetworkPolicy objects via kubectl but blocks zero traffic.
+<br><strong>Common mistake:</strong> Believing that applying a NetworkPolicy YAML alone guarantees enforcement without checking the CNI's capabilities.</div></details>
+
+<details class="qa"><summary>3. What is the "default-deny" pattern and why is it the standard production baseline?</summary>
+<div class="qa-body"><strong>Short answer:</strong> A policy with an empty podSelector and no rules, denying all ingress/egress by default so only explicitly allowed traffic passes.
+<br><strong>Detail:</strong> It inverts the cluster's native default-allow posture into an auditable allowlist model — anything not explicitly permitted is blocked.
+<br><strong>Production example:</strong> Every namespace in a mature cluster starts with a default-deny-all policy before any service-specific allow rules are layered on.
+<br><strong>Common mistake:</strong> Only writing allow rules without a default-deny baseline, leaving all non-matched traffic still open.</div></details>
+
+<details class="qa"><summary>4. Why do NetworkPolicies combine additively (OR) instead of intersecting (AND)?</summary>
+<div class="qa-body"><strong>Short answer:</strong> If any policy selecting a Pod allows a given traffic path, that traffic is allowed — multiple matching policies are unioned, not intersected.
+<br><strong>Detail:</strong> This means one overly broad allow rule anywhere in the namespace can silently undermine an otherwise tight default-deny baseline for the same Pods.
+<br><strong>Production example:</strong> A debug policy left behind that allows "from: {}" on port 8080 defeats the namespace's default-deny for that port.
+<br><strong>Common mistake:</strong> Assuming policies are ANDed together like firewall rule chains evaluated in order — they're not; there's no ordering or negation.</div></details>
+
+<details class="qa"><summary>5. What's the classic "silent breakage" pitfall when applying default-deny egress?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Forgetting to explicitly allow egress to CoreDNS on port 53, breaking all DNS resolution in the namespace.
+<br><strong>Detail:</strong> Every application resolving a hostname (even to reach an allowed destination) needs DNS first; if DNS traffic itself is blocked, all name-based connections fail with confusing timeout errors.
+<br><strong>Production example:</strong> A backend Pod that can technically reach Postgres by IP but can't resolve "postgres.backend.svc" because DNS egress wasn't allowlisted.
+<br><strong>Common mistake:</strong> Writing a default-deny-egress policy without a companion allow-DNS-to-kube-system rule in the same rollout.</div></details>
+
+<details class="qa"><summary>6. What's the difference between using podSelector and namespaceSelector in an ingress rule?</summary>
+<div class="qa-body"><strong>Short answer:</strong> podSelector matches Pods by label within scope; namespaceSelector matches which namespaces are in scope; combined in one `from` entry, both must match (AND) the same source.
+<br><strong>Detail:</strong> Used alone, namespaceSelector allows any Pod in a matching namespace; used alone, podSelector (without namespaceSelector) matches only within the policy's own namespace.
+<br><strong>Production example:</strong> Allowing only Pods labeled app=frontend, and only when they're in the namespace labeled kubernetes.io/metadata.name=frontend — combining both tightens the rule precisely.
+<br><strong>Common mistake:</strong> Using only podSelector expecting it to also match across namespaces — it doesn't unless namespaceSelector is included.</div></details>
+
+<details class="qa"><summary>7. Why is kube-proxy irrelevant to NetworkPolicy enforcement?</summary>
+<div class="qa-body"><strong>Short answer:</strong> kube-proxy only implements Service load-balancing (ClusterIP/NodePort routing); NetworkPolicy filtering is a separate concern owned by the CNI plugin.
+<br><strong>Detail:</strong> Confusing the two leads to debugging in the wrong place — kube-proxy's iptables/IPVS rules control which backend Pod a Service request lands on, not whether the connection itself is permitted.
+<br><strong>Production example:</strong> Debugging a blocked connection by checking kube-proxy logs instead of the CNI agent's (e.g. Calico or Cilium) enforcement logs.
+<br><strong>Common mistake:</strong> Assuming disabling/restarting kube-proxy affects NetworkPolicy behavior.</div></details>
+
+<details class="qa"><summary>8. How would you verify a NetworkPolicy is actually being enforced, not just stored?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Run a live connection test (e.g. curl) from a Pod that should be blocked and confirm it actually times out or is refused.
+<br><strong>Detail:</strong> Checking `kubectl get networkpolicy` only proves the object exists in etcd, not that any node is enforcing it — you must test real traffic.
+<br><strong>Production example:</strong> <code>kubectl exec frontend-pod -- curl -m 2 postgres.backend:5432</code> after applying a deny policy, expecting a timeout.
+<br><strong>Common mistake:</strong> Treating "kubectl apply succeeded" as proof of working network segmentation.</div></details>
+
+<details class="qa"><summary>9. Why does multi-tenancy in Kubernetes require both RBAC and NetworkPolicy?</summary>
+<div class="qa-body"><strong>Short answer:</strong> RBAC controls who can call the Kubernetes API; NetworkPolicy controls what Pods can talk to over the network — entirely separate attack surfaces.
+<br><strong>Detail:</strong> A tenant could have zero API permissions yet still have a Pod capable of reaching another tenant's database directly over the network if NetworkPolicy isn't also enforced.
+<br><strong>Production example:</strong> Shared clusters isolating tenants both via namespaced RBAC bindings and per-namespace default-deny NetworkPolicies.
+<br><strong>Common mistake:</strong> Relying on RBAC alone as "isolation" and assuming it covers network-level access too.</div></details>
+
+<details class="qa"><summary>10. What does an empty podSelector ({}) mean in a NetworkPolicy spec?</summary>
+<div class="qa-body"><strong>Short answer:</strong> It selects every Pod in the policy's namespace, applying the rules to all of them.
+<br><strong>Detail:</strong> Combined with no ingress/egress rules listed and the corresponding policyTypes set, this is exactly how a default-deny-all baseline policy is expressed.
+<br><strong>Production example:</strong> A single default-deny-all.yaml per namespace using podSelector: {} with policyTypes [Ingress, Egress] and no rules.
+<br><strong>Common mistake:</strong> Confusing an empty podSelector (matches all Pods) with an empty `from`/`to` list (matches nothing, i.e. deny).</div></details>
+
+<details class="qa"><summary>11–50. Additional rapid-fire questions</summary>
+<div class="qa-body">
+<strong>11.</strong> Which CNIs are known to enforce NetworkPolicy out of the box? — Calico, Cilium, Weave Net (plain AWS VPC CNI and default flannel typically do not).<br>
+<strong>12.</strong> What protocol/port do most default-deny-egress rollouts forget to allow? — UDP/TCP 53 to kube-system for CoreDNS.<br>
+<strong>13.</strong> Is NetworkPolicy namespaced or cluster-scoped? — Namespaced.<br>
+<strong>14.</strong> Can a NetworkPolicy select Pods across namespaces for ingress/egress? — Yes, using namespaceSelector combined with podSelector in `from`/`to`.<br>
+<strong>15.</strong> What API group does NetworkPolicy belong to? — <code>networking.k8s.io/v1</code>.<br>
+<strong>16.</strong> Does NetworkPolicy operate at L3/L4 or L7? — L3/L4 (IP/port); L7 (HTTP paths, methods) needs a service mesh or CNI extension like Cilium's L7 policies.<br>
+<strong>17.</strong> What happens if no NetworkPolicy selects a given Pod? — That Pod's traffic remains fully open (default-allow), unaffected by any policy.<br>
+<strong>18.</strong> How do you list all NetworkPolicies cluster-wide? — <code>kubectl get networkpolicy -A</code>.<br>
+<strong>19.</strong> What command checks whether the CNI enforcement agent is running? — <code>kubectl get pods -n kube-system -l k8s-app=calico-node</code> (or equivalent for Cilium).<br>
+<strong>20.</strong> Does a policyTypes list need both Ingress and Egress even if you only define ingress rules? — No — only list the types you intend to constrain; omitting Egress leaves egress unaffected by that policy.<br>
+<strong>21.</strong> What's the effect of a NetworkPolicy with policyTypes: [Ingress] and no ingress rules? — Denies all ingress to selected Pods (default-deny ingress only), egress untouched.<br>
+<strong>22.</strong> Can NetworkPolicy restrict traffic to external IPs outside the cluster? — Yes, using <code>ipBlock</code> in egress/ingress rules with CIDR ranges.<br>
+<strong>23.</strong> Why might label drift after a redeploy silently break a NetworkPolicy? — If Pod labels change and no longer match the policy's selector, the policy stops applying to those Pods entirely.<br>
+<strong>24.</strong> What's a good way to catch NetworkPolicy misconfigurations before production? — Combine `kubectl describe networkpolicy` selector review with a live connectivity test in staging.<br>
+<strong>25.</strong> Are NetworkPolicies evaluated in a specific priority order? — No — there's no explicit ordering or priority; all matching policies are combined additively.<br>
+<strong>26.</strong> Can you negate a rule (explicitly deny one Pod while allowing others)? — Not natively in the standard API — Calico/Cilium extensions add deny-rule support beyond the vanilla NetworkPolicy spec.<br>
+<strong>27.</strong> What's the risk of using podSelector alone (without namespaceSelector) intending cross-namespace access? — It silently restricts the match to the policy's own namespace, blocking the intended cross-namespace traffic.<br>
+<strong>28.</strong> How does Cilium's eBPF-based enforcement differ mechanically from Calico's iptables mode? — eBPF hooks packet processing directly in the kernel for lower overhead vs. Calico's traditional iptables/nftables chain rules (Calico also supports eBPF mode).<br>
+<strong>29.</strong> What's the operational cost of very granular per-service NetworkPolicies? — More objects to maintain and audit, though each is individually simpler and more precise.<br>
+<strong>30.</strong> Can NetworkPolicy be combined with a service mesh's mTLS policies? — Yes — NetworkPolicy provides L3/L4 segmentation while a mesh (e.g. Istio) adds L7 and identity-based mTLS authorization on top.<br>
+<strong>31.</strong> How would you debug "policy exists but traffic still flows"? — Check CNI enforcement support first, then verify selectors actually match current Pod/namespace labels.<br>
+<strong>32.</strong> What does `kubectl logs -l k8s-app=cilium | grep denied` help verify? — Whether the CNI agent is actually generating deny decisions for expected blocked traffic.<br>
+<strong>33.</strong> Why is testing in a lab cluster before rolling default-deny to prod recommended? — Default-deny can break unexpected traffic paths (side-channel calls, health checks) that weren't obvious from the app's documented dependencies.<br>
+<strong>34.</strong> Does NetworkPolicy affect traffic between containers within the same Pod? — No — containers in the same Pod share a network namespace and communicate over localhost, unaffected by NetworkPolicy.<br>
+<strong>35.</strong> Can a NetworkPolicy restrict traffic to a specific named port instead of a numeric port? — Yes, `ports` can reference a container's named port.<br>
+<strong>36.</strong> What's the interaction between NetworkPolicy and hostNetwork Pods? — Pods using hostNetwork bypass normal Pod networking, and NetworkPolicy enforcement for them is inconsistent/CNI-dependent — best avoided for policy-sensitive workloads.<br>
+<strong>37.</strong> Is there a way to apply one NetworkPolicy across the whole cluster instead of per-namespace? — Not with the vanilla API — some CNIs (e.g. Calico GlobalNetworkPolicy) provide cluster-scoped equivalents as an extension.<br>
+<strong>38.</strong> What's a good rollout strategy for introducing default-deny into an existing busy namespace? — Start in permissive/log-only mode if the CNI supports it, review actual traffic patterns, then flip to enforcing default-deny.<br>
+<strong>39.</strong> Why do allow rules typically specify both podSelector and a port? — Restricting by port alone is too broad since any Pod could hit that port; restricting by label alone allows all ports from that source.<br>
+<strong>40.</strong> Does deleting a NetworkPolicy immediately open up previously blocked traffic? — Yes, once removed, the CNI stops enforcing those rules and default-allow (or whatever remaining policies dictate) applies.<br>
+<strong>41.</strong> What's the relationship between NetworkPolicy and Ingress/Egress cloud firewalls (e.g. security groups)? — They're complementary layers — NetworkPolicy governs Pod-to-Pod traffic inside the cluster, cloud firewalls govern traffic at the node/VPC boundary.<br>
+<strong>42.</strong> Can NetworkPolicy be used to isolate a database Pod from all but one specific backend? — Yes — a policy on the database Pod's podSelector allowing ingress only from the backend's podSelector+namespaceSelector on the DB port.<br>
+<strong>43.</strong> What happens if two policies both select the same Pod for ingress with conflicting explicit ports? — Both sets of allowed ports become permitted — a union, not a conflict resolution.<br>
+<strong>44.</strong> Why is "default-deny + explicit allow" more auditable than "default-allow + explicit deny"? — Every permitted path must be documented as an explicit rule, making the full set of allowed traffic paths visible from the policy objects themselves.<br>
+<strong>45.</strong> Does NetworkPolicy apply to traffic to/from the Kubernetes API Server itself? — Yes if egress rules restrict it — Pods needing API access must have an explicit egress allow to the API Server's IP/port.<br>
+<strong>46.</strong> What's a practical first NetworkPolicy to write when migrating a legacy flat-network app? — A namespace-wide default-deny with a broad temporary allow-all-within-namespace rule, then progressively narrowing it.<br>
+<strong>47.</strong> How do egress rules to external SaaS APIs typically get expressed? — Via `ipBlock` CIDR ranges in the egress rule, since NetworkPolicy doesn't support DNS-name-based rules natively (though some CNIs add FQDN policy extensions).<br>
+<strong>48.</strong> Is there a built-in way to see which specific policy blocked a connection? — Not from vanilla kubectl — you typically need CNI-specific flow logs (e.g. Cilium's Hubble, Calico's flow logs).<br>
+<strong>49.</strong> Why might a health-check probe start failing right after applying default-deny ingress? — kubelet's liveness/readiness probes originate from the node and need an explicit allow rule if the probe traffic isn't otherwise covered.<br>
+<strong>50.</strong> What's the first thing to check when "everything is unreachable" right after rolling out NetworkPolicies? — Whether a default-deny was applied without the necessary allow rules (including DNS) alongside it.
+</div></details>
+
+<footer class="course-footer">Next: Topic 44 — Pod Security, restricting what a Pod is allowed to do on its node.</footer>
+
+<script>
+  mermaid.initialize({ startOnLoad: true, theme: 'dark' });
+</script>
+
+</body>
+</html>

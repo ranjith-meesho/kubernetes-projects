@@ -1,0 +1,1188 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Observability Sprint — 5 Days, 20 Hours</title>
+<style>
+:root{
+  --bg:#0f1216; --bg-panel:#161b22; --bg-raised:#1c2230;
+  --text:#e6edf3; --text-dim:#8b98a5; --text-faint:#5c6672;
+  --border:#262d38;
+  --amber:#f0a24a; --amber-soft:#f0a24a22;
+  --teal:#4fd8c4; --teal-soft:#4fd8c422;
+  --violet:#a78bfa; --violet-soft:#a78bfa22;
+  --good:#6fce8f; --bad:#e8697d;
+  --code-bg:#1c2230;
+  --shadow: 0 8px 24px rgba(0,0,0,.35);
+}
+:root[data-theme="light"]{
+  --bg:#f5f4f1; --bg-panel:#ffffff; --bg-raised:#fbfaf8;
+  --text:#1b1f24; --text-dim:#5b6472; --text-faint:#8a92a0;
+  --border:#e2e0da;
+  --amber:#c8511f; --amber-soft:#c8511f18;
+  --teal:#0f8a76; --teal-soft:#0f8a7618;
+  --violet:#6d4fd1; --violet-soft:#6d4fd118;
+  --good:#1f8a4c; --bad:#c23b52;
+  --code-bg:#eef0f3;
+  --shadow: 0 4px 16px rgba(20,20,10,.08);
+}
+@media (prefers-color-scheme: light){
+  :root:not([data-theme="dark"]){
+    --bg:#f5f4f1; --bg-panel:#ffffff; --bg-raised:#fbfaf8;
+    --text:#1b1f24; --text-dim:#5b6472; --text-faint:#8a92a0;
+    --border:#e2e0da;
+    --amber:#c8511f; --amber-soft:#c8511f18;
+    --teal:#0f8a76; --teal-soft:#0f8a7618;
+    --violet:#6d4fd1; --violet-soft:#6d4fd118;
+    --good:#1f8a4c; --bad:#c23b52;
+    --code-bg:#eef0f3;
+    --shadow: 0 4px 16px rgba(20,20,10,.08);
+  }
+}
+*{box-sizing:border-box;}
+html,body{margin:0;padding:0;}
+body{
+  background:var(--bg); color:var(--text);
+  font-family: Georgia, 'Iowan Old Style', 'Palatino Linotype', serif;
+  line-height:1.62; font-size:17px;
+  -webkit-font-smoothing:antialiased;
+}
+.display{
+  font-family: -apple-system, 'Helvetica Neue', Arial, sans-serif;
+  font-stretch: condensed;
+  letter-spacing:-.01em;
+  font-weight:800;
+}
+.mono{ font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace; }
+.eyebrow{
+  font-family:-apple-system,'Helvetica Neue',Arial,sans-serif;
+  text-transform:uppercase; letter-spacing:.14em; font-size:.72rem;
+  font-weight:700; color:var(--text-faint);
+}
+a{ color:var(--amber); }
+h1,h2,h3,h4{ text-wrap:balance; }
+
+.shell{ display:flex; min-height:100vh; }
+
+/* ---------- Sidebar nav ---------- */
+nav.rail{
+  width:230px; flex:0 0 230px; position:sticky; top:0; align-self:flex-start;
+  height:100vh; overflow-y:auto; padding:28px 18px;
+  border-right:1px solid var(--border); background:var(--bg-panel);
+}
+nav.rail .brand{ font-family:-apple-system,sans-serif; font-weight:800; font-size:1.05rem; letter-spacing:-.01em; margin-bottom:2px; }
+nav.rail .brand-sub{ font-size:.72rem; color:var(--text-faint); margin-bottom:22px; letter-spacing:.04em; }
+nav.rail a.navlink{
+  display:block; padding:8px 10px; margin:2px 0; border-radius:6px;
+  font-family:-apple-system,sans-serif; font-size:.86rem; color:var(--text-dim);
+  text-decoration:none; border-left:2px solid transparent;
+}
+nav.rail a.navlink:hover{ background:var(--bg-raised); color:var(--text); }
+nav.rail .navgroup{ margin-bottom:14px; }
+nav.rail .navgroup-label{ font-size:.68rem; letter-spacing:.1em; text-transform:uppercase; color:var(--text-faint); margin:14px 0 4px 10px; font-family:-apple-system,sans-serif;}
+
+main{ flex:1; min-width:0; padding:48px clamp(20px,5vw,72px) 90px; max-width:920px; }
+
+/* ---------- Hero ---------- */
+.hero{ margin-bottom:56px; }
+.hero .eyebrow{ color:var(--amber); }
+.hero h1{ font-size:clamp(2rem,4.4vw,2.9rem); margin:8px 0 14px; line-height:1.08; }
+.hero p.lede{ font-size:1.12rem; color:var(--text-dim); max-width:62ch; margin:0 0 22px; }
+.hero .stat-row{ display:flex; gap:14px; flex-wrap:wrap; }
+.stat{ background:var(--bg-panel); border:1px solid var(--border); border-radius:10px; padding:12px 16px; min-width:120px; box-shadow:var(--shadow); }
+.stat .n{ font-family:-apple-system,sans-serif; font-weight:800; font-size:1.4rem; }
+.stat .l{ font-size:.72rem; color:var(--text-faint); text-transform:uppercase; letter-spacing:.08em; }
+
+/* ---------- 80/20 box ---------- */
+.rule8020{
+  background:linear-gradient(135deg, var(--amber-soft), transparent);
+  border:1px solid var(--border); border-left:3px solid var(--amber);
+  border-radius:8px; padding:18px 22px; margin:26px 0 0;
+}
+.rule8020 .eyebrow{ color:var(--amber); margin-bottom:6px; }
+
+/* ---------- Day section ---------- */
+section.day{ padding-top:64px; scroll-margin-top:20px; border-top:1px solid var(--border); margin-top:20px;}
+section.day:first-of-type{ border-top:none; }
+.day-tag{ display:flex; align-items:center; gap:12px; margin-bottom:6px; }
+.day-num{ font-family:-apple-system,sans-serif; font-weight:800; font-size:.78rem; color:var(--bg); background:var(--amber); padding:3px 10px; border-radius:20px; }
+.day h2{ font-size:1.9rem; margin:6px 0 6px; }
+.day .day-meta{ color:var(--text-faint); font-size:.85rem; font-family:-apple-system,sans-serif; margin-bottom:28px; }
+
+h3.subhead{
+  font-family:-apple-system,sans-serif; font-weight:800; font-size:1.02rem;
+  margin:38px 0 10px; padding-bottom:8px; border-bottom:1px solid var(--border);
+  display:flex; align-items:center; gap:8px;
+}
+h3.subhead .tag{ font-size:.62rem; text-transform:uppercase; letter-spacing:.08em; padding:2px 8px; border-radius:20px; font-weight:700; }
+.tag-concept{ background:var(--teal-soft); color:var(--teal); }
+.tag-visual{ background:var(--violet-soft); color:var(--violet); }
+.tag-practice{ background:var(--amber-soft); color:var(--amber); }
+.tag-interview{ background:var(--bg-raised); color:var(--text-dim); border:1px solid var(--border);}
+.tag-resource{ background:var(--teal-soft); color:var(--teal); }
+
+.concept p{ margin:0 0 14px; max-width:70ch; }
+.concept ul{ max-width:66ch; padding-left:1.2em; }
+.concept li{ margin-bottom:6px; }
+.concept strong{ color:var(--text); }
+
+/* ---------- Diagram ---------- */
+.diagram{
+  background:var(--bg-panel); border:1px solid var(--border); border-radius:10px;
+  padding:22px; margin:14px 0 20px; overflow-x:auto; box-shadow:var(--shadow);
+}
+.diagram .cap{ font-family:-apple-system,sans-serif; font-size:.78rem; color:var(--text-faint); margin-top:14px; }
+.dflow{ display:flex; align-items:center; gap:0; min-width:max-content; }
+.dbox{
+  font-family:-apple-system,sans-serif; font-size:.82rem; font-weight:700;
+  border:1px solid var(--border); border-radius:8px; padding:12px 16px; text-align:center;
+  background:var(--bg-raised); min-width:110px;
+}
+.dbox .sub{ display:block; font-weight:400; color:var(--text-faint); font-size:.72rem; margin-top:3px; }
+.dbox.amber{ border-color:var(--amber); color:var(--amber); }
+.dbox.teal{ border-color:var(--teal); color:var(--teal); }
+.dbox.violet{ border-color:var(--violet); color:var(--violet); }
+.darrow{ color:var(--text-faint); font-size:1.3rem; padding:0 10px; }
+.dcol{ display:flex; flex-direction:column; gap:8px; align-items:center; }
+.dstack{ display:flex; flex-direction:column; gap:14px; }
+
+/* ---------- Example / code ---------- */
+.example{
+  background:var(--code-bg); border:1px solid var(--border); border-radius:10px;
+  padding:18px 20px; margin:14px 0 20px; overflow-x:auto;
+}
+.example pre{ margin:0; white-space:pre; font-size:.86rem; line-height:1.55; }
+.example .scenario{ font-family:-apple-system,sans-serif; font-size:.85rem; color:var(--text-dim); margin:0 0 12px; padding-bottom:10px; border-bottom:1px dashed var(--border); }
+
+/* ---------- Interview accordion ---------- */
+.qa-groups{ display:flex; flex-direction:column; gap:10px; }
+details.qa-group{
+  background:var(--bg-panel); border:1px solid var(--border); border-radius:10px; overflow:hidden;
+}
+details.qa-group summary{
+  cursor:pointer; list-style:none; padding:14px 18px; font-family:-apple-system,sans-serif;
+  font-weight:700; font-size:.92rem; display:flex; justify-content:space-between; align-items:center;
+}
+details.qa-group summary::-webkit-details-marker{ display:none; }
+details.qa-group summary .count{ font-weight:400; color:var(--text-faint); font-size:.78rem; }
+details.qa-group summary::after{ content:'+'; font-size:1.2rem; color:var(--text-faint); margin-left:12px; }
+details.qa-group[open] summary::after{ content:'–'; }
+.qa-body{ padding:4px 18px 16px; border-top:1px solid var(--border); }
+.qa{ padding:14px 0; border-bottom:1px solid var(--border); }
+.qa:last-child{ border-bottom:none; }
+.qa .q{ font-family:-apple-system,sans-serif; font-weight:700; font-size:.92rem; margin:0 0 6px; }
+.qa .q .qnum{ color:var(--amber); margin-right:6px; }
+.qa .a{ margin:0; color:var(--text-dim); font-size:.94rem; max-width:68ch; }
+.qa .a code{ background:var(--code-bg); padding:1px 6px; border-radius:4px; font-size:.85em; }
+
+/* ---------- Resources ---------- */
+.resources{ display:grid; grid-template-columns:repeat(auto-fill,minmax(250px,1fr)); gap:12px; }
+.res-card{ background:var(--bg-panel); border:1px solid var(--border); border-radius:10px; padding:14px 16px; }
+.res-card .k{ font-family:-apple-system,sans-serif; font-size:.68rem; text-transform:uppercase; letter-spacing:.08em; color:var(--teal); font-weight:700; }
+.res-card .t{ font-weight:700; margin:4px 0 4px; font-size:.94rem; }
+.res-card .d{ color:var(--text-dim); font-size:.86rem; margin:0; }
+
+/* ---------- Milestone footer per day ---------- */
+.milestone{
+  margin-top:30px; padding:16px 20px; border-radius:10px;
+  background:var(--teal-soft); border:1px solid var(--teal); border-left:3px solid var(--teal);
+}
+.milestone .eyebrow{ color:var(--teal); }
+.milestone p{ margin:6px 0 0; }
+
+/* ---------- Table ---------- */
+.tblwrap{ overflow-x:auto; margin:14px 0 20px; }
+table.cmp{ border-collapse:collapse; width:100%; min-width:520px; font-size:.88rem; font-family:-apple-system,sans-serif; }
+table.cmp th, table.cmp td{ border:1px solid var(--border); padding:9px 12px; text-align:left; }
+table.cmp th{ background:var(--bg-raised); font-size:.74rem; text-transform:uppercase; letter-spacing:.05em; color:var(--text-faint); }
+table.cmp td code{ background:var(--code-bg); padding:1px 5px; border-radius:4px; }
+
+footer.end{ margin-top:70px; padding-top:26px; border-top:1px solid var(--border); color:var(--text-faint); font-size:.85rem; font-family:-apple-system,sans-serif; }
+
+@media (max-width:820px){
+  nav.rail{ display:none; }
+  main{ padding:32px 18px 70px; }
+}
+</style>
+</head>
+<body>
+
+<div class="shell">
+<nav class="rail">
+  <div class="brand">Observability Sprint</div>
+  <div class="brand-sub">5 DAYS · 20 HOURS · 80/20</div>
+  <div class="navgroup">
+    <a class="navlink" href="#top">Overview</a>
+  </div>
+  <div class="navgroup">
+    <div class="navgroup-label">Day 1</div>
+    <a class="navlink" href="#day1">Foundations + Prometheus Core</a>
+  </div>
+  <div class="navgroup">
+    <div class="navgroup-label">Day 2</div>
+    <a class="navlink" href="#day2">Prometheus Alerting &amp; Scale</a>
+  </div>
+  <div class="navgroup">
+    <div class="navgroup-label">Day 3</div>
+    <a class="navlink" href="#day3">VictoriaMetrics Deep Dive</a>
+  </div>
+  <div class="navgroup">
+    <div class="navgroup-label">Day 4</div>
+    <a class="navlink" href="#day4">OpenTelemetry</a>
+  </div>
+  <div class="navgroup">
+    <div class="navgroup-label">Day 5</div>
+    <a class="navlink" href="#day5">Integration &amp; Capstone</a>
+  </div>
+</nav>
+
+<main id="top">
+
+  <div class="hero">
+    <div class="eyebrow">A five-day, twenty-hour training plan</div>
+    <h1 class="display">Observability, the 80/20 way.</h1>
+    <p class="lede">Prometheus, VictoriaMetrics, and OpenTelemetry — the way a working SRE actually needs to know them. Four hours a day, five days, no fluff: the 20% of concepts that explain 80% of what you'll be asked, paged for, or asked to design in an interview.</p>
+    <div class="stat-row">
+      <div class="stat"><div class="n">5</div><div class="l">Days</div></div>
+      <div class="stat"><div class="n">20h</div><div class="l">Total time</div></div>
+      <div class="stat"><div class="n">250</div><div class="l">Interview Q&amp;A</div></div>
+      <div class="stat"><div class="n">3</div><div class="l">Tools mastered</div></div>
+    </div>
+    <div class="rule8020">
+      <div class="eyebrow">How to use the 80/20 rule here</div>
+      <p style="margin:0;">Each day has one non-negotiable core (do this even if you're exhausted), and optional depth (skip if short on time). The core sections are <strong>Concepts</strong> and <strong>Practice</strong> — do those first. <strong>Interview Q&amp;A</strong> and extra <strong>Resources</strong> are for reinforcement; skim them on a second pass or on your commute.</p>
+    </div>
+  </div>
+
+  <!-- ============================================================ DAY 1 ============================================================ -->
+  <section class="day" id="day1">
+    <div class="day-tag"><span class="day-num">DAY 1 · 4H</span></div>
+    <h2 class="display">Foundations + Prometheus Core</h2>
+    <div class="day-meta">Goal: understand why observability matters, then get Prometheus scraping real metrics and answering real questions.</div>
+
+    <h3 class="subhead"><span class="tag tag-concept">Concepts</span> The three pillars, and why "monitoring" isn't enough</h3>
+    <div class="concept">
+      <p><strong>Monitoring</strong> answers questions you thought to ask in advance ("is CPU &gt; 90%?"). <strong>Observability</strong> answers questions you didn't think to ask until something broke ("why did checkout latency spike only for users in Mumbai on Android?"). You get there with three data types that each answer a different question:</p>
+      <ul>
+        <li><strong>Metrics</strong> — numbers over time (request rate, error count, memory). Cheap to store, great for trends and alerting, bad at explaining "why."</li>
+        <li><strong>Logs</strong> — discrete timestamped events with detail. Expensive at volume, great for root-cause once you know where to look.</li>
+        <li><strong>Traces</strong> — the path a single request takes across services, with timing per hop. Great for "which service in this chain is slow."</li>
+      </ul>
+      <p>The 80/20 insight: most interview and real-world work lives in <em>metrics</em> (Prometheus/VictoriaMetrics) and the <em>plumbing that produces all three</em> (OpenTelemetry). Master those two first — logs tooling (Loki, ELK) reuses the same mental model.</p>
+    </div>
+
+    <h3 class="subhead"><span class="tag tag-concept">Concepts</span> Prometheus's core idea: pull, not push</h3>
+    <div class="concept">
+      <p>Prometheus <strong>scrapes</strong> — it pulls metrics from your apps on a schedule (default 15s), rather than your apps pushing to it. Your app exposes a plain-text <code class="mono">/metrics</code> HTTP endpoint; Prometheus visits it, parses the numbers, and stores them in its own time-series database (TSDB) on local disk.</p>
+      <ul>
+        <li><strong>Metric</strong> — a named measurement, e.g. <code class="mono">http_requests_total</code>.</li>
+        <li><strong>Label</strong> — a key/value dimension on that metric, e.g. <code class="mono">{method="GET", status="500"}</code>. Every unique label combination is its own time series.</li>
+        <li><strong>Sample</strong> — one (timestamp, value) point for a given series.</li>
+        <li><strong>Four metric types</strong>: <code class="mono">Counter</code> (only goes up — requests served), <code class="mono">Gauge</code> (goes up/down — memory used), <code class="mono">Histogram</code> (bucketed observations — request duration), <code class="mono">Summary</code> (client-side quantiles, rarer in practice).</li>
+      </ul>
+      <p>Why pull wins operationally: Prometheus itself tells you a target is down (a failed scrape), you don't need apps to know where the monitoring system lives, and it's trivial to run ad-hoc against any host during debugging.</p>
+    </div>
+
+    <h3 class="subhead"><span class="tag tag-visual">Visual</span> The Prometheus pull loop</h3>
+    <div class="diagram">
+      <div class="dflow">
+        <div class="dcol">
+          <div class="dbox">Your App<span class="sub">/metrics endpoint</span></div>
+        </div>
+        <div class="darrow">◀──</div>
+        <div class="dbox amber">Prometheus Server<span class="sub">scrape · TSDB · PromQL</span></div>
+        <div class="darrow">──▶</div>
+        <div class="dcol">
+          <div class="dbox">Grafana<span class="sub">dashboards</span></div>
+        </div>
+      </div>
+      <div class="cap">Prometheus reaches out and pulls (arrow points from target to server) every scrape interval. Grafana then queries Prometheus for visualization. Node/blackbox/mysqld exporters sit alongside "Your App" as more scrape targets.</div>
+    </div>
+
+    <h3 class="subhead"><span class="tag tag-practice">Practice</span> Stand up Prometheus and query real data</h3>
+    <div class="example">
+      <p class="scenario">Scenario: you want CPU and memory metrics from your own laptop, visible in PromQL within 10 minutes.</p>
+      <pre class="mono"># 1. Run node_exporter (exposes host metrics on :9100)
+docker run -d --name node-exporter -p 9100:9100 prom/node-exporter
+
+# 2. prometheus.yml — tell Prometheus what to scrape
+global:
+  scrape_interval: 15s
+scrape_configs:
+  - job_name: 'node'
+    static_configs:
+      - targets: ['localhost:9100']
+
+# 3. Run Prometheus pointed at that config
+docker run -d --name prometheus -p 9090:9090 \
+  -v $(pwd)/prometheus.yml:/etc/prometheus/prometheus.yml \
+  prom/prometheus
+
+# 4. Open http://localhost:9090 and try these in the query box:
+up                                    # 1 = target healthy, 0 = down
+rate(node_cpu_seconds_total[5m])      # per-second CPU rate over 5 min
+node_memory_MemAvailable_bytes</pre>
+    </div>
+
+    <div class="milestone">
+      <div class="eyebrow">End-of-day milestone</div>
+      <p>You can explain pull-vs-push in one breath, you have Prometheus scraping a real exporter, and you've run <code class="mono">rate()</code> on a counter and gotten a sane number out.</p>
+    </div>
+
+    <h3 class="subhead"><span class="tag tag-interview">Interview Prep</span> 50 questions — Foundations &amp; Prometheus core</h3>
+    <div class="qa-groups">
+
+      <details class="qa-group">
+        <summary>Observability fundamentals <span class="count">10 questions</span></summary>
+        <div class="qa-body">
+          <div class="qa"><p class="q"><span class="qnum">1.</span>What's the difference between monitoring and observability?</p><p class="a">Monitoring checks known failure modes against predefined thresholds. Observability is a property of a system that lets you ask arbitrary new questions about its internal state from the outside, using the telemetry it emits — useful for the failures you didn't anticipate.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">2.</span>Name the three pillars of observability and what each is best at.</p><p class="a">Metrics (trends, alerting, cheap), logs (detailed events, root cause), traces (cross-service request flow, latency attribution).</p></div>
+          <div class="qa"><p class="q"><span class="qnum">3.</span>Why can't logs alone give you good alerting?</p><p class="a">Logs are unstructured/high-cardinality text; computing "is the error rate above 1%" requires parsing and aggregating huge volumes in real time, which is slow and expensive compared to a pre-aggregated numeric time series.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">4.</span>What is cardinality, and why do engineers worry about it?</p><p class="a">Cardinality is the number of unique time series a metric produces (product of its label value combinations). High cardinality (e.g. a label with user IDs) explodes memory/storage and can crash a metrics backend.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">5.</span>What is MTTR and how does observability improve it?</p><p class="a">Mean Time To Resolution/Recovery. Good observability shortens the "detect → localize → diagnose" phases by letting engineers pivot from a metric spike to the specific trace or log line causing it.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">6.</span>What is an SLI, SLO, and SLA?</p><p class="a">SLI = a measured indicator (e.g. request latency). SLO = an internal target for that SLI (99% of requests &lt; 300ms). SLA = an external, often contractual, commitment with consequences for breach.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">7.</span>What's an error budget?</p><p class="a">The allowed amount of unreliability (1 − SLO) over a period. If your SLO is 99.9% over 30 days, your error budget is ~43 minutes of downtime; teams spend it on releases/risk and stop shipping fast changes when it's exhausted.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">8.</span>Push vs pull metrics collection — tradeoffs?</p><p class="a">Pull (Prometheus): server controls cadence, easy target-down detection, needs service discovery/network reachability to targets. Push (StatsD/OTLP): works well for short-lived jobs and firewalled/serverless targets, but needs a receiving buffer and you lose "is it even running" for free.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">9.</span>Why do batch jobs and serverless functions often need a Pushgateway or OTLP push instead of scraping?</p><p class="a">They may finish and terminate before a scrape interval elapses, so there's nothing to pull from; they must push their final metrics before exiting.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">10.</span>What's the USE method and the RED method?</p><p class="a">USE (Utilization, Saturation, Errors) is for resources (CPU, disk, queues). RED (Rate, Errors, Duration) is for request-driven services. Both are checklists for "which metrics do I need at minimum."</p></div>
+        </div>
+      </details>
+
+      <details class="qa-group">
+        <summary>Prometheus data model <span class="count">10 questions</span></summary>
+        <div class="qa-body">
+          <div class="qa"><p class="q"><span class="qnum">11.</span>What are the four Prometheus metric types?</p><p class="a">Counter (monotonic increasing), Gauge (up/down), Histogram (bucketed distribution, server-side aggregatable), Summary (client-side quantiles, not aggregatable across instances).</p></div>
+          <div class="qa"><p class="q"><span class="qnum">12.</span>Why prefer Histogram over Summary in most cases?</p><p class="a">Histograms store bucket counts you can sum across instances and compute quantiles from centrally with <code>histogram_quantile()</code>; Summary quantiles are computed client-side per instance and can't be meaningfully averaged or merged.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">13.</span>What is a label in Prometheus, and how does it relate to a time series?</p><p class="a">A label is a key-value pair attached to a metric. The metric name plus its full set of label values uniquely identifies one time series.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">14.</span>Why shouldn't you put a user ID or request ID in a label?</p><p class="a">It creates one time series per unique value — unbounded cardinality that can OOM the TSDB and blow up query latency; unbounded/high-cardinality values belong in logs or trace attributes, not metric labels.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">15.</span>What does a Counter reset (e.g. on process restart) look like, and how does PromQL handle it?</p><p class="a">The value drops to 0 (or near it) on restart. Functions like <code>rate()</code> and <code>increase()</code> detect the decrease and correct for it automatically, assuming a reset rather than negative traffic.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">16.</span>What's the exposition format Prometheus expects on /metrics?</p><p class="a">Plain text, one sample per line: <code>metric_name{label="value"} 123.45</code>, with optional <code># HELP</code> and <code># TYPE</code> comment lines describing each metric.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">17.</span>What is an "instant vector" vs a "range vector" in PromQL?</p><p class="a">An instant vector is one value per series at a single point in time (e.g. <code>up</code>). A range vector is a series of values over a time window (e.g. <code>http_requests_total[5m]</code>), required as input to functions like <code>rate()</code>.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">18.</span>How does Prometheus store data on disk?</p><p class="a">A custom TSDB using 2-hour immutable blocks of compressed chunks plus a WAL (write-ahead log) for crash recovery; older blocks are compacted together over time.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">19.</span>What's the default and typical retention for local Prometheus storage, and why does it matter?</p><p class="a">Default is 15 days. Because storage is local disk on a single node with no built-in long-term/HA story, teams needing months of history or durability reach for remote_write into VictoriaMetrics, Thanos, Cortex or Mimir.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">20.</span>What does the built-in <code>up</code> metric tell you?</p><p class="a">1 if the last scrape of that target succeeded, 0 if it failed — the first thing to check when "why is my dashboard empty" comes up.</p></div>
+        </div>
+      </details>
+
+      <details class="qa-group">
+        <summary>Prometheus architecture <span class="count">10 questions</span></summary>
+        <div class="qa-body">
+          <div class="qa"><p class="q"><span class="qnum">21.</span>What are the core components in a Prometheus deployment?</p><p class="a">Prometheus server (scrape + TSDB + PromQL engine), exporters (translate a system's native metrics to Prometheus format), Alertmanager (routes/dedupes/silences alerts), and a visualization layer like Grafana.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">22.</span>What is an exporter, and name three common ones.</p><p class="a">A small process that exposes a target system's metrics in Prometheus format. Common ones: node_exporter (host/OS metrics), mysqld_exporter, blackbox_exporter (probes endpoints over HTTP/TCP/ICMP).</p></div>
+          <div class="qa"><p class="q"><span class="qnum">23.</span>What happens if a scrape target is unreachable?</p><p class="a">The scrape fails, <code>up</code> for that target becomes 0, and Prometheus keeps retrying on the next interval — no data is invented for the gap.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">24.</span>Is Prometheus itself highly available out of the box?</p><p class="a">No — a single Prometheus server is a single point of failure with local-only storage. HA is typically achieved by running two identical replicas scraping the same targets, or offloading storage/HA to VictoriaMetrics/Thanos/Cortex/Mimir.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">25.</span>What is federation in Prometheus?</p><p class="a">One Prometheus server scrapes a subset of aggregated metrics from other Prometheus servers' <code>/federate</code> endpoint, useful for building a global view from per-cluster instances — but it doesn't solve long-term storage.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">26.</span>How does Prometheus discover scrape targets dynamically?</p><p class="a">Via service discovery integrations (Kubernetes, Consul, EC2, file-based SD, DNS) instead of hardcoding <code>static_configs</code>, so targets appear/disappear automatically as infrastructure changes.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">27.</span>What is the pushgateway and when should you avoid it?</p><p class="a">A gateway that batch/short-lived jobs push metrics to, which Prometheus then scrapes. Avoid it for long-running services — it turns into a stale-data trap since pushed metrics linger until explicitly deleted.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">28.</span>How do you secure a Prometheus /metrics endpoint in production?</p><p class="a">Network-level restriction (internal-only, mTLS, or a service mesh), plus reverse-proxy basic auth/OAuth if it must be reachable more broadly — Prometheus itself has only basic built-in auth support.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">29.</span>What's the relationship between Prometheus and Grafana?</p><p class="a">Prometheus stores and queries data; Grafana is a separate visualization layer that queries Prometheus's HTTP API (or PromQL-compatible backends) to render dashboards — Prometheus's own UI is for ad-hoc queries, not polished dashboards.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">30.</span>Scenario: your dashboard shows a flat line at zero for a service that's clearly running. What do you check first?</p><p class="a">Check <code>up{job="..."}</code> for that target — if 0, it's a scrape/network/auth problem; if 1, check the metric name/labels match what the app actually exports (rename, relabeling, or a wrong job selector are common culprits).</p></div>
+        </div>
+      </details>
+
+      <details class="qa-group">
+        <summary>PromQL basics <span class="count">10 questions</span></summary>
+        <div class="qa-body">
+          <div class="qa"><p class="q"><span class="qnum">31.</span>What does <code>rate(http_requests_total[5m])</code> compute?</p><p class="a">The per-second average rate of increase of that counter over the trailing 5-minute window, correcting for counter resets — the standard way to turn a counter into "requests per second."</p></div>
+          <div class="qa"><p class="q"><span class="qnum">32.</span>Difference between <code>rate()</code> and <code>irate()</code>?</p><p class="a"><code>rate()</code> smooths over the whole window (good for alerting/dashboards); <code>irate()</code> uses only the last two data points in the window (more reactive, spikier, better for fast-moving graphs, worse for alert thresholds).</p></div>
+          <div class="qa"><p class="q"><span class="qnum">33.</span>What does <code>increase(metric[1h])</code> return?</p><p class="a">The total increase of a counter over the given window — effectively <code>rate() * window_seconds</code>, useful for "how many errors occurred in the last hour."</p></div>
+          <div class="qa"><p class="q"><span class="qnum">34.</span>How do you sum request rate across all instances of a service by status code?</p><p class="a"><code>sum by (status) (rate(http_requests_total[5m]))</code> — aggregates the per-instance rates, grouped only by the <code>status</code> label.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">35.</span>What's the difference between <code>sum by (x)</code> and <code>sum without (x)</code>?</p><p class="a"><code>by (x)</code> keeps only label <code>x</code> in the result, dropping all others. <code>without (x)</code> keeps every other label except <code>x</code>.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">36.</span>How do you compute a 95th percentile latency from a histogram metric?</p><p class="a"><code>histogram_quantile(0.95, sum by (le) (rate(http_request_duration_seconds_bucket[5m])))</code> — aggregate bucket rates by the <code>le</code> label first, then apply <code>histogram_quantile</code>.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">37.</span>What does the <code>le</code> label mean on a histogram bucket?</p><p class="a">"Less than or equal to" — each bucket counts observations with a value ≤ that bucket's boundary; buckets are cumulative.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">38.</span>How do you alert on "error rate over 5%" using PromQL?</p><p class="a"><code>sum(rate(http_requests_total{status=~"5.."}[5m])) / sum(rate(http_requests_total[5m])) &gt; 0.05</code> — ratio of error-rate to total-rate, both computed as rates first, never as raw counter division.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">39.</span>Why is comparing two raw counters directly (without rate()) almost always wrong?</p><p class="a">Raw counters are cumulative since process start and reset on restart, so a direct ratio or difference reflects process uptime, not current behavior; rate()/increase() normalize to a comparable per-window value.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">40.</span>What does the <code>offset</code> modifier do, e.g. <code>metric offset 1d</code>?</p><p class="a">Shifts the query evaluation back in time by the given duration — used to compare "now" against "same time yesterday/last week" for anomaly detection.</p></div>
+        </div>
+      </details>
+
+      <details class="qa-group">
+        <summary>Scenario-based <span class="count">10 questions</span></summary>
+        <div class="qa-body">
+          <div class="qa"><p class="q"><span class="qnum">41.</span>A counter metric appears to "go down" on a graph. What's happening and how do you fix the query?</p><p class="a">The process restarted and the counter reset to zero; raw counter graphs will show a sawtooth. Use <code>rate()</code> or <code>increase()</code>, which detect and compensate for resets automatically.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">42.</span>Prometheus's memory usage keeps growing until OOM. What's your first hypothesis and how do you confirm it?</p><p class="a">Cardinality explosion. Confirm via <code>topk(10, count by (__name__)({__name__=~".+"}))</code> or the "TSDB status" page in the Prometheus UI, which lists metrics/labels with the highest series counts.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">43.</span>Your team wants 13 months of metric history for capacity planning, but Prometheus is configured for 15-day local retention. What do you recommend?</p><p class="a">Don't just bump local retention (disk cost, slow queries); instead remote_write into a long-term store like VictoriaMetrics with appropriate retention/downsampling, and query through that instead of raw Prometheus for historical ranges.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">44.</span>A dashboard panel is empty even though <code>up == 1</code> for the target. What next?</p><p class="a">Check the exact metric name and label selectors in the query against what the target actually exports (via its raw <code>/metrics</code> page) — a typo'd job label, relabeling rule, or renamed metric after an app upgrade are the usual suspects.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">45.</span>Two teams both want Prometheus, but one runs ephemeral batch jobs and one runs long-lived web services. Do they need different collection strategies?</p><p class="a">Yes — long-lived services are scraped directly; ephemeral batch jobs should push final metrics to a Pushgateway (or better, emit via OpenTelemetry to a collector) since they may not exist at the next scrape tick.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">46.</span>How would you detect "silent" data loss, where a target is up but simply not emitting a specific metric anymore?</p><p class="a">Alert on the absence of a series using <code>absent()</code> or <code>absent_over_time()</code>, since a missing series produces no result rather than an obvious zero.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">47.</span>Someone proposes labeling every HTTP metric with the full request path (e.g. <code>/users/12345</code>). What's the risk and the fix?</p><p class="a">Unbounded cardinality — one series per unique path/ID combination. Fix: normalize to route templates (<code>/users/:id</code>) before labeling, and push per-request detail to traces/logs instead.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">48.</span>Your service exposes latency as a Summary with client-computed p99. Ops wants a fleet-wide p99 across 50 pods. Why is this hard, and what do you change?</p><p class="a">Per-instance quantiles can't be mathematically averaged into a correct fleet-wide quantile. Switch the metric to a Histogram so bucket counts can be summed across instances first, then <code>histogram_quantile()</code> applied once.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">49.</span>A new engineer asks why they should use Prometheus instead of just logging metrics and grep/awk-ing them. What's your answer?</p><p class="a">Purpose-built TSDB storage and PromQL give you fast aggregation, rate math, alerting, and dashboarding at scale without reparsing raw text every query — logs don't pre-aggregate or index numerically.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">50.</span>You need to compare this week's traffic to the same weekday last week in one query. How?</p><p class="a">Use the <code>offset</code> modifier: <code>rate(http_requests_total[5m]) - rate(http_requests_total[5m] offset 7d)</code>, comparing the current rate against the same window shifted back 7 days.</p></div>
+        </div>
+      </details>
+    </div>
+
+    <h3 class="subhead"><span class="tag tag-resource">Resources</span> Free material for today</h3>
+    <div class="resources">
+      <div class="res-card"><div class="k">Docs</div><div class="t">Prometheus "Getting Started"</div><p class="d">Official prometheus.io docs — the fastest path from zero to a running scrape config.</p></div>
+      <div class="res-card"><div class="k">Interactive</div><div class="t">PromLabs PromQL cheat sheet + katacoda-style playground</div><p class="d">Short, example-driven reference for every PromQL function used above.</p></div>
+      <div class="res-card"><div class="k">Hands-on</div><div class="t">node_exporter + docker-compose starter</div><p class="d">Search "prometheus node_exporter docker-compose example" — dozens of free minimal repos to clone and run in minutes.</p></div>
+      <div class="res-card"><div class="k">Video</div><div class="t">"Prometheus Monitoring in 30 minutes" style intros</div><p class="d">Any recent (2023+) YouTube walkthrough of scrape configs + PromQL; pause and replicate each query yourself.</p></div>
+    </div>
+  </section>
+
+  <!-- ============================================================ DAY 2 ============================================================ -->
+  <section class="day" id="day2">
+    <div class="day-tag"><span class="day-num">DAY 2 · 4H</span></div>
+    <h2 class="display">Prometheus Alerting, Rules &amp; Scale</h2>
+    <div class="day-meta">Goal: go from "I can query" to "I can alert correctly and keep Prometheus healthy at scale."</div>
+
+    <h3 class="subhead"><span class="tag tag-concept">Concepts</span> Recording rules vs alerting rules</h3>
+    <div class="concept">
+      <p><strong>Recording rules</strong> pre-compute an expensive PromQL expression on a schedule and save it as a new time series — so a dashboard hitting it 50 times a minute doesn't re-run a costly aggregation each time. <strong>Alerting rules</strong> are PromQL expressions that, when true, fire an alert which Prometheus forwards to Alertmanager.</p>
+      <ul>
+        <li>Recording rule: <code class="mono">job:http_errors:rate5m = sum by (job) (rate(http_requests_total{status=~"5.."}[5m]))</code></li>
+        <li>Alerting rule: fires when that recording rule's value <code class="mono">&gt; 0.05</code> <strong>for</strong> a sustained period (the <code class="mono">for:</code> clause) — this avoids paging on a single noisy blip.</li>
+      </ul>
+      <p>The <code class="mono">for:</code> duration is one of the highest-leverage knobs in alerting: too short and you page on noise, too long and you miss fast incidents. 2–5 minutes is a common starting point for user-facing latency/error alerts.</p>
+    </div>
+
+    <h3 class="subhead"><span class="tag tag-concept">Concepts</span> Alertmanager: routing, grouping, silencing, inhibition</h3>
+    <div class="concept">
+      <p>Prometheus servers only <em>evaluate</em> alert rules; Alertmanager is the separate component that decides who gets paged, how alerts are bundled, and when to shut up.</p>
+      <ul>
+        <li><strong>Routing</strong> — a tree of matchers (by label, e.g. <code class="mono">team="payments"</code>) that sends an alert to the right receiver (Slack, PagerDuty, email).</li>
+        <li><strong>Grouping</strong> — bundles similar alerts (same <code class="mono">alertname</code>/<code class="mono">cluster</code>) into one notification instead of 50 separate pages when 50 pods all fail together.</li>
+        <li><strong>Silencing</strong> — a temporary, manually created mute for alerts matching given labels (e.g. during planned maintenance).</li>
+        <li><strong>Inhibition</strong> — suppresses lower-priority alerts when a related higher-priority one is already firing (e.g. don't page about individual pod alerts if the whole cluster is already down).</li>
+      </ul>
+    </div>
+
+    <h3 class="subhead"><span class="tag tag-visual">Visual</span> The alert pipeline, end to end</h3>
+    <div class="diagram">
+      <div class="dflow">
+        <div class="dbox amber">Alerting Rule<span class="sub">PromQL true &gt; for:</span></div>
+        <div class="darrow">──▶</div>
+        <div class="dbox">Alertmanager<span class="sub">group · dedupe · route</span></div>
+        <div class="darrow">──▶</div>
+        <div class="dcol">
+          <div class="dbox">Slack</div>
+        </div>
+      </div>
+      <div class="cap">Inside Alertmanager: incoming alerts pass through inhibition rules (is a bigger alert already active?), then grouping (bundle similar alerts), then the routing tree (label matchers pick a receiver), then silences (is this muted right now?).</div>
+    </div>
+
+    <h3 class="subhead"><span class="tag tag-concept">Concepts</span> Cardinality &amp; performance at scale</h3>
+    <div class="concept">
+      <p>As deployments grow, the single biggest operational risk to Prometheus is <strong>cardinality</strong> — the total number of active time series. Every new label value multiplies series count. A Prometheus server with tens of millions of series gets slow, memory-hungry, and eventually falls over.</p>
+      <ul>
+        <li><strong>Relabeling</strong> — rewrite or drop labels/targets before they're stored (<code class="mono">metric_relabel_configs</code>), e.g. drop noisy debug metrics entirely.</li>
+        <li><strong>Scrape interval tuning</strong> — not every metric needs 15s resolution; longer intervals for low-value targets cut load.</li>
+        <li><strong>Sharding/federation</strong> — split scraping across multiple Prometheus instances by team/cluster when one instance can't keep up.</li>
+      </ul>
+      <p>This is exactly the pain that motivates tomorrow's topic, VictoriaMetrics — it's built to absorb far higher cardinality and volume more cheaply than vanilla Prometheus storage.</p>
+    </div>
+
+    <h3 class="subhead"><span class="tag tag-practice">Practice</span> Write and fire a real alert</h3>
+    <div class="example">
+      <p class="scenario">Scenario: alert the team when 5xx error rate exceeds 5% for 2 minutes, routed to a #incidents Slack channel, but muted during a known maintenance window.</p>
+      <pre class="mono"># rules.yml
+groups:
+  - name: api-slo
+    rules:
+      - record: job:http_errors:rate5m
+        expr: sum by (job) (rate(http_requests_total{status=~"5.."}[5m]))
+      - alert: HighErrorRate
+        expr: job:http_errors:rate5m / sum by (job) (rate(http_requests_total[5m])) > 0.05
+        for: 2m
+        labels:
+          severity: page
+          team: payments
+        annotations:
+          summary: "{{ $labels.job }} error rate above 5%"
+
+# alertmanager.yml (excerpt)
+route:
+  receiver: default
+  routes:
+    - matchers: ["team = payments"]
+      receiver: slack-incidents
+      group_by: ["alertname", "job"]
+receivers:
+  - name: slack-incidents
+    slack_configs:
+      - channel: '#incidents'</pre>
+    </div>
+
+    <div class="milestone">
+      <div class="eyebrow">End-of-day milestone</div>
+      <p>You've written a recording rule, an alerting rule with a sane <code class="mono">for:</code>, and an Alertmanager route — and you can explain grouping vs inhibition vs silencing without hesitating.</p>
+    </div>
+
+    <h3 class="subhead"><span class="tag tag-interview">Interview Prep</span> 50 questions — Alerting, rules &amp; scale</h3>
+    <div class="qa-groups">
+
+      <details class="qa-group">
+        <summary>Alerting concepts <span class="count">10 questions</span></summary>
+        <div class="qa-body">
+          <div class="qa"><p class="q"><span class="qnum">1.</span>What's the difference between an alerting rule and Alertmanager?</p><p class="a">The alerting rule (evaluated by the Prometheus server) decides <em>when</em> a condition is true and creates an alert. Alertmanager is a separate service that decides <em>what happens next</em> — routing, grouping, silencing, notification delivery.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">2.</span>What does the <code>for:</code> clause do on an alerting rule?</p><p class="a">Requires the expression to stay true continuously for that duration before the alert transitions from "pending" to "firing" — prevents paging on single-scrape blips.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">3.</span>What are the alert states in Prometheus?</p><p class="a">Inactive (condition false), Pending (condition true, but <code>for:</code> duration not yet elapsed), Firing (condition true for at least <code>for:</code> duration).</p></div>
+          <div class="qa"><p class="q"><span class="qnum">4.</span>What is alert grouping and why does it matter?</p><p class="a">Alertmanager bundles alerts sharing configured label keys into a single notification — without it, one root cause affecting 100 pods pages you 100 times instead of once.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">5.</span>What is inhibition, with an example?</p><p class="a">Suppressing lower-severity alerts when a related higher-severity one is firing — e.g. suppress "pod down" alerts for a cluster when "cluster unreachable" is already firing, since the pod alerts are noise at that point.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">6.</span>What's a silence, and how is it different from inhibition?</p><p class="a">A silence is a manually created, time-bounded mute matching given labels (e.g. during a deploy). Inhibition is automatic and rule-based, driven by another alert's state, not a human action.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">7.</span>Why should alert thresholds usually be based on symptoms (user-facing effect) rather than causes?</p><p class="a">Symptom-based alerts (high latency, high error rate) tell you users are actually affected; cause-based alerts (CPU at 80%) may fire without any user impact, causing fatigue and eroding trust in paging.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">8.</span>What's "alert fatigue" and how do rules design help avoid it?</p><p class="a">Getting so many low-value alerts that engineers start ignoring pages. Combat it with symptom-based alerting, sensible <code>for:</code> windows, grouping, and inhibition rather than alerting on every metric that moves.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">9.</span>How do labels on an alerting rule get used downstream?</p><p class="a">Alertmanager's routing tree matches on those labels (plus any added at the receiver) to pick a route/receiver — e.g. <code>severity=page</code> vs <code>severity=ticket</code> can route to PagerDuty vs a low-priority queue respectively.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">10.</span>Can Alertmanager alone guarantee you don't get paged twice for the same root cause across two Prometheus replicas?</p><p class="a">Yes if both Prometheus replicas send to the same Alertmanager cluster — Alertmanager dedupes identical alerts (same labels) before notifying, which is also why running HA Alertmanager as a cluster (not standalone) matters.</p></div>
+        </div>
+      </details>
+
+      <details class="qa-group">
+        <summary>Recording rules &amp; SLOs <span class="count">10 questions</span></summary>
+        <div class="qa-body">
+          <div class="qa"><p class="q"><span class="qnum">11.</span>Why use a recording rule instead of just writing the raw PromQL in every dashboard panel?</p><p class="a">Performance — an expensive aggregation computed once per evaluation interval and stored is far cheaper than recomputing it on every dashboard load/refresh across many viewers.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">12.</span>What naming convention does Prometheus recommend for recording rules?</p><p class="a"><code>level:metric:operations</code>, e.g. <code>job:http_errors:rate5m</code> — aggregation level, base metric, then the operations applied, so intent is readable from the name alone.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">13.</span>How would you implement a multi-window, multi-burn-rate SLO alert?</p><p class="a">Alert when error budget burn rate is high over both a short window (e.g. 5m) and a longer window (e.g. 1h) simultaneously — catches both fast, severe burns and slow, sustained ones while filtering out short blips that don't threaten the budget.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">14.</span>What's a burn rate?</p><p class="a">How fast you're consuming your error budget relative to a sustainable pace — a burn rate of 1 means you'll exhaust the budget exactly at period end; burn rate of 10 means you'll exhaust it 10x faster (period/10).</p></div>
+          <div class="qa"><p class="q"><span class="qnum">15.</span>Should recording rules be evaluated at the same interval as scraping?</p><p class="a">Not necessarily — they're configured independently via <code>evaluation_interval</code>/rule group interval; you can evaluate less frequently than you scrape if the derived metric doesn't need that resolution.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">16.</span>Where do recording-rule results get stored?</p><p class="a">Back into the same Prometheus TSDB as a regular new time series, so they can be queried, graphed, and alerted on exactly like any scraped metric.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">17.</span>What happens to alert/recording rule state across a Prometheus restart?</p><p class="a">Alert firing state is lost on restart in vanilla Prometheus unless using the alert state persistence feature (or the "for" state carried via the WAL in newer versions) — this is one reason HA replica pairs are used, so a restart doesn't blind you.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">18.</span>How do you test an alerting rule before deploying it?</p><p class="a"><code>promtool test rules</code> lets you write unit tests with synthetic input series and assert expected alert states/values, without touching a live Prometheus.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">19.</span>Why should a latency SLO alert use a histogram-based error rate rather than an average?</p><p class="a">Averages hide tail latency — a few very slow requests can be masked by many fast ones. An SLO based on "% of requests under threshold X" (via histogram buckets) reflects the actual user experience distribution.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">20.</span>Scenario: your SLO alert fires constantly during low-traffic overnight hours. Why, and how do you fix it?</p><p class="a">Ratio-based alerts get noisy at low sample counts (a single error out of 3 requests is 33%). Fix by requiring a minimum absolute request volume in the condition, or using longer aggregation windows overnight.</p></div>
+        </div>
+      </details>
+
+      <details class="qa-group">
+        <summary>Exporters &amp; service discovery <span class="count">10 questions</span></summary>
+        <div class="qa-body">
+          <div class="qa"><p class="q"><span class="qnum">21.</span>What is relabeling, and name one common use.</p><p class="a">Rewriting/filtering labels or target lists using regex-based rules before scrape (<code>relabel_configs</code>) or before storage (<code>metric_relabel_configs</code>) — common use: dropping a noisy high-cardinality metric entirely with an <code>action: drop</code> rule.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">22.</span>Difference between <code>relabel_configs</code> and <code>metric_relabel_configs</code>?</p><p class="a"><code>relabel_configs</code> runs before scraping and can change which targets are scraped at all; <code>metric_relabel_configs</code> runs after scraping, on the samples themselves, and can drop specific metrics/series.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">23.</span>How does Kubernetes service discovery work in Prometheus?</p><p class="a">The <code>kubernetes_sd_config</code> watches the Kubernetes API for pods/services/endpoints and auto-populates scrape targets, typically filtered via pod annotations like <code>prometheus.io/scrape: "true"</code>.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">24.</span>What's the blackbox_exporter used for?</p><p class="a">Active probing — HTTP, TCP, ICMP, DNS checks against external endpoints, useful for synthetic "is this URL reachable and returning 200" monitoring rather than metrics the app exposes itself.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">25.</span>Why would you write a custom exporter instead of instrumenting application code directly?</p><p class="a">When you can't modify the target's source (a third-party database, hardware, or legacy system) — an exporter translates its native stats/API into Prometheus format from the outside.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">26.</span>What's the tradeoff of scraping every target every 15s across thousands of pods?</p><p class="a">Network and storage load scale linearly with target count × metric count; teams often lower scrape frequency for low-priority targets or shard scraping across multiple Prometheus instances.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">27.</span>How do you drop an entire noisy metric using metric_relabel_configs?</p><p class="a"><code>- source_labels: [__name__]\n  regex: 'go_gc_duration_seconds.*'\n  action: drop</code> — matches the metric name label and drops matching series before storage.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">28.</span>What is the <code>honor_labels</code> setting used for?</p><p class="a">Controls conflict resolution when a scraped target's own labels collide with labels Prometheus would normally add (like <code>instance</code>) — <code>true</code> keeps the target's label, useful for federation scenarios.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">29.</span>How would you monitor a fleet of AWS Lambda functions with Prometheus?</p><p class="a">Prometheus can't pull from ephemeral Lambdas directly; typically push metrics via OpenTelemetry/CloudWatch and either bridge CloudWatch metrics into Prometheus format or feed them through an OTel Collector into your metrics backend.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">30.</span>Scenario: after a Kubernetes rolling deploy, half your targets show as down briefly, then recover. Concerning?</p><p class="a">Usually expected — old pods terminate and new ones aren't scraped yet until service discovery refreshes; investigate only if targets stay down well past the deploy's rollout window.</p></div>
+        </div>
+      </details>
+
+      <details class="qa-group">
+        <summary>PromQL advanced <span class="count">10 questions</span></summary>
+        <div class="qa-body">
+          <div class="qa"><p class="q"><span class="qnum">31.</span>What does <code>topk(5, sum by (job) (rate(http_requests_total[5m])))</code> return?</p><p class="a">The 5 jobs with the highest current request rate, useful for quickly spotting the noisiest/busiest services.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">32.</span>What is a subquery in PromQL, e.g. <code>max_over_time(rate(x[5m])[1h:1m])</code>?</p><p class="a">A range vector built by re-evaluating an inner expression repeatedly over an outer window at a given step — here, computing rate every 1m for the last hour, then taking the max of those rates, useful for "worst 5-min rate seen in the last hour."</p></div>
+          <div class="qa"><p class="q"><span class="qnum">33.</span>What's the danger of subqueries in production dashboards?</p><p class="a">They can be very expensive — effectively re-running the inner query many times — so overuse can slow Prometheus significantly; prefer recording rules for anything queried often.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">34.</span>How do you join two different metrics in PromQL, e.g. requests by pod with pod memory?</p><p class="a">Vector matching with <code>on()</code>/<code>ignoring()</code> and group modifiers, e.g. <code>rate(http_requests_total[5m]) * on(pod) group_left() node_memory_MemAvailable_bytes</code> — matching requires overlapping label sets.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">35.</span>What does <code>group_left</code> do in a many-to-one match?</p><p class="a">Allows the left-hand side to match multiple series against one series on the right, carrying additional labels from the right side into the result — needed whenever cardinality differs between the two sides of a binary operation.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">36.</span>How do you compute the percentage of time a target was down over the last day?</p><p class="a"><code>avg_over_time(up[1d]) * 100</code> gives the fraction of scrapes where the target was up, expressed as a percent.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">37.</span>What's the difference between <code>delta()</code> and <code>increase()</code>?</p><p class="a"><code>delta()</code> is for gauges — the difference between first and last value in the window (can be negative). <code>increase()</code> is for counters and assumes monotonic increase, correcting for resets.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">38.</span>What does <code>predict_linear(node_filesystem_avail_bytes[6h], 4*3600)</code> do, and what's it useful for?</p><p class="a">Linearly extrapolates the trend over the past 6 hours to predict the value 4 hours in the future — classic use is "will this disk fill up in the next 4 hours," alerting before it actually happens.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">39.</span>Why does <code>histogram_quantile()</code> require aggregating by the <code>le</code> label before applying it?</p><p class="a">Because it needs the full set of cumulative buckets per series to interpolate a quantile; if you aggregate away <code>le</code> first (or forget to group by it), the bucket structure is destroyed and the function can't compute a meaningful quantile.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">40.</span>Scenario: a query returns "no data" only for a 2-minute PromQL rate window but works fine at 10 minutes. Why?</p><p class="a">The scrape interval may be close to or exceeding half the range window, so too few samples fall inside it for <code>rate()</code> to compute — as a rule of thumb the range window should be at least 4x the scrape interval.</p></div>
+        </div>
+      </details>
+
+      <details class="qa-group">
+        <summary>Scenario-based <span class="count">10 questions</span></summary>
+        <div class="qa-body">
+          <div class="qa"><p class="q"><span class="qnum">41.</span>On-call gets paged 40 times overnight for the same underlying database outage. What's broken in the alerting setup, and how do you fix it?</p><p class="a">Missing grouping/inhibition — likely each dependent service alerted independently instead of being grouped, and no inhibition rule suppressed downstream symptom alerts once the root-cause DB alert fired.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">42.</span>Leadership wants a 99.9% uptime SLO. Walk through how you'd instrument, alert, and report on it.</p><p class="a">Define the SLI (e.g. ratio of non-5xx responses), compute via a recording rule, set a multi-window multi-burn-rate alert against the error budget, and build a dashboard showing budget remaining over the rolling period.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">43.</span>A single Prometheus server is falling behind on scraping — the "scrape duration" metric keeps climbing. What are your options?</p><p class="a">Reduce cardinality/metric volume via relabeling, lower scrape frequency for low-value targets, shard scrape targets across multiple Prometheus instances, or move to a scalable backend like VictoriaMetrics/Thanos/Mimir.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">44.</span>How would you alert on "disk will fill up soon" rather than "disk is full"?</p><p class="a"><code>predict_linear(node_filesystem_avail_bytes[6h], 4*3600) &lt; 0</code> — fires when the extrapolated trend predicts exhaustion within the next 4 hours, giving lead time to act.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">45.</span>You need a maintenance window where alerts for one specific service are muted for 2 hours, but nothing else is affected. How?</p><p class="a">Create an Alertmanager silence matching that service's labels (e.g. <code>job="checkout"</code>) with a 2-hour expiry — scoped precisely so unrelated alerts still fire normally.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">46.</span>A recording rule's output looks wrong — values seem doubled. What's a likely cause?</p><p class="a">Double-counting from overlapping aggregation, e.g. summing an already-summed recording rule again, or a duplicate scrape target (two jobs scraping the same instance) inflating counts.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">47.</span>How would you design alerting so that a single flaky pod restarting doesn't page anyone, but the whole deployment crash-looping does?</p><p class="a">Alert on an aggregate condition (e.g. % of pods in CrashLoopBackOff across the deployment above a threshold, sustained via <code>for:</code>) rather than per-pod restart counts.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">48.</span>Your alerting rule references a recording rule that hasn't been evaluated yet (just deployed). What happens?</p><p class="a">The alerting rule sees no data for that series and simply doesn't fire (PromQL treats missing series as absent, not zero) — until the recording rule group has run at least once.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">49.</span>How do you avoid paging the same on-call engineer for both "API is down" and "database is down" when the DB outage is the actual cause?</p><p class="a">Inhibition: configure the API-down alert to be inhibited whenever the database-down alert (higher severity/source-of-truth) is firing, so only the root-cause page goes out.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">50.</span>A finance stakeholder wants alerts sent via email with a 24-hour delay for non-urgent capacity warnings, while SRE wants instant Slack for outages. How does Alertmanager support both from the same rules?</p><p class="a">Differentiate via a <code>severity</code> label on the alerting rules, then route in Alertmanager: <code>severity="page"</code> → immediate Slack/PagerDuty receiver, <code>severity="ticket"</code> → email receiver with a longer <code>group_wait</code>/repeat interval.</p></div>
+        </div>
+      </details>
+    </div>
+
+    <h3 class="subhead"><span class="tag tag-resource">Resources</span> Free material for today</h3>
+    <div class="resources">
+      <div class="res-card"><div class="k">Docs</div><div class="t">Alertmanager configuration docs</div><p class="d">Official reference for routing trees, grouping, and receivers — read the routing example top to bottom once.</p></div>
+      <div class="res-card"><div class="k">Reference</div><div class="t">Google SRE Workbook — "Alerting on SLOs" chapter</div><p class="d">Free online; the source of the multi-window multi-burn-rate alerting pattern used above.</p></div>
+      <div class="res-card"><div class="k">Tool</div><div class="t">promtool</div><p class="d">Ships with Prometheus — use <code>promtool test rules</code> to unit-test alert logic before deploying.</p></div>
+      <div class="res-card"><div class="k">Practice</div><div class="t">awesome-prometheus-alerts (GitHub)</div><p class="d">A large free library of battle-tested alerting rules to read, adapt, and learn idioms from.</p></div>
+    </div>
+  </section>
+
+  <!-- ============================================================ DAY 3 ============================================================ -->
+  <section class="day" id="day3">
+    <div class="day-tag"><span class="day-num">DAY 3 · 4H</span></div>
+    <h2 class="display">VictoriaMetrics Deep Dive</h2>
+    <div class="day-meta">Goal: know exactly what problem VictoriaMetrics solves, how its architecture works, and how to run it as a Prometheus long-term store.</div>
+
+    <h3 class="subhead"><span class="tag tag-concept">Concepts</span> Why VictoriaMetrics exists</h3>
+    <div class="concept">
+      <p>Prometheus's built-in storage is single-node, local-disk, and not built for years of retention or huge cardinality. <strong>VictoriaMetrics (VM)</strong> is a drop-in-compatible time-series database that keeps the Prometheus data model and PromQL-like query language, but re-engineers storage for far better compression, lower memory use, high cardinality tolerance, and both single-node and horizontally scalable cluster modes.</p>
+      <ul>
+        <li>It speaks Prometheus's <strong>remote_write</strong> protocol, so an existing Prometheus keeps scraping locally and just forwards (or exclusively ships) samples to VM for long-term storage.</li>
+        <li>It exposes a Prometheus-API-compatible query endpoint, so Grafana and existing PromQL dashboards work against VM with no changes.</li>
+        <li>Its own query language, <strong>MetricsQL</strong>, is a superset of PromQL — everything you learned the last two days still works, plus extra functions.</li>
+      </ul>
+      <p>The 80/20 takeaway: VictoriaMetrics is not a replacement mental model — it's Prometheus's storage and scale problem, solved. If you know PromQL, you already know ~95% of MetricsQL.</p>
+    </div>
+
+    <h3 class="subhead"><span class="tag tag-concept">Concepts</span> Single-node vs cluster architecture</h3>
+    <div class="concept">
+      <p><strong>Single-node VictoriaMetrics</strong> is one binary that does everything — ingestion, storage, and querying — and comfortably handles millions of series on modest hardware. Most teams should start here.</p>
+      <p><strong>Cluster VictoriaMetrics</strong> splits the single binary into three independently scalable services when you outgrow one node:</p>
+      <ul>
+        <li><strong>vminsert</strong> — receives incoming data (remote_write, OTLP, etc.) and shards it across storage nodes.</li>
+        <li><strong>vmstorage</strong> — actually stores the time series data on disk; you add more vmstorage nodes to scale capacity/durability.</li>
+        <li><strong>vmselect</strong> — handles PromQL/MetricsQL queries by fanning out to the relevant vmstorage nodes and merging results.</li>
+      </ul>
+      <p>Two supporting tools round out the ecosystem: <strong>vmagent</strong> (a lightweight, horizontally scalable alternative to running full Prometheus purely for scraping+forwarding) and <strong>vmalert</strong> (evaluates recording/alerting rules against VM, since VM itself doesn't evaluate rules).</p>
+    </div>
+
+    <h3 class="subhead"><span class="tag tag-visual">Visual</span> VictoriaMetrics cluster components</h3>
+    <div class="diagram">
+      <div class="dflow">
+        <div class="dcol">
+          <div class="dbox">Prometheus /<br/>vmagent<span class="sub">scrape + remote_write</span></div>
+        </div>
+        <div class="darrow">──▶</div>
+        <div class="dbox teal">vminsert<span class="sub">shards writes</span></div>
+        <div class="darrow">──▶</div>
+        <div class="dbox teal">vmstorage (×N)<span class="sub">durable TSDB shards</span></div>
+        <div class="darrow">◀──</div>
+        <div class="dbox teal">vmselect<span class="sub">fan-out + merge queries</span></div>
+        <div class="darrow">◀──</div>
+        <div class="dcol">
+          <div class="dbox">Grafana</div>
+        </div>
+      </div>
+      <div class="cap">Write path and read path both pass through vmstorage but via different components (vminsert vs vmselect) — this is what lets you scale ingestion and query load independently by adding more of whichever is the bottleneck.</div>
+    </div>
+
+    <div class="tblwrap">
+      <table class="cmp">
+        <thead><tr><th>Aspect</th><th>Vanilla Prometheus</th><th>VictoriaMetrics</th></tr></thead>
+        <tbody>
+          <tr><td>Storage scaling</td><td>Single node, local disk only</td><td>Single-node or horizontal cluster (vminsert/vmstorage/vmselect)</td></tr>
+          <tr><td>Long-term retention</td><td>Needs remote-write to another system</td><td>Native, with configurable retention + downsampling</td></tr>
+          <tr><td>Cardinality handling</td><td>Degrades hard past tens of millions of series</td><td>Better compression, tolerates much higher cardinality</td></tr>
+          <tr><td>Query language</td><td>PromQL</td><td>MetricsQL (superset of PromQL)</td></tr>
+          <tr><td>Rule evaluation</td><td>Built into Prometheus server</td><td>Requires <code>vmalert</code> (separate component)</td></tr>
+          <tr><td>Typical role</td><td>Local scraper + short-term store</td><td>Long-term store / HA backend, often paired with Prometheus or vmagent as the scraper</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3 class="subhead"><span class="tag tag-practice">Practice</span> Point Prometheus's remote_write at VictoriaMetrics</h3>
+    <div class="example">
+      <p class="scenario">Scenario: keep your existing Prometheus scraping as-is, but ship everything to VictoriaMetrics for durable, longer-retention storage and query it via vmui.</p>
+      <pre class="mono"># 1. Run single-node VictoriaMetrics
+docker run -d --name victoria-metrics -p 8428:8428 \
+  victoriametrics/victoria-metrics \
+  --retentionPeriod=12  # months
+
+# 2. Add remote_write to prometheus.yml
+remote_write:
+  - url: http://localhost:8428/api/v1/write
+
+# 3. Query via vmui (built-in UI) at http://localhost:8428/vmui
+# Try the exact same PromQL from Day 1/2 — it just works:
+rate(http_requests_total[5m])
+
+# 4. Or query VM's Prometheus-compatible API directly from Grafana:
+# Data source URL: http://localhost:8428
+# Type: "Prometheus" (VM is wire-compatible)</pre>
+    </div>
+
+    <div class="milestone">
+      <div class="eyebrow">End-of-day milestone</div>
+      <p>You can explain vminsert/vmstorage/vmselect from memory, you've wired remote_write from Prometheus into VictoriaMetrics, and you've run a familiar PromQL query against vmui without changing a single character of syntax.</p>
+    </div>
+
+    <h3 class="subhead"><span class="tag tag-interview">Interview Prep</span> 50 questions — VictoriaMetrics</h3>
+    <div class="qa-groups">
+
+      <details class="qa-group">
+        <summary>Why VictoriaMetrics &amp; core architecture <span class="count">10 questions</span></summary>
+        <div class="qa-body">
+          <div class="qa"><p class="q"><span class="qnum">1.</span>What core problem does VictoriaMetrics solve that vanilla Prometheus doesn't?</p><p class="a">Long-term, durable, horizontally scalable storage of time-series data with better compression and higher cardinality tolerance — Prometheus's local TSDB is single-node and not designed for that.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">2.</span>Is VictoriaMetrics a replacement for Prometheus, or does it complement it?</p><p class="a">Usually complements it — Prometheus (or vmagent) still does the scraping and short-term buffering; VictoriaMetrics is the long-term storage/query backend it remote_writes into. VM can also scrape directly itself, replacing Prometheus entirely for simple setups.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">3.</span>What protocol does Prometheus use to ship data into VictoriaMetrics?</p><p class="a">The Prometheus <code>remote_write</code> protocol — VM implements a compatible ingestion endpoint (<code>/api/v1/write</code>).</p></div>
+          <div class="qa"><p class="q"><span class="qnum">4.</span>What is MetricsQL?</p><p class="a">VictoriaMetrics's query language — a strict superset of PromQL with additional functions (e.g. easier joins, better subquery support) and some default behavior fixes; any valid PromQL query runs unchanged.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">5.</span>What are the two deployment modes of VictoriaMetrics?</p><p class="a">Single-node (one binary handling ingest, storage, and query — simplest, handles millions of series) and cluster (vminsert/vmstorage/vmselect split for horizontal scale).</p></div>
+          <div class="qa"><p class="q"><span class="qnum">6.</span>Why does VictoriaMetrics typically use less disk and memory than Prometheus for the same data?</p><p class="a">More aggressive, purpose-built compression algorithms for time-series data and a storage engine designed around high cardinality, rather than Prometheus's general-purpose local TSDB.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">7.</span>Can Grafana query VictoriaMetrics directly?</p><p class="a">Yes — VM exposes a Prometheus-API-compatible HTTP endpoint, so Grafana's standard "Prometheus" data source type works against it unchanged.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">8.</span>What is vmui?</p><p class="a">VictoriaMetrics's built-in web UI for ad-hoc PromQL/MetricsQL queries and basic graphing, similar in purpose to Prometheus's own expression browser.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">9.</span>Does migrating from Prometheus to VictoriaMetrics require rewriting dashboards and alerts?</p><p class="a">Generally no for dashboards (same PromQL, compatible API); alerting rules need <code>vmalert</code> instead of Prometheus's built-in rule evaluator, but rule syntax stays the same.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">10.</span>Is VictoriaMetrics open source?</p><p class="a">Yes, the core (single-node and cluster) is open source (Apache 2.0-style license); VictoriaMetrics also offers a paid enterprise version with extra features like downsampling and multi-tenancy at larger scale.</p></div>
+        </div>
+      </details>
+
+      <details class="qa-group">
+        <summary>Cluster components <span class="count">10 questions</span></summary>
+        <div class="qa-body">
+          <div class="qa"><p class="q"><span class="qnum">11.</span>What does vminsert do?</p><p class="a">Receives incoming write requests (remote_write, OTLP, InfluxDB line protocol, etc.) and routes/shards each time series to the appropriate vmstorage node(s) based on a consistent hashing scheme.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">12.</span>What does vmstorage do?</p><p class="a">The actual storage engine — persists time series data to disk on that node and answers data requests from vmselect for the series it holds.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">13.</span>What does vmselect do?</p><p class="a">Handles incoming PromQL/MetricsQL queries, fans them out to all relevant vmstorage nodes in parallel, and merges the partial results into a single response.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">14.</span>Why split into three components instead of one, like single-node VM?</p><p class="a">To scale ingestion, storage, and query load independently — e.g. add more vmstorage nodes for capacity without touching query throughput, or add vmselect replicas for heavy dashboard load without adding storage.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">15.</span>What is vmagent, and why choose it over full Prometheus for scraping?</p><p class="a">A lightweight, resource-efficient agent purpose-built for scraping and forwarding (remote_write) at scale — no local TSDB/query engine overhead, easier to run many stateless replicas of than full Prometheus.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">16.</span>What is vmalert, and why is it a separate component from VictoriaMetrics itself?</p><p class="a">VM's rule-evaluation engine for recording and alerting rules — separate because vminsert/vmstorage/vmselect intentionally stay focused purely on storage/query, keeping each component simple and independently scalable.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">17.</span>How does data replication work in VictoriaMetrics cluster mode?</p><p class="a">Configurable replication factor (<code>-replicationFactor</code>) lets vminsert write each series to multiple vmstorage nodes, so a single node's failure doesn't lose data.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">18.</span>What happens to query results if one vmstorage node is temporarily unavailable?</p><p class="a">With replication configured, vmselect can still get complete results from surviving replicas; without replication, queries return partial data for the down node's shard until it recovers.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">19.</span>How would you scale VictoriaMetrics cluster to handle 10x more incoming write volume?</p><p class="a">Add more vminsert and vmstorage nodes (ingestion and storage capacity scale together) — vmselect scaling is driven by query load, which may grow separately.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">20.</span>What's a realistic reason to still run single-node VictoriaMetrics even at moderate scale?</p><p class="a">Operational simplicity — single-node VM comfortably handles millions of active series on one reasonably sized machine, and cluster mode adds real operational complexity (multiple services, sharding, replication) not worth it below that scale.</p></div>
+        </div>
+      </details>
+
+      <details class="qa-group">
+        <summary>MetricsQL &amp; querying <span class="count">10 questions</span></summary>
+        <div class="qa-body">
+          <div class="qa"><p class="q"><span class="qnum">21.</span>Will a query written for Prometheus run unmodified on VictoriaMetrics?</p><p class="a">Yes — MetricsQL is a strict superset of PromQL, so valid PromQL always runs the same way on VM.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">22.</span>Name one MetricsQL feature that has no direct PromQL equivalent.</p><p class="a"><code>default_rollup</code>/simplified subquery defaults and functions like <code>rollup_candlestick</code>, or arbitrary binary operations between arbitrary label sets without needing exact PromQL <code>on()</code>/<code>ignoring()</code> gymnastics in some cases — the general theme is MetricsQL relaxes several strict matching rules PromQL enforces.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">23.</span>What is the WITH expression in MetricsQL?</p><p class="a">Lets you define reusable named subexpressions within a single query (like a local variable), improving readability of complex queries without needing a separate recording rule.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">24.</span>Does VictoriaMetrics support instant vs range queries the same way Prometheus does?</p><p class="a">Yes — the same <code>/api/v1/query</code> (instant) and <code>/api/v1/query_range</code> (range) API endpoints, so existing tooling/Grafana panels work unchanged.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">25.</span>How does VictoriaMetrics handle staleness (a series that stops reporting)?</p><p class="a">Similar staleness markers/handling to Prometheus so a series that stops being written doesn't show as flatlined forever on a graph — it disappears after the staleness window rather than extending the last value.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">26.</span>What is downsampling, and does VictoriaMetrics support it?</p><p class="a">Reducing data resolution for older data (e.g. keep raw 15s data for 2 weeks, 5-minute rollups beyond that) to save storage while retaining long-term trend visibility; supported in VictoriaMetrics (notably a first-class feature in its enterprise version, with community workarounds in OSS).</p></div>
+          <div class="qa"><p class="q"><span class="qnum">27.</span>How do you find the highest-cardinality metrics in a VictoriaMetrics instance?</p><p class="a">VM exposes cardinality explorer tooling (a UI page and API) purpose-built for this, more convenient than Prometheus's TSDB status page for the same task.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">28.</span>Can VictoriaMetrics ingest data in formats other than Prometheus remote_write?</p><p class="a">Yes — it also accepts InfluxDB line protocol, Graphite, OpenTSDB, and OTLP (OpenTelemetry) natively, making it a flexible ingestion sink for mixed environments.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">29.</span>How would you migrate historical data from Prometheus's local TSDB into VictoriaMetrics?</p><p class="a">Using VictoriaMetrics's <code>vmctl</code> import tool, which can read Prometheus's local blocks (or remote-read) and backfill them into VM.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">30.</span>Scenario: after switching Grafana's data source from Prometheus to VictoriaMetrics, one dashboard panel shows different numbers. What would you check?</p><p class="a">Whether the panel relies on Prometheus-specific default behaviors MetricsQL handles slightly differently (rare edge cases in matching/instant-vector semantics), or whether both sources actually have identical retained data ranges/retention windows for the query being compared.</p></div>
+        </div>
+      </details>
+
+      <details class="qa-group">
+        <summary>Operations &amp; scaling <span class="count">10 questions</span></summary>
+        <div class="qa-body">
+          <div class="qa"><p class="q"><span class="qnum">31.</span>What's the first thing to check if vminsert reports write errors?</p><p class="a">Whether vmstorage nodes are reachable/healthy and not rejecting writes due to being overloaded or out of disk space — vminsert surfaces backpressure from storage as write failures.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">32.</span>How do you configure retention in VictoriaMetrics?</p><p class="a">The <code>-retentionPeriod</code> flag (e.g. <code>12</code> for 12 months) on vmstorage/single-node — much simpler than juggling remote storage lifecycle rules in some alternative long-term-storage setups.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">33.</span>Why might you run vmagent in front of VictoriaMetrics even when VM can scrape directly?</p><p class="a">To decouple scraping from storage scaling, run many lightweight stateless scraper replicas near targets (e.g. per Kubernetes cluster), and buffer/retry writes if the storage tier is briefly unavailable.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">34.</span>How does VictoriaMetrics behave if vmstorage runs out of disk space?</p><p class="a">It stops accepting new writes for that node's shard (protecting existing data) rather than silently corrupting data — monitoring free disk on vmstorage nodes is a standard operational alert.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">35.</span>What's a sensible way to alert on VictoriaMetrics's own health?</p><p class="a">Track ingestion error rates, vmstorage disk usage trend, vmselect query latency/error rate, and replication lag if using multi-node replication — essentially treat VM itself as a service with its own RED/USE metrics.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">36.</span>How would you run VictoriaMetrics highly available across two data centers?</p><p class="a">Typically two independent VM clusters (or single-node instances) each receiving the same remote_write stream (dual-write from vmagent/Prometheus), rather than stretching one cluster across DCs — avoids cross-DC latency in the write/query hot path.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">37.</span>What's a common cost-saving argument for choosing VictoriaMetrics over a hosted/SaaS metrics backend?</p><p class="a">Its storage efficiency (compression) plus being free/open-source for the core product often makes self-hosted VM meaningfully cheaper at scale than commercial per-series-priced SaaS options, at the cost of operating it yourself.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">38.</span>How do you upgrade a VictoriaMetrics cluster with zero data loss?</p><p class="a">Rolling upgrade node-by-node (vmstorage nodes especially), relying on replication factor &gt; 1 so in-flight writes/queries aren't lost while one node is briefly down for the upgrade.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">39.</span>What monitoring would you put in place specifically for cardinality growth over time?</p><p class="a">Track active time series count and new series creation rate as its own metric/dashboard, alerting on abnormal growth so a bad deploy that adds a high-cardinality label is caught before it degrades the whole cluster.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">40.</span>Scenario: query latency on vmselect spikes only during business hours. What's your investigation path?</p><p class="a">Correlate with dashboard/query volume (more concurrent users running heavy queries), check if specific expensive queries (wide time ranges, high-cardinality selectors) are being run repeatedly, and consider adding vmselect replicas or recording rules for the expensive queries.</p></div>
+        </div>
+      </details>
+
+      <details class="qa-group">
+        <summary>Scenario-based <span class="count">10 questions</span></summary>
+        <div class="qa-body">
+          <div class="qa"><p class="q"><span class="qnum">41.</span>Your company runs Prometheus per-Kubernetes-cluster (10 clusters) and wants one global dashboard. How does VictoriaMetrics help?</p><p class="a">Each cluster's Prometheus/vmagent remote_writes into a shared (or federated) VictoriaMetrics cluster, giving one queryable global store instead of relying on Prometheus federation, which doesn't scale well for this.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">42.</span>A team is hitting Prometheus's practical series-count ceiling on one box. What's the lowest-effort first step before adopting full cluster-mode VM?</p><p class="a">Try single-node VictoriaMetrics as a drop-in remote_write target first — its better compression/cardinality handling alone often resolves the issue without the operational overhead of cluster mode.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">43.</span>How would you justify to a skeptical manager why VictoriaMetrics is worth adopting over "just Prometheus with a bigger disk"?</p><p class="a">A bigger disk doesn't fix single-node scaling limits, HA, or the operational risk of one server holding all history; VM adds durability, better compression (lower cost per series), and a scaling path that doesn't require re-architecting later.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">44.</span>You need both fast recent-data queries and cheap 2-year retention. How does VictoriaMetrics's design help?</p><p class="a">Its storage engine is efficient enough that both live in the same system without a separate downsampled long-term tier being mandatory (though downsampling is still an option in enterprise) — recent and historical queries hit the same, well-compressed store.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">45.</span>A batch pipeline needs to backfill 6 months of historical metrics computed from logs. How would you get that into VictoriaMetrics?</p><p class="a">Write directly via the remote_write/import API (VM supports out-of-order and backdated inserts more gracefully than vanilla Prometheus), or use <code>vmctl</code> for bulk import.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">46.</span>Two independent product teams want strict data isolation in the same VictoriaMetrics deployment. What's the approach?</p><p class="a">VictoriaMetrics enterprise supports true multi-tenancy; in OSS, teams typically achieve isolation via separate VM instances/clusters per team, or namespacing conventions plus access control at the query-proxy layer.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">47.</span>Why might an interviewer consider "VictoriaMetrics vs Thanos vs Cortex/Mimir" a fair comparison question, and what's a concise answer?</p><p class="a">All three solve "Prometheus long-term/HA storage," but differ in architecture and complexity: VM tends to be praised for lower resource use and simpler operations, Thanos leans on object storage (S3) with a sidecar model, Cortex/Mimir target very large multi-tenant SaaS-style deployments — the "right" one depends on team scale and existing infra (e.g. heavy S3 usage favors Thanos).</p></div>
+          <div class="qa"><p class="q"><span class="qnum">48.</span>Your org is migrating and wants zero dashboard downtime. What's the safe cutover sequence?</p><p class="a">Dual-write (remote_write to both old and new backend) for a validation period, compare query results/dashboards side-by-side, then switch Grafana's data source once confidence is high, keeping the old system readable a while longer as a rollback path.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">49.</span>How would you explain vminsert/vmstorage/vmselect to a non-infra stakeholder in one sentence each?</p><p class="a">vminsert is the mail sorter deciding which storage shelf each piece of data goes to; vmstorage is the shelf itself; vmselect is the librarian who runs to every relevant shelf and hands you back one combined answer.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">50.</span>A cost review asks why metrics storage costs dropped 60% after migrating to VictoriaMetrics with the same retention. What's the likely explanation?</p><p class="a">VM's storage engine achieves significantly higher compression ratios for time-series data than Prometheus's default local TSDB (and often better than naive alternatives), so the same raw sample volume occupies far less disk.</p></div>
+        </div>
+      </details>
+    </div>
+
+    <h3 class="subhead"><span class="tag tag-resource">Resources</span> Free material for today</h3>
+    <div class="resources">
+      <div class="res-card"><div class="k">Docs</div><div class="t">docs.victoriametrics.com — Quick Start</div><p class="d">Official docs cover single-node and cluster setup, remote_write config, and vmagent/vmalert in depth.</p></div>
+      <div class="res-card"><div class="k">Reference</div><div class="t">MetricsQL documentation</div><p class="d">Side-by-side comparison with PromQL — read this after Day 1/2 PromQL so the differences jump out.</p></div>
+      <div class="res-card"><div class="k">Hands-on</div><div class="t">victoriametrics/VictoriaMetrics GitHub — docker-compose examples</div><p class="d">The repo ships ready-made docker-compose files for single-node, cluster, and full Grafana-included stacks.</p></div>
+      <div class="res-card"><div class="k">Blog</div><div class="t">VictoriaMetrics engineering blog</div><p class="d">Deep, free technical posts comparing VM's storage design against Prometheus/Thanos/Cortex — great interview ammo.</p></div>
+    </div>
+  </section>
+
+  <!-- ============================================================ DAY 4 ============================================================ -->
+  <section class="day" id="day4">
+    <div class="day-tag"><span class="day-num">DAY 4 · 4H</span></div>
+    <h2 class="display">OpenTelemetry: Traces, Metrics, Logs</h2>
+    <div class="day-meta">Goal: understand how telemetry actually gets generated and shipped — the layer that feeds Prometheus/VictoriaMetrics and trace backends alike.</div>
+
+    <h3 class="subhead"><span class="tag tag-concept">Concepts</span> What OpenTelemetry actually is</h3>
+    <div class="concept">
+      <p><strong>OpenTelemetry (OTel)</strong> is a vendor-neutral standard (APIs, SDKs, and a Collector) for generating and shipping telemetry — traces, metrics, and logs — out of your application code. Before OTel, every vendor (Datadog, New Relic, Jaeger, etc.) had its own instrumentation library, so switching backends meant re-instrumenting everything. OTel decouples "how you instrument" from "where the data ends up."</p>
+      <ul>
+        <li><strong>API</strong> — the interfaces your code calls (start a span, record a metric). Stable, minimal, no-op if no SDK is configured.</li>
+        <li><strong>SDK</strong> — the actual implementation: batches, samples, and exports telemetry according to configuration.</li>
+        <li><strong>Collector</strong> — a standalone process that receives telemetry (from SDKs or other sources), processes it (batch, filter, redact), and exports it to one or more backends — Prometheus/VictoriaMetrics for metrics, Jaeger/Tempo for traces, Loki/Elasticsearch for logs.</li>
+      </ul>
+      <p>The 80/20 insight: you rarely need to write the plumbing from scratch. Most languages have <strong>auto-instrumentation</strong> for common frameworks (HTTP servers, DB clients) — you add a library/agent and get spans and metrics with minimal code changes; manual instrumentation is reserved for business-specific spans.</p>
+    </div>
+
+    <h3 class="subhead"><span class="tag tag-concept">Concepts</span> Traces, spans, and context propagation</h3>
+    <div class="concept">
+      <p>A <strong>trace</strong> represents one request's journey through your whole system. It's made of <strong>spans</strong> — each span is one unit of work (an HTTP call, a DB query, a function) with a start time, duration, and attributes. Spans are connected in a parent-child tree: the root span is the entry point, child spans are the work it delegates to other services.</p>
+      <ul>
+        <li><strong>Trace ID</strong> — unique per end-to-end request, shared by every span in that trace.</li>
+        <li><strong>Span ID</strong> — unique per unit of work; a span's <strong>parent span ID</strong> links it into the tree.</li>
+        <li><strong>Context propagation</strong> — passing the trace ID/span ID across process boundaries, typically via the <code class="mono">traceparent</code> HTTP header (W3C Trace Context standard), so Service B's spans know they belong to Service A's trace.</li>
+      </ul>
+      <p>Without propagation, each service would generate its own disconnected trace — you'd never see the full request path, only fragments.</p>
+    </div>
+
+    <h3 class="subhead"><span class="tag tag-visual">Visual</span> A distributed trace, and the Collector pipeline</h3>
+    <div class="diagram">
+      <div class="dstack">
+        <div class="dflow">
+          <div class="dbox violet">Gateway<span class="sub">span: 120ms</span></div>
+          <div class="darrow">──▶</div>
+          <div class="dbox violet">Auth Service<span class="sub">span: 15ms</span></div>
+          <div class="darrow">──▶</div>
+          <div class="dbox violet">Orders Service<span class="sub">span: 95ms</span></div>
+          <div class="darrow">──▶</div>
+          <div class="dbox violet">Postgres<span class="sub">span: 80ms</span></div>
+        </div>
+        <div class="cap" style="margin-top:0;">One trace, four spans, same trace ID throughout. The waterfall shows Orders → Postgres eating 80 of the parent's 95ms — that's your bottleneck, visible instantly instead of guessed at.</div>
+      </div>
+    </div>
+    <div class="diagram">
+      <div class="dflow">
+        <div class="dbox">App w/ OTel SDK<span class="sub">emits OTLP</span></div>
+        <div class="darrow">──▶</div>
+        <div class="dbox violet">Receiver<span class="sub">OTLP/Prometheus/Jaeger</span></div>
+        <div class="darrow">──▶</div>
+        <div class="dbox violet">Processor<span class="sub">batch · filter · redact</span></div>
+        <div class="darrow">──▶</div>
+        <div class="dbox violet">Exporter<span class="sub">fan-out</span></div>
+        <div class="darrow">──▶</div>
+        <div class="dcol">
+          <div class="dbox teal">VictoriaMetrics<span class="sub">metrics</span></div>
+          <div class="dbox">Jaeger / Tempo<span class="sub">traces</span></div>
+        </div>
+      </div>
+      <div class="cap">The OTel Collector is the universal adapter: one pipeline, many possible receivers in and exporters out, so instrumented apps don't need to know or care which backend you're using today.</div>
+    </div>
+
+    <h3 class="subhead"><span class="tag tag-practice">Practice</span> Instrument a tiny service and run a Collector</h3>
+    <div class="example">
+      <p class="scenario">Scenario: auto-instrument a simple Python Flask app so every incoming request produces a trace, then route it through a local OTel Collector to the console (swap for Jaeger/Tempo later).</p>
+      <pre class="mono"># 1. Install auto-instrumentation (no code changes needed)
+pip install opentelemetry-distro opentelemetry-exporter-otlp
+opentelemetry-bootstrap -a install
+
+# 2. Run your app with auto-instrumentation, pointed at a local Collector
+OTEL_SERVICE_NAME=orders-service \
+OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317 \
+opentelemetry-instrument python app.py
+
+# 3. collector-config.yaml — minimal pipeline
+receivers:
+  otlp:
+    protocols:
+      grpc:
+processors:
+  batch:
+exporters:
+  logging:
+    loglevel: debug
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [logging]
+
+# 4. Run the Collector
+docker run -d -p 4317:4317 -v $(pwd)/collector-config.yaml:/etc/otelcol/config.yaml \
+  otel/opentelemetry-collector
+
+# Hit your app a few times, then check the Collector's logs —
+# you'll see full span data: trace ID, span ID, duration, attributes.</pre>
+    </div>
+
+    <div class="milestone">
+      <div class="eyebrow">End-of-day milestone</div>
+      <p>You can draw the Collector pipeline (receiver → processor → exporter) from memory, explain what a trace ID/span ID/context propagation actually do, and you've seen real spans flow from an app through a Collector.</p>
+    </div>
+
+    <h3 class="subhead"><span class="tag tag-interview">Interview Prep</span> 50 questions — OpenTelemetry</h3>
+    <div class="qa-groups">
+
+      <details class="qa-group">
+        <summary>Core concepts <span class="count">10 questions</span></summary>
+        <div class="qa-body">
+          <div class="qa"><p class="q"><span class="qnum">1.</span>What problem does OpenTelemetry solve that existed before it?</p><p class="a">Vendor lock-in from proprietary instrumentation SDKs — before OTel, switching observability vendors meant re-instrumenting your whole codebase; OTel standardizes the API/SDK so you instrument once and export anywhere.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">2.</span>What are the three signal types OpenTelemetry standardizes?</p><p class="a">Traces, metrics, and logs — with traces being the most mature part of the spec historically, though all three are now stable.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">3.</span>What's the difference between the OTel API and the OTel SDK?</p><p class="a">The API is the stable interface your application code calls (e.g. "start a span") and is a safe no-op if unconfigured; the SDK is the actual implementation that processes, samples, batches, and exports that data — you can upgrade/swap SDKs without touching instrumented code.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">4.</span>What is OTLP?</p><p class="a">OpenTelemetry Protocol — the native wire format (gRPC or HTTP, Protobuf-encoded) for sending telemetry between SDKs, Collectors, and OTLP-compatible backends.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">5.</span>Auto-instrumentation vs manual instrumentation — when do you need each?</p><p class="a">Auto-instrumentation (agents/libraries hooking common frameworks) covers HTTP servers, DB clients, message queues with zero/minimal code changes — use it first. Manual instrumentation (custom spans/attributes in your own business logic) fills gaps auto-instrumentation can't see, like a specific algorithm's internal steps.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">6.</span>What are semantic conventions in OpenTelemetry?</p><p class="a">Standardized names/formats for common attributes (e.g. <code>http.method</code>, <code>db.system</code>) so telemetry from different languages/libraries is consistent and cross-service queries/dashboards work uniformly.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">7.</span>Is OpenTelemetry a backend/storage system?</p><p class="a">No — it's purely instrumentation and pipeline tooling (API, SDK, Collector). You still need a backend (VictoriaMetrics, Jaeger, Tempo, Loki, or a commercial vendor) to store and visualize the data it produces.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">8.</span>What's a Resource in OpenTelemetry?</p><p class="a">Metadata describing the entity producing telemetry — service name, version, host, Kubernetes pod, cloud region — attached once per SDK instance and carried on every signal it emits.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">9.</span>How does OpenTelemetry relate to Prometheus?</p><p class="a">They're complementary: OTel can generate metrics and export them in Prometheus format (or via OTLP into a Collector that exposes a Prometheus-scrapable endpoint), letting you keep Prometheus/VictoriaMetrics as your metrics backend while using OTel for unified instrumentation across traces/metrics/logs.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">10.</span>Which OpenTelemetry signal is generally the most mature/widely adopted today?</p><p class="a">Traces, followed closely by metrics; logs support matured later and is still catching up in some language SDKs, though all three are part of the stable spec.</p></div>
+        </div>
+      </details>
+
+      <details class="qa-group">
+        <summary>SDK &amp; instrumentation <span class="count">10 questions</span></summary>
+        <div class="qa-body">
+          <div class="qa"><p class="q"><span class="qnum">11.</span>What is a Tracer and a TracerProvider?</p><p class="a">TracerProvider is the SDK-level factory configured once per application (with exporters, samplers, resource info); a Tracer is obtained from it (usually per library/module) and used to actually start spans.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">12.</span>What is sampling, and why does it matter for traces?</p><p class="a">Deciding which traces to actually record/export rather than keeping 100% of them — necessary because tracing every request at high volume is expensive; sampling trades completeness for cost/performance.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">13.</span>Head-based vs tail-based sampling — what's the difference?</p><p class="a">Head-based decides at the start of a trace (e.g. random 10%) before knowing the outcome — simple, cheap, but might miss rare errors. Tail-based decides after the full trace completes, so it can preferentially keep error/slow traces — better signal, but requires buffering the whole trace (often at the Collector) before deciding.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">14.</span>What's a span attribute vs a span event?</p><p class="a">An attribute is a key-value fact describing the span as a whole (e.g. <code>http.status_code=500</code>); an event is a timestamped point-in-time occurrence within the span's duration (e.g. "cache miss at t+12ms"), similar to a structured log line attached to that span.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">15.</span>What is a span's status, and what are the possible values?</p><p class="a">Unset, Ok, or Error — set explicitly by instrumentation (or auto-instrumentation on an exception/non-2xx response) to mark whether that unit of work succeeded, which trace backends use for error-rate views and filtering.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">16.</span>How does context propagation actually travel between two HTTP services?</p><p class="a">The calling service's SDK injects a <code>traceparent</code> header (W3C Trace Context format, containing trace ID, parent span ID, and trace flags) into the outgoing HTTP request; the receiving service's SDK extracts it and continues the same trace instead of starting a new one.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">17.</span>What happens to a trace if one service in the chain doesn't propagate context (e.g. an old, uninstrumented service)?</p><p class="a">The trace breaks there — spans downstream of that gap start a new, disconnected trace, so you lose end-to-end visibility across that hop until it's instrumented or a manual bridge is added.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">18.</span>What is a Baggage in OpenTelemetry?</p><p class="a">Key-value context propagated alongside trace context across service boundaries, but meant for business/application data (e.g. a customer tier) rather than trace identity — usable by any service downstream, not just for correlating spans.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">19.</span>Why would you add custom manual spans even when your framework is auto-instrumented?</p><p class="a">Auto-instrumentation only sees framework/library boundaries (HTTP in, DB call out); it can't see meaningful internal steps of your own business logic (e.g. "validate order," "apply discount") that you specifically want timed and visible in the waterfall.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">20.</span>How do OpenTelemetry metrics instruments differ (Counter, UpDownCounter, Histogram, Gauge)?</p><p class="a">Counter: monotonically increasing (requests served). UpDownCounter: can increase or decrease (active connections). Histogram: records a distribution of values (latency) — maps directly onto Prometheus's Histogram type. Gauge (Observable): a point-in-time value read via callback (current queue depth).</p></div>
+        </div>
+      </details>
+
+      <details class="qa-group">
+        <summary>The Collector <span class="count">10 questions</span></summary>
+        <div class="qa-body">
+          <div class="qa"><p class="q"><span class="qnum">21.</span>What are the three pipeline stages in an OTel Collector config?</p><p class="a">Receivers (ingest telemetry — OTLP, Prometheus scrape, Jaeger, etc.), processors (transform in-flight data — batch, filter, redact PII, add resource attributes), exporters (send onward to one or more backends).</p></div>
+          <div class="qa"><p class="q"><span class="qnum">22.</span>Why run a Collector instead of exporting straight from every app to your backend?</p><p class="a">Centralizes concerns like batching, retries, sampling decisions, and backend swaps — you can change or add a backend by editing one Collector config instead of redeploying every instrumented service.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">23.</span>What's the difference between an Agent (sidecar/daemonset) Collector and a Gateway Collector?</p><p class="a">Agent Collectors run close to the workload (one per host/pod) doing lightweight local processing; Gateway Collectors run centrally, receiving from many Agents, doing heavier processing (tail sampling, cross-request dedup) before final export.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">24.</span>Name a common processor and what it's used for.</p><p class="a">The <code>batch</code> processor groups telemetry before export to reduce the number of network calls; the <code>memory_limiter</code> processor protects the Collector from OOMing under load spikes.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">25.</span>Can one Collector pipeline export the same data to two different backends?</p><p class="a">Yes — a pipeline can list multiple exporters, e.g. sending traces to both Jaeger and a commercial vendor simultaneously for a migration period.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">26.</span>How would you redact sensitive data (e.g. an email address in a span attribute) before it leaves your infrastructure?</p><p class="a">Use a processor like <code>attributes</code> or <code>redaction</code> in the Collector pipeline to strip/mask matching attribute keys/patterns before the export stage runs.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">27.</span>How does the Collector support Prometheus specifically?</p><p class="a">Via the <code>prometheus</code> receiver (scrapes existing Prometheus-format endpoints into the OTel pipeline) and the <code>prometheusremotewrite</code> exporter (ships OTel metrics onward to Prometheus/VictoriaMetrics via remote_write).</p></div>
+          <div class="qa"><p class="q"><span class="qnum">28.</span>What's the "Contrib" Collector distribution, and why does it matter?</p><p class="a">The Collector core ships a minimal set of components; the community "Contrib" distribution bundles many additional receivers/processors/exporters (cloud vendors, extra protocols) — most real deployments use Contrib or a custom-built distribution rather than core alone.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">29.</span>How do you prevent the Collector itself from becoming a single point of failure?</p><p class="a">Run multiple Collector replicas behind a load balancer (for Gateway-tier Collectors), and configure retry/queueing on exporters so transient backend outages don't drop data.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">30.</span>Scenario: metrics are arriving at your Collector but never reach VictoriaMetrics. Where do you look?</p><p class="a">Check the exporter config (endpoint URL, auth) and the Collector's own internal telemetry/logs for exporter errors — a misconfigured <code>prometheusremotewrite</code> endpoint or a network/firewall block between Collector and VM are the usual causes.</p></div>
+        </div>
+      </details>
+
+      <details class="qa-group">
+        <summary>Traces &amp; context propagation <span class="count">10 questions</span></summary>
+        <div class="qa-body">
+          <div class="qa"><p class="q"><span class="qnum">31.</span>What does a trace waterfall view actually show you?</p><p class="a">Every span in a trace laid out by start time and duration, nested to reflect parent-child relationships — visually surfacing which hop consumed most of the total request time.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">32.</span>What is the W3C Trace Context standard?</p><p class="a">A standardized HTTP header format (<code>traceparent</code>, <code>tracestate</code>) for propagating trace identity across service and vendor boundaries, so different instrumentation libraries/vendors can interoperate on the same trace.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">33.</span>How does async/queue-based messaging (e.g. Kafka) complicate context propagation?</p><p class="a">There's no synchronous request/response to inject headers into; trace context must be attached as message metadata/headers by the producer and explicitly extracted by the consumer, otherwise the trace breaks across the queue boundary.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">34.</span>What is span linking, as opposed to normal parent-child spans?</p><p class="a">A way to associate spans that are causally related but not in a strict parent-child call chain — e.g. linking a batch-processing span to each of the individual request spans that fed into that batch.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">35.</span>Why is a single trace ID valuable even without looking at the full waterfall?</p><p class="a">It's a universal correlation key — you can pivot from a trace ID found in a log line straight to the full trace, or from an error dashboard straight to the exact request that caused it, without manual timestamp/context guessing.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">36.</span>What's an exemplar, and how does it connect metrics to traces?</p><p class="a">A sample trace ID attached to a specific histogram bucket observation in a metric — lets you click from "this latency bucket spiked" directly to one real trace that fell into that bucket, bridging metrics and traces without separate correlation logic.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">37.</span>How would you debug "my trace is missing spans from Service C" ?</p><p class="a">Check whether Service C is instrumented at all, whether it's actually receiving propagated context (not just generating its own root traces), and whether its Collector/exporter pipeline is successfully delivering to the same backend the rest of the trace lands in.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">38.</span>What's the performance overhead concern with tracing, and how is it typically managed?</p><p class="a">Creating/exporting spans on every request adds CPU/memory/network overhead; managed via sampling (don't trace 100% of low-value traffic), batching exports, and running the SDK's export path asynchronously off the request's critical path.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">39.</span>Can traces alone tell you a service is failing its SLO?</p><p class="a">Not efficiently on their own — traces are great for deep-diving individual requests but expensive to aggregate at scale for "what % of all requests met the SLO"; that's what metrics (often derived from the same instrumentation) are for.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">40.</span>Scenario: a customer reports one specific slow request. What's the fastest path from their report to a root cause using this stack?</p><p class="a">Get the trace ID (from a response header or correlated log line), pull that exact trace from the tracing backend, read the waterfall to see which span/service ate the time, then cross-reference that service's own metrics/logs around that timestamp for more detail.</p></div>
+        </div>
+      </details>
+
+      <details class="qa-group">
+        <summary>Scenario-based <span class="count">10 questions</span></summary>
+        <div class="qa-body">
+          <div class="qa"><p class="q"><span class="qnum">41.</span>Your org has 40 microservices in 4 languages, currently with no unified tracing. Where do you start?</p><p class="a">Roll out OTel auto-instrumentation language-by-language for the highest-traffic/most-critical services first, standardize on OTLP export to a shared Collector, and ensure context propagation works across every service-to-service call path before worrying about full coverage.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">42.</span>Leadership is worried about tracing costs at 100% sampling. What's your recommendation?</p><p class="a">Move to tail-based sampling at a Gateway Collector — keep 100% of error/slow traces and a small percentage of normal ones, which preserves the traces that matter most while cutting storage/ingestion cost dramatically.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">43.</span>A service team wants to switch from Jaeger to a commercial APM vendor. What does the OTel adoption save them here?</p><p class="a">Because instrumentation talks OTLP through a vendor-neutral Collector, switching backends is a Collector exporter config change, not a re-instrumentation project across every service's codebase.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">44.</span>How would you use OpenTelemetry to feed both Prometheus-style dashboards and a tracing UI from the same instrumentation?</p><p class="a">Instrument once with the OTel SDK emitting both metrics and traces; route metrics through the Collector's <code>prometheusremotewrite</code> exporter into VictoriaMetrics, and traces through an OTLP exporter into Jaeger/Tempo — one instrumentation investment, two backends.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">45.</span>A new engineer asks why their manually-added span never shows a parent, always appearing as a new root trace. What's likely wrong?</p><p class="a">They probably started the span without extracting/attaching the incoming request's context first (e.g. missed context propagation setup for their framework), so the SDK has no parent context to attach to and starts a fresh trace.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">46.</span>Your Collector's memory usage spikes and it starts dropping data under load. What's your fix?</p><p class="a">Add/tune the <code>memory_limiter</code> processor to shed load gracefully before OOM, scale out with more Collector replicas behind a load balancer, and check whether batch sizes/queue depths are set too aggressively for the traffic volume.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">47.</span>How would you explain to a skeptical engineer why they should adopt OpenTelemetry instead of their cloud vendor's proprietary agent?</p><p class="a">Vendor neutrality avoids lock-in and lets you change backends without re-instrumenting; it's also become the industry-standard spec most tools now support natively, so it's rarely a dead-end choice.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">48.</span>A batch ETL job runs for 3 hours. Should it be represented as one giant span?</p><p class="a">Generally no — break it into meaningful child spans per stage/chunk (extract, transform, load) so the waterfall is actually useful; one giant span with no internal structure gives you duration but no diagnostic value.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">49.</span>How does OpenTelemetry fit into a Kubernetes environment specifically?</p><p class="a">Typically deployed as a Collector DaemonSet (per-node agent tier) forwarding to a central Collector Deployment (gateway tier), with the Kubernetes attributes processor auto-enriching telemetry with pod/namespace/node metadata.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">50.</span>Scenario: two teams instrument the same shared library differently, producing inconsistent attribute names for the same concept. What should have prevented this?</p><p class="a">Adopting OpenTelemetry semantic conventions from the start — a shared, documented naming standard for common attributes exists precisely to prevent this kind of fragmentation across teams.</p></div>
+        </div>
+      </details>
+    </div>
+
+    <h3 class="subhead"><span class="tag tag-resource">Resources</span> Free material for today</h3>
+    <div class="resources">
+      <div class="res-card"><div class="k">Docs</div><div class="t">opentelemetry.io — official docs + Demo app</div><p class="d">The official "OpenTelemetry Demo" is a free, full microservices app pre-instrumented end-to-end — clone and explore real traces immediately.</p></div>
+      <div class="res-card"><div class="k">Interactive</div><div class="t">OTel Collector Contrib repo + example configs</div><p class="d">Browse real receiver/processor/exporter configs on GitHub to see production pipeline patterns.</p></div>
+      <div class="res-card"><div class="k">Backend</div><div class="t">Jaeger all-in-one (free, docker)</div><p class="d">The fastest free way to see real trace waterfalls: <code>docker run jaegertracing/all-in-one</code>, point your Collector's OTLP exporter at it.</p></div>
+      <div class="res-card"><div class="k">Video</div><div class="t">CNCF OpenTelemetry YouTube channel</div><p class="d">Free conference talks covering Collector architecture, sampling strategies, and real adoption case studies.</p></div>
+    </div>
+  </section>
+
+  <!-- ============================================================ DAY 5 ============================================================ -->
+  <section class="day" id="day5">
+    <div class="day-tag"><span class="day-num">DAY 5 · 4H</span></div>
+    <h2 class="display">Integration, Production Practice &amp; Capstone</h2>
+    <div class="day-meta">Goal: wire all three tools into one coherent pipeline, internalize production best practices, and ship a working capstone.</div>
+
+    <h3 class="subhead"><span class="tag tag-concept">Concepts</span> The full stack, end to end</h3>
+    <div class="concept">
+      <p>Here's the pipeline you've been building toward all week: your application, instrumented with the <strong>OpenTelemetry SDK</strong>, emits metrics and traces via <strong>OTLP</strong> to an <strong>OTel Collector</strong>. The Collector's pipeline splits the signals — metrics go out via <code class="mono">prometheusremotewrite</code> into <strong>VictoriaMetrics</strong>, traces go out via OTLP into a tracing backend (Jaeger/Tempo). <strong>Grafana</strong> sits on top querying both, and — the key integration trick — <strong>exemplars</strong> let you click from a latency spike on a VictoriaMetrics-backed graph straight into the exact trace that caused it.</p>
+      <p>This is the realistic architecture most interviewers and real production systems converge on: Prometheus's data model as the lingua franca for metrics, OpenTelemetry as the universal instrumentation/transport layer, and VictoriaMetrics as the scalable place metrics actually live.</p>
+    </div>
+
+    <h3 class="subhead"><span class="tag tag-concept">Concepts</span> Correlating metrics, logs, and traces</h3>
+    <div class="concept">
+      <p>The whole point of running all three signal types is <strong>correlation</strong> — the ability to pivot from any one of them to the others for the same incident, in seconds:</p>
+      <ul>
+        <li><strong>Metric → Trace</strong>: an exemplar on a histogram bucket links straight to a real trace ID that fell in that bucket.</li>
+        <li><strong>Trace → Log</strong>: if your logging includes the trace ID (structured logging with OTel context), you can jump from a span to every log line emitted during it.</li>
+        <li><strong>Log → Metric</strong>: seeing a burst of a specific error message in logs, then checking whether the corresponding error-rate metric/alert fired at the same timestamp.</li>
+      </ul>
+      <p>Without shared identifiers (trace ID as the universal key), engineers are stuck manually correlating by timestamp across three different UIs — slow and error-prone during an incident.</p>
+    </div>
+
+    <h3 class="subhead"><span class="tag tag-visual">Visual</span> The complete observability pipeline</h3>
+    <div class="diagram">
+      <div class="dstack">
+        <div class="dflow">
+          <div class="dbox">Application<span class="sub">OTel SDK</span></div>
+          <div class="darrow">──▶</div>
+          <div class="dbox violet">OTel Collector<span class="sub">receive · process · fan-out</span></div>
+        </div>
+        <div class="dflow" style="padding-left:60px;">
+          <div class="darrow" style="transform:rotate(90deg); padding:0;">──▶</div>
+        </div>
+        <div class="dflow">
+          <div class="dbox teal">VictoriaMetrics<span class="sub">metrics + exemplars</span></div>
+          <div class="darrow">‹──›</div>
+          <div class="dbox">Jaeger / Tempo<span class="sub">traces</span></div>
+        </div>
+        <div class="dflow" style="justify-content:center;">
+          <div class="darrow" style="transform:rotate(90deg);">──▶</div>
+        </div>
+        <div class="dflow" style="justify-content:center;">
+          <div class="dbox amber">Grafana<span class="sub">dashboards · click-through exemplars · alerting</span></div>
+        </div>
+      </div>
+      <div class="cap">One instrumentation source, one Collector, two specialized backends, one pane of glass — and a dotted "‹──›" link representing exemplar-based click-through between the metrics store and the trace store.</div>
+    </div>
+
+    <h3 class="subhead"><span class="tag tag-concept">Concepts</span> Production best practices — the last 20%</h3>
+    <div class="concept">
+      <ul>
+        <li><strong>Design for cardinality from day one</strong> — review every new label/attribute for unbounded values before it ships, not after the metrics backend falls over.</li>
+        <li><strong>Alert on symptoms, not causes</strong> — user-facing SLIs (error rate, latency) over infrastructure internals (CPU%) whenever both are available.</li>
+        <li><strong>Sample traces intelligently</strong> — tail-based sampling to keep the interesting (slow/error) traces without paying to store everything.</li>
+        <li><strong>Treat your observability stack as a production service</strong> — it needs its own uptime, SLOs, and on-call, because when it's down, you're blind exactly when you need it most.</li>
+        <li><strong>Keep instrumentation vendor-neutral</strong> — OTel's whole value proposition collapses if you couple business code directly to one vendor's proprietary SDK anyway.</li>
+      </ul>
+    </div>
+
+    <h3 class="subhead"><span class="tag tag-practice">Practice</span> Capstone: a full docker-compose observability stack</h3>
+    <div class="example">
+      <p class="scenario">Scenario: stand up the entire pipeline locally in one command, generate real traffic, and see a metric spike click through to its trace.</p>
+      <pre class="mono"># docker-compose.yml (abridged — full version in the OTel Demo repo)
+services:
+  app:
+    build: ./demo-app          # your instrumented service
+    environment:
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+    depends_on: [otel-collector]
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib
+    volumes: ["./collector-config.yaml:/etc/otelcol/config.yaml"]
+    ports: ["4317:4317"]
+
+  victoriametrics:
+    image: victoriametrics/victoria-metrics
+    ports: ["8428:8428"]
+
+  jaeger:
+    image: jaegertracing/all-in-one
+    ports: ["16686:16686"]
+
+  grafana:
+    image: grafana/grafana
+    ports: ["3000:3000"]
+    depends_on: [victoriametrics, jaeger]
+
+# Capstone checklist:
+# [ ] docker-compose up, generate load against /app
+# [ ] Grafana data source: VictoriaMetrics (Prometheus-type) + Jaeger
+# [ ] Build one dashboard panel with RED metrics for the app
+# [ ] Enable exemplars on that panel; click one to jump into Jaeger
+# [ ] Write one alerting rule (vmalert) for error rate > 5%
+# [ ] Trigger the alert on purpose and watch it route through Alertmanager</pre>
+    </div>
+
+    <div class="milestone">
+      <div class="eyebrow">End-of-week milestone</div>
+      <p>You've run the entire pipeline end-to-end on your own machine, clicked from a metric spike into a real trace, and written a working alert. That's the complete 80% — you're ready for both the interview and the pager.</p>
+    </div>
+
+    <h3 class="subhead"><span class="tag tag-interview">Interview Prep</span> 50 questions — Integration &amp; production practice</h3>
+    <div class="qa-groups">
+
+      <details class="qa-group">
+        <summary>SLI/SLO/error budgets <span class="count">10 questions</span></summary>
+        <div class="qa-body">
+          <div class="qa"><p class="q"><span class="qnum">1.</span>Walk through defining an SLO for a checkout API from scratch.</p><p class="a">Pick a user-facing SLI (e.g. % of requests completing under 500ms with a 2xx status), set a target over a rolling window (99.5% over 30 days), instrument it via a histogram metric, then alert on burn rate against the resulting error budget.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">2.</span>Why use a rolling window instead of a fixed calendar month for SLOs?</p><p class="a">A rolling window (e.g. trailing 30 days) avoids the "reset to zero on the 1st" cliff where a bad incident on day 29 barely affects the metric before it resets — it gives a continuously meaningful reliability signal.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">3.</span>What should happen operationally when an error budget is exhausted?</p><p class="a">Convention (not enforced by tooling) is to slow down risky releases and prioritize reliability work until the budget recovers — it's a policy/culture practice, not something Prometheus enforces automatically.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">4.</span>How do you pick which endpoints deserve an SLO versus which don't?</p><p class="a">Prioritize by user impact/business criticality — a checkout API needs one; an internal admin report endpoint usually doesn't, since not every service justifies the SLO tracking overhead.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">5.</span>Can traces contribute to an SLI directly?</p><p class="a">Rarely as the primary source (too expensive to aggregate at scale) — but they're invaluable for diagnosing *why* an SLO is being missed once the metric-based SLI has already flagged the problem.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">6.</span>What's the risk of setting an SLO target that's stricter than what your architecture can realistically deliver?</p><p class="a">Chronic, unfixable alert noise and a permanently "red" error budget that teams learn to ignore — undermining the entire point of having the SLO as a decision-making tool.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">7.</span>How would dependencies (a third-party payment API) factor into your service's SLO?</p><p class="a">Either exclude failures clearly attributable to the dependency from your own SLI (with proper labeling to separate them), or set your SLO realistically below 100% to account for known dependency risk — and track the dependency's own reliability separately.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">8.</span>What's the relationship between SLOs and capacity planning?</p><p class="a">SLO latency/error trends over time (stored durably in VictoriaMetrics) show creeping degradation before it becomes an outage, informing when to scale infrastructure ahead of breaching the target.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">9.</span>How do you communicate SLO status to non-technical stakeholders?</p><p class="a">A simple dashboard panel showing "budget remaining" as a percentage or days-left figure, rather than raw PromQL/latency numbers — translate the technical metric into a business-relevant number.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">10.</span>Scenario: your SLO dashboard shows 100% budget remaining, but customers are complaining about slowness. What's wrong?</p><p class="a">Likely the SLI doesn't actually reflect the user-experienced path — e.g. it measures backend-only latency while the complaint is about a slow frontend asset or third-party script; the SLI definition needs to be revisited to match real user experience.</p></div>
+        </div>
+      </details>
+
+      <details class="qa-group">
+        <summary>Correlation &amp; exemplars <span class="count">10 questions</span></summary>
+        <div class="qa-body">
+          <div class="qa"><p class="q"><span class="qnum">11.</span>What is an exemplar, concretely, in a Prometheus/VictoriaMetrics histogram?</p><p class="a">A trace ID (plus timestamp/value) attached to one specific observation within a histogram bucket, exposed alongside the regular metric data so a UI can offer "view trace" on that data point.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">12.</span>Does vanilla Prometheus support exemplars, or is this VictoriaMetrics/OTel-specific?</p><p class="a">Prometheus added native exemplar support (an experimental/opt-in feature); it's not exclusive to VictoriaMetrics, but VM also supports storing/serving them — either way it depends on the OTel SDK/instrumentation actually attaching exemplars to metric writes.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">13.</span>How do you correlate a trace with logs if your logging library doesn't know about OpenTelemetry?</p><p class="a">You generally can't automatically — you need the logging integration to inject the active trace ID/span ID into each log line's structured fields, which usually requires an OTel logging bridge/instrumentation for that language.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">14.</span>Why is timestamp-only correlation across metrics/logs/traces unreliable during an incident?</p><p class="a">Clock skew across hosts, multiple concurrent requests in the same second, and coarse metric granularity all make "same rough time" a weak signal compared to an exact shared trace ID.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">15.</span>How does Grafana typically implement exemplar click-through?</p><p class="a">The data source (Prometheus/VictoriaMetrics) returns exemplar trace IDs alongside query results; Grafana renders them as clickable dots on the graph that deep-link into a configured tracing data source (Jaeger/Tempo) using that trace ID.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">16.</span>What's the tradeoff of storing exemplars at high volume?</p><p class="a">Extra storage/ingestion overhead per sample; most systems cap the number of exemplars retained per time window/bucket rather than keeping one for every single observation.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">17.</span>How would correlation IDs work for an async, queue-based workflow rather than a synchronous HTTP chain?</p><p class="a">The trace context must be explicitly propagated as message metadata by the producer and extracted by the consumer (OTel messaging semantic conventions cover this), otherwise the async hop breaks the correlation chain.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">18.</span>Why does correlation matter more as microservice count grows?</p><p class="a">With more services, a single user request touches more independent logs/metrics streams; manual correlation across dozens of services by hand becomes practically impossible without a shared trace ID to pivot on.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">19.</span>What's a practical first step for a team with metrics and logs, but no traces yet?</p><p class="a">Add OTel auto-instrumentation for tracing to the highest-traffic service first, ensure trace IDs get into that service's structured logs, and prove the click-through value before expanding to more services.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">20.</span>Scenario: an exemplar link takes you to a trace, but that trace shows no error and normal duration. Why might the metric still have spiked?</p><p class="a">The exemplar is just one sample representative of a bucket, not necessarily the worst one — the bucket could have been populated mostly by other, unsampled/unlinked requests; check a broader trace search around the same timestamp rather than relying on one exemplar alone.</p></div>
+        </div>
+      </details>
+
+      <details class="qa-group">
+        <summary>Production ops &amp; cardinality <span class="count">10 questions</span></summary>
+        <div class="qa-body">
+          <div class="qa"><p class="q"><span class="qnum">21.</span>What's a practical cardinality budget/review process for a growing engineering org?</p><p class="a">Require new metric labels to go through a lightweight review (linting or PR checklist) checking for unbounded values before merge, plus ongoing dashboards tracking total active series growth by team/service.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">22.</span>How would you retrofit cardinality controls onto an existing, already-out-of-control metrics setup?</p><p class="a">Identify top offenders via cardinality-explorer tooling, apply <code>metric_relabel_configs</code>/Collector processors to drop or aggregate the worst labels, then add ongoing monitoring/alerting on series growth to prevent recurrence.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">23.</span>What's the operational cost of running your observability stack itself, and how do you monitor it?</p><p class="a">Compute/storage for VictoriaMetrics, Collector, tracing backend, plus their own failure modes; monitor them like any other production service — their own RED/USE metrics, uptime SLOs, and dedicated alerting, ideally on infrastructure independent enough to still page you if the primary stack is down.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">24.</span>How do you avoid a circular dependency where your alerting system depends on the same infrastructure it's meant to alert about?</p><p class="a">Run the observability/alerting stack in a separate failure domain (different cluster/region/account) from the services it monitors, or use a secondary lightweight external check (e.g. a simple uptime prober) as a fallback.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">25.</span>What's a sane retention strategy across metrics, logs, and traces given their different costs?</p><p class="a">Metrics (cheap, compress well): months to years. Traces (moderate, but sampled): weeks to a couple months. Logs (most expensive at full volume): days to weeks for full-fidelity, longer only for filtered/sampled/aggregated subsets.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">26.</span>How do you handle a metrics backend outage without losing all visibility?</p><p class="a">Buffering/retry at the collection layer (vmagent/Collector queue telemetry briefly during a backend blip), redundant collectors/backends for critical paths, and a lightweight independent health-check/paging path that doesn't depend on the full stack.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">27.</span>What's a red flag during a system design interview about someone's proposed metrics architecture?</p><p class="a">No mention of cardinality control, no retention/scaling story past a single Prometheus node, or metrics/traces/logs treated as entirely separate systems with no shared correlation strategy.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">28.</span>How would you roll out this whole stack to a team with zero observability today, in priority order?</p><p class="a">1) Basic RED metrics via Prometheus/exporters for the top user-facing services, 2) Alerting on symptom-based SLIs, 3) OTel tracing on the highest-value paths, 4) VictoriaMetrics for durable storage once volume justifies it, 5) correlation/exemplars once all three signals exist.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">29.</span>What's the danger of adopting all three tools (Prometheus, VictoriaMetrics, OTel) at once versus incrementally?</p><p class="a">High complexity and low near-term payoff before any single piece delivers value — teams that try to build the "perfect" full stack before shipping anything often stall; incremental adoption (start with basic metrics, add tracing, add scale later) delivers value sooner.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">30.</span>Scenario: after adding OTel tracing fleet-wide, overall service latency measurably increased. What do you investigate?</p><p class="a">Whether sampling is too aggressive (100% head-based tracing adding real overhead), whether span export is blocking the request path instead of async/batched, and whether the Collector/network hop itself is adding latency under load.</p></div>
+        </div>
+      </details>
+
+      <details class="qa-group">
+        <summary>Architecture decisions <span class="count">10 questions</span></summary>
+        <div class="qa-body">
+          <div class="qa"><p class="q"><span class="qnum">31.</span>Design the observability stack for a 5-service startup vs. a 500-service enterprise. What differs?</p><p class="a">Startup: single-node Prometheus/VictoriaMetrics, minimal sampling, simple Alertmanager routing, maybe skip full tracing initially. Enterprise: cluster-mode VictoriaMetrics, tail-based sampling at a Gateway Collector tier, multi-team routing/ownership, strict cardinality governance, and likely federated/multi-region deployment.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">32.</span>When would you choose to skip OpenTelemetry and just use Prometheus client libraries directly?</p><p class="a">If you truly only ever need metrics (no tracing/logs unification ambition) and want the simplest possible setup — OTel's value is largest when you need traces and cross-signal correlation, which plain Prometheus client libraries don't provide.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">33.</span>Why place the OTel Collector between apps and VictoriaMetrics instead of having each app remote_write directly?</p><p class="a">Centralizes processing (batching, filtering, redaction), decouples app code from the specific backend, and lets you change/add backends without touching application deployments.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">34.</span>How do you decide between running vmagent vs. full Prometheus as your scraper in front of VictoriaMetrics?</p><p class="a">Choose vmagent for lean, horizontally-scaled pure scrape-and-forward roles; keep full Prometheus where you still want local short-term querying/alerting independent of the central VM store (e.g. for local debugging during a VM outage).</p></div>
+          <div class="qa"><p class="q"><span class="qnum">35.</span>What single architectural decision most affects your ability to debug a 3am incident, across everything covered this week?</p><p class="a">Whether trace context (and thus correlation) is propagated consistently across every service hop — without it, every other tool (dashboards, logs) leaves you manually stitching together the story instead of following one trace ID straight to the cause.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">36.</span>How would multi-region deployment change your metrics/tracing architecture?</p><p class="a">Typically per-region collection (Collector/VictoriaMetrics per region) to avoid cross-region latency in the hot path, with a global query layer (federation, or a global VM cluster/view) for cross-region dashboards and incident correlation.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">37.</span>What's the argument for keeping metrics in Prometheus's data model even if you eventually adopt a fully OTel-native pipeline?</p><p class="a">The Prometheus data model (labels + PromQL) is the de facto industry standard with the widest tooling/dashboard/alerting ecosystem — OTel metrics map cleanly onto it, so there's little reason to abandon it even when OTel handles collection/transport.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">38.</span>How would you present a cost-benefit case for adopting VictoriaMetrics cluster mode to a budget-conscious VP?</p><p class="a">Frame it around avoided cost of a metrics outage/data loss at current growth trajectory, compression-driven infra savings versus current storage spend, and the operational time saved versus building/maintaining a bespoke scaling workaround on vanilla Prometheus.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">39.</span>What's a common mistake teams make when they treat "adding OpenTelemetry" as equivalent to "having observability"?</p><p class="a">Instrumenting everything but never defining SLIs/SLOs, alerting policy, or a correlation workflow — telemetry without a plan for how it drives decisions and incident response doesn't actually improve MTTR on its own.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">40.</span>If you had to cut one of metrics, logs, or traces for a resource-constrained team, which would you keep and why?</p><p class="a">Metrics — they're cheapest to store/query at scale and directly answer "is something wrong right now and how bad," which covers the majority of day-to-day operational needs even without deep root-cause detail.</p></div>
+        </div>
+      </details>
+
+      <details class="qa-group">
+        <summary>Scenario / capstone-style <span class="count">10 questions</span></summary>
+        <div class="qa-body">
+          <div class="qa"><p class="q"><span class="qnum">41.</span>Walk me through what happens, system by system, from a user clicking "checkout" to an engineer seeing an alert and finding the root cause.</p><p class="a">App's OTel SDK starts a trace and records metrics on the request → both flow via OTLP to the Collector → metrics route to VictoriaMetrics (with an exemplar linking to the trace), traces route to Jaeger → a vmalert rule detects the error-rate SLI breach and fires → Alertmanager routes it to the on-call Slack channel → engineer opens the linked Grafana dashboard, clicks an exemplar dot, lands directly on the offending trace, and sees which downstream span is slow/erroring.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">42.</span>Your capstone dashboard's error-rate panel is flat at zero even though you can see 500s in the app logs. Debug it.</p><p class="a">Check whether the app's OTel metrics instrumentation actually records status code as an attribute/label distinguishing success/failure, whether the Collector's metrics pipeline (not just traces) is correctly configured and exporting, and whether the PromQL/MetricsQL query filters on the right label values.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">43.</span>How would you extend the capstone stack to add log correlation as a fourth pillar?</p><p class="a">Add a logging backend (e.g. Loki), configure the app/OTel logging bridge to inject trace ID into structured log output, add a Loki data source in Grafana, and enable Grafana's trace-to-logs / logs-to-trace linking using that shared trace ID.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">44.</span>Your vmalert rule never fires even though you can visually see the error rate spike on the dashboard. Why?</p><p class="a">Likely the alerting rule expression, label selectors, or <code>for:</code> duration don't match reality — check that vmalert is actually loaded with that rule group, evaluating against the right VictoriaMetrics endpoint, and that the expression matches exactly what the dashboard panel queries.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">45.</span>How would you demonstrate to an interviewer that you understand the "why," not just the "how," of this stack?</p><p class="a">Explain the pipeline in terms of the problems each piece solves (Prometheus: pull-based metrics + PromQL; VictoriaMetrics: Prometheus's scale/retention gap; OTel: vendor-neutral instrumentation and cross-signal correlation) rather than reciting component names — tie every tool back to an operational pain it removes.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">46.</span>What would you add next if given one more week beyond this plan?</p><p class="a">Tail-based sampling at a Gateway Collector, log correlation via Loki/trace ID injection, a proper multi-window multi-burn-rate SLO alert, and load-testing the stack itself to validate it holds up under realistic production traffic.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">47.</span>How do you validate that your alerting actually works, beyond "the config looks right"?</p><p class="a">Deliberately trigger the condition (e.g. inject synthetic errors) in a test environment and confirm the full path fires end-to-end: rule evaluates → Alertmanager receives → notification actually lands in Slack/PagerDuty.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">48.</span>What's the single highest-leverage habit from this whole week to carry into a real job?</p><p class="a">Reviewing new metric labels/attributes for cardinality risk before they ship — it's the cheapest possible prevention for the most common way observability stacks fail in production.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">49.</span>How would you pitch this 20-hour plan's worth to a manager deciding whether to invest team training time in it?</p><p class="a">It covers the exact stack (Prometheus data model, VictoriaMetrics scale story, OTel instrumentation) that underlies the large majority of modern observability job postings and real incident-response workflows — a high return for a bounded, five-day investment.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">50.</span>You're asked in an interview to design observability for a brand-new system with no telemetry at all. What's your one-sentence answer?</p><p class="a">Instrument with OpenTelemetry from day one for vendor-neutral traces/metrics, store metrics in a Prometheus-compatible backend like VictoriaMetrics for scale and longevity, define symptom-based SLOs before writing a single alert, and treat cardinality discipline as a first-class design constraint, not an afterthought.</p></div>
+        </div>
+      </details>
+    </div>
+
+    <h3 class="subhead"><span class="tag tag-resource">Resources</span> Free material for today</h3>
+    <div class="resources">
+      <div class="res-card"><div class="k">Project</div><div class="t">OpenTelemetry Demo (official)</div><p class="d">A free, fully pre-built polyglot microservices app with traces/metrics/logs wired in — the fastest way to see the whole pipeline working together.</p></div>
+      <div class="res-card"><div class="k">Reference</div><div class="t">Grafana docs — Exemplars</div><p class="d">Free official docs on configuring exemplar click-through between a Prometheus-compatible source and a tracing backend.</p></div>
+      <div class="res-card"><div class="k">Reading</div><div class="t">Google SRE Book (free online) — full text</div><p class="d">The canonical source for SLOs, error budgets, and alerting philosophy referenced throughout this week.</p></div>
+      <div class="res-card"><div class="k">Practice</div><div class="t">Rebuild the capstone from scratch, no notes</div><p class="d">The single best retention exercise: redo Day 5's docker-compose stack tomorrow from memory before checking back.</p></div>
+    </div>
+  </section>
+
+  <footer class="end">
+    Five days, twenty hours, one coherent mental model: Prometheus's data model as the language, OpenTelemetry as the universal instrumentation layer, VictoriaMetrics as the place it all durably lives. Everything else — dashboards, vendors, specific query syntax — is detail you can look up. The model is what gets you through both the interview and the 3am page.
+  </footer>
+
+</main>
+</div>
+</body>
+</html>

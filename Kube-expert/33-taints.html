@@ -1,0 +1,300 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Topic 33: Taints — Kubernetes Expert Course</title>
+<link rel="stylesheet" href="styles.css">
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+</head>
+<body>
+
+<header class="course-header">
+  <div class="kicker">Topic 33 of 70</div>
+  <h1>Taints</h1>
+  <div class="subtitle">Node-side repellents that keep pods away unless they explicitly tolerate them.</div>
+</header>
+
+<nav class="topic-nav">
+  <a href="32-anti-affinity.html">&larr; Anti-Affinity</a>
+  <a href="index.html">Course Index</a>
+  <a href="34-tolerations.html">Tolerations &rarr;</a>
+</nav>
+
+<h2 id="explanation">Explanation</h2>
+<p>A <strong>taint</strong> is a property applied to a <em>node</em> (not a Pod) that repels Pods from scheduling onto
+it unless the Pod carries a matching <strong>toleration</strong>. Where affinity/anti-affinity are Pod-side
+preferences, taints are the node's way of saying "I don't want to run arbitrary workloads — only Pods that have
+explicitly agreed to tolerate my condition." This inverts the usual relationship: instead of every Pod having to know
+about every special node, the node advertises a taint once, and only Pods that opt in via a toleration can land there.</p>
+
+<p>Kubernetes needs taints because clusters are rarely homogeneous. Some nodes have GPUs and should only run ML
+workloads; some nodes are being drained for maintenance and should run nothing new; some nodes are dedicated to a
+particular team or workload class for cost-allocation or compliance reasons; and some nodes are simply unhealthy and
+must repel all pods immediately. Taints give the platform team a first-class, declarative mechanism for all of these
+cases without touching every Deployment's affinity rules.</p>
+
+<p>A taint has three parts: <code>key</code>, <code>value</code>, and <code>effect</code>. The effect determines the
+severity of the repulsion:</p>
+<ul>
+  <li><strong>NoSchedule</strong> — the Scheduler will not place new Pods here, but existing Pods already running are left alone.</li>
+  <li><strong>PreferNoSchedule</strong> — a soft version; the Scheduler tries to avoid the node but will use it if there's no better option.</li>
+  <li><strong>NoExecute</strong> — the strongest effect: new Pods are not scheduled, <em>and existing Pods without a matching toleration are evicted</em>. This is also what Kubernetes uses automatically for node health conditions (e.g. <code>node.kubernetes.io/not-ready</code>, <code>node.kubernetes.io/unreachable</code>).</li>
+</ul>
+
+<p>Taints and tolerations exist as a pair by design — a taint alone can't be "matched," it needs a Pod's toleration to
+cancel it out for that specific Pod. This is deliberately asymmetric to node affinity's <code>nodeSelector</code>/
+<code>requiredDuringScheduling</code>, which is Pod-driven attraction; taints are node-driven repulsion, and the two
+mechanisms are often combined: taint the GPU nodes so only GPU-workload Pods (which tolerate the taint <em>and</em>
+have a node affinity/selector pulling them there) can land.</p>
+
+<p>In production, the most common taint pattern is <strong>node dedication</strong>: taint a pool of nodes with
+<code>dedicated=ml:NoSchedule</code>, then only Pods carrying the matching toleration plus a node affinity/selector for
+that pool will actually run there — the taint keeps everyone else out, the affinity pulls the intended workload in.
+Control-plane nodes in kubeadm clusters are tainted with <code>node-role.kubernetes.io/control-plane:NoSchedule</code>
+by default for exactly this reason: keep untrusted workloads off the machines running etcd and the API Server.</p>
+
+<div class="callout warn">
+  <strong>NoExecute is destructive by default.</strong> A NoExecute taint without a <code>tolerationSeconds</code>
+  escape hatch on the Pod evicts it immediately. Kubernetes itself relies on this for the built-in
+  <code>not-ready</code>/<code>unreachable</code> taints — which is exactly how Pods get rescheduled off a node that
+  just went offline.
+</div>
+
+<h2 id="internal-working">Internal Working / Interactions</h2>
+<ul>
+  <li><strong>Node Controller (Controller Manager):</strong> automatically adds/removes built-in taints like <code>node.kubernetes.io/not-ready</code> and <code>node.kubernetes.io/unreachable</code> based on node heartbeat status — this is the automatic self-healing path.</li>
+  <li><strong>API Server:</strong> stores taints as part of the Node object's <code>spec.taints</code> array; kubectl taint is just a PATCH against this field.</li>
+  <li><strong>Scheduler:</strong> the <code>TaintToleration</code> plugin runs during Filter (for NoSchedule) and Score (for PreferNoSchedule) to decide eligibility; it never overrides a hard taint mismatch.</li>
+  <li><strong>kubelet:</strong> when a NoExecute taint appears on its node (or the node condition changes), the kubelet (via the API Server-driven eviction controller) starts a timer per Pod based on that Pod's <code>tolerationSeconds</code>, then terminates the Pod locally when the timer expires.</li>
+  <li><strong>etcd:</strong> holds the current taint list as part of the Node object, watched by both Scheduler and Controller Manager.</li>
+</ul>
+
+<h2 id="architecture-diagram">Architecture Diagram</h2>
+<pre class="mermaid">
+flowchart TB
+    subgraph Node_GPU["Node: gpu-pool-1 (tainted dedicated=ml:NoSchedule)"]
+        direction TB
+    end
+    subgraph Node_Std["Node: standard-pool-1 (no taint)"]
+        direction TB
+    end
+
+    P1["Pod: ml-training (toleration: dedicated=ml)"] -->|"Toleration matches taint"| Node_GPU
+    P2["Pod: web-frontend (no toleration)"] -.->|"Filtered out - taint blocks"| Node_GPU
+    P2 -->|"Schedules normally"| Node_Std
+</pre>
+
+<pre class="mermaid">
+stateDiagram-v2
+    [*] --> Healthy: Node joins cluster
+    Healthy --> NotReadyTainted: Missed heartbeats\n(node.kubernetes.io/not-ready:NoExecute auto-applied)
+    NotReadyTainted --> EvictionTimerRunning: Per-pod tolerationSeconds countdown starts
+    EvictionTimerRunning --> PodEvicted: Timer expires, no matching toleration
+    EvictionTimerRunning --> PodStays: Pod tolerates indefinitely (tolerationSeconds unset + Exists)
+    NotReadyTainted --> Healthy: Node recovers, taint removed
+    PodEvicted --> [*]
+</pre>
+
+<h2 id="code-example">Code Example</h2>
+<pre><code># Applying a taint to a node (imperative — taints are node-level, not a YAML resource type
+# you create standalone; they live under Node.spec.taints)
+# kubectl taint nodes gpu-node-1 dedicated=ml:NoSchedule
+
+# Equivalent declarative view of the resulting Node object (read-only status you'd see via
+# `kubectl get node gpu-node-1 -o yaml`):
+apiVersion: v1
+kind: Node
+metadata:
+  name: gpu-node-1
+spec:
+  taints:
+    - key: "dedicated"        # arbitrary key identifying the reason for the taint
+      value: "ml"             # arbitrary value, must match toleration's value for Equal operator
+      effect: "NoSchedule"    # repels new pods; existing pods on this node are unaffected
+</code></pre>
+
+<pre><code>apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: control-plane-critical-addon
+  namespace: kube-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: critical-addon }
+  template:
+    metadata:
+      labels: { app: critical-addon }
+    spec:
+      # Explicitly tolerate the built-in control-plane taint so this addon can run there
+      # (common for CNI plugins, kube-proxy, and other node-critical DaemonSets).
+      tolerations:
+        - key: "node-role.kubernetes.io/control-plane"
+          operator: "Exists"     # matches any value for this key
+          effect: "NoSchedule"
+        - key: "node.kubernetes.io/not-ready"
+          operator: "Exists"
+          effect: "NoExecute"
+          tolerationSeconds: 300   # stay for 5 min after node goes NotReady before evicting
+      containers:
+        - name: addon
+          image: registry.internal/critical-addon:1.0
+</code></pre>
+
+<h2 id="kubectl-commands">kubectl Commands</h2>
+<pre><code># Add a taint imperatively
+kubectl taint nodes gpu-node-1 dedicated=ml:NoSchedule
+
+# Remove a taint (note the trailing minus sign)
+kubectl taint nodes gpu-node-1 dedicated=ml:NoSchedule-
+
+# List all taints across all nodes
+kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.taints}{"\n"}{end}'
+
+# See the built-in control-plane taint
+kubectl describe node <control-plane-node-name> | grep Taints
+
+# Check whether a specific pod would be affected by a taint (look at Events on describe)
+kubectl describe pod <pod-name> | grep -A5 Events
+
+# View default cluster taints (e.g. node.kubernetes.io/not-ready) live
+kubectl get nodes -o custom-columns=NAME:.metadata.name,TAINTS:.spec.taints
+</code></pre>
+
+<h2 id="best-practices">Best Practices &amp; Common Pitfalls</h2>
+<div class="grid-2">
+<div>
+<h4>Do's</h4>
+<ul>
+  <li>Use taints for node dedication (GPU pools, spot-instance pools, team-specific pools) and pair with matching tolerations plus affinity.</li>
+  <li>Set <code>tolerationSeconds</code> explicitly on latency-sensitive workloads so you control eviction delay rather than relying on defaults.</li>
+  <li>Use <code>PreferNoSchedule</code> for soft guidance (e.g. "prefer not to put general workloads here") vs <code>NoSchedule</code> for hard boundaries.</li>
+  <li>Document every custom taint's purpose — undocumented taints are a common cause of "why won't my pod schedule" tickets.</li>
+</ul>
+</div>
+<div>
+<h4>Don'ts</h4>
+<ul>
+  <li>Don't taint nodes with NoExecute casually — it evicts running workloads immediately, unlike NoSchedule.</li>
+  <li>Don't forget the built-in <code>not-ready</code>/<code>unreachable</code> taints already handle most failure-based eviction — don't duplicate this logic manually.</li>
+  <li>Don't use taints as a security boundary by themselves — they control scheduling, not runtime isolation; combine with NetworkPolicies/RBAC for real isolation.</li>
+  <li>Don't forget to remove taints left over from decommissioned dedication schemes — stale taints silently block scheduling for years.</li>
+</ul>
+</div>
+</div>
+
+<h2 id="interview-questions">50 Interview Questions</h2>
+
+<details class="qa"><summary>1. What is a taint and what does it do?</summary>
+<div class="qa-body"><strong>Short answer:</strong> A property on a Node that repels Pods from scheduling there unless the Pod has a matching toleration.
+<br><strong>Detailed explanation:</strong> Taints invert the usual model — instead of Pods declaring what they want, the node declares what it will refuse, and only Pods that explicitly opt in via a toleration can land.
+<br><strong>Production example:</strong> A GPU node pool tainted <code>dedicated=ml:NoSchedule</code> keeps ordinary web workloads off expensive hardware.
+<br><strong>Common mistake:</strong> Thinking a taint alone routes the intended workload to the node — it only blocks everyone else; affinity is what actually pulls the target workload in.</div></details>
+
+<details class="qa"><summary>2. What are the three taint effects and how do they differ?</summary>
+<div class="qa-body"><strong>Short answer:</strong> NoSchedule (block new Pods only), PreferNoSchedule (soft avoidance), NoExecute (block new Pods and evict existing ones without a matching toleration).
+<br><strong>Detailed explanation:</strong> NoSchedule and PreferNoSchedule only affect the Filter/Score phases at scheduling time; NoExecute is the only effect that acts on already-running Pods, actively evicting them.
+<br><strong>Production example:</strong> Kubernetes automatically applies <code>node.kubernetes.io/not-ready:NoExecute</code> when a node's heartbeats stop, evicting Pods that don't tolerate it.
+<br><strong>Common mistake:</strong> Applying NoExecute casually, not realizing it immediately evicts running workloads unlike NoSchedule.</div></details>
+
+<details class="qa"><summary>3. What are the three parts of a taint?</summary>
+<div class="qa-body"><strong>Short answer:</strong> <code>key</code>, <code>value</code>, and <code>effect</code>.
+<br><strong>Detailed explanation:</strong> The key/value form an arbitrary label-like identifier for the reason behind the taint; the effect determines the scheduling/eviction severity applied against Pods lacking a matching toleration.
+<br><strong>Production example:</strong> <code>dedicated=ml:NoSchedule</code> — key=dedicated, value=ml, effect=NoSchedule.
+<br><strong>Common mistake:</strong> Forgetting effect is part of the match — a toleration must match key, value (for Equal), and effect together.</div></details>
+
+<details class="qa"><summary>4. Why does Kubernetes automatically taint control-plane nodes?</summary>
+<div class="qa-body"><strong>Short answer:</strong> To keep untrusted or arbitrary workloads off the machines running etcd and the API Server.
+<br><strong>Detailed explanation:</strong> kubeadm clusters apply <code>node-role.kubernetes.io/control-plane:NoSchedule</code> by default so regular application Pods never compete for resources with, or gain proximity to, the control plane.
+<br><strong>Production example:</strong> Only cluster-critical DaemonSets (CNI, kube-proxy) carry tolerations for this taint so they still run everywhere.
+<br><strong>Common mistake:</strong> Manually removing the control-plane taint to "get more capacity," inadvertently exposing etcd/API Server nodes to arbitrary workloads.</div></details>
+
+<details class="qa"><summary>5. How does the node dedication pattern work using taints?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Taint the dedicated pool so unrelated Pods are repelled, then give the intended workload both a matching toleration and a node affinity/selector pulling it there.
+<br><strong>Detailed explanation:</strong> The taint alone only opens/closes the door; the affinity is what actually walks the intended Pod through it. Without both, you either get unwanted Pods leaking onto the pool (missing taint) or the intended Pod not landing there at all (missing affinity).
+<br><strong>Production example:</strong> ML training Pods tolerate <code>dedicated=ml:NoSchedule</code> and carry a nodeAffinity for <code>node-pool=gpu-pool</code>.
+<br><strong>Common mistake:</strong> Adding only the toleration and assuming it's enough to route the workload onto the dedicated nodes.</div></details>
+
+<details class="qa"><summary>6. Which component automatically manages the built-in <code>not-ready</code>/<code>unreachable</code> taints?</summary>
+<div class="qa-body"><strong>Short answer:</strong> The Node Controller inside the Controller Manager.
+<br><strong>Detailed explanation:</strong> It watches node heartbeat status and adds/removes these NoExecute taints based on missed heartbeats, driving the automatic eviction/rescheduling path for node failures.
+<br><strong>Production example:</strong> A node losing network connectivity gets tainted <code>node.kubernetes.io/unreachable:NoExecute</code> within the node-monitor-grace-period window.
+<br><strong>Common mistake:</strong> Assuming kubelet applies these taints — kubelet only executes eviction once the timer expires, it doesn't decide node health status itself.</div></details>
+
+<details class="qa"><summary>7. What is <code>tolerationSeconds</code> and why does it only apply to NoExecute?</summary>
+<div class="qa-body"><strong>Short answer:</strong> It's a Pod-side grace period before eviction after a NoExecute taint appears; it's meaningless for NoSchedule/PreferNoSchedule since those never evict.
+<br><strong>Detailed explanation:</strong> It controls how long a Pod is allowed to keep running after a node goes NotReady/unreachable before being forcibly removed, directly tuning failover speed.
+<br><strong>Production example:</strong> A critical add-on tolerates <code>not-ready:NoExecute</code> with <code>tolerationSeconds: 300</code>, riding out brief network blips.
+<br><strong>Common mistake:</strong> Setting it too high for latency-sensitive services, delaying failover after a genuine node failure.</div></details>
+
+<details class="qa"><summary>8. Are taints a sufficient security boundary on their own?</summary>
+<div class="qa-body"><strong>Short answer:</strong> No — taints only control scheduling, not runtime isolation.
+<br><strong>Detailed explanation:</strong> A Pod that somehow lands on a tainted node (or one already running before the taint was applied) still shares the kernel/network unless NetworkPolicies, RBAC, and other isolation controls are also applied.
+<br><strong>Production example:</strong> A compliance review flagged that GPU-pool taints alone didn't prevent lateral network access from co-located Pods, requiring NetworkPolicy as well.
+<br><strong>Common mistake:</strong> Treating "tainted node" as equivalent to "isolated node" for security purposes.</div></details>
+
+<details class="qa"><summary>9. How would you remove a taint from a node?</summary>
+<div class="qa-body"><strong>Short answer:</strong> <code>kubectl taint nodes &lt;node&gt; key=value:effect-</code> — note the trailing minus sign.
+<br><strong>Detailed explanation:</strong> The API Server treats this as a PATCH removing that entry from <code>Node.spec.taints</code>; the Scheduler and Node Controller pick up the change on their next watch event.
+<br><strong>Production example:</strong> Decommissioning a dedicated pool required removing <code>dedicated=ml:NoSchedule</code> from every node in the pool before repurposing it.
+<br><strong>Common mistake:</strong> Forgetting the trailing <code>-</code>, which causes kubectl to try to add rather than remove the taint.</div></details>
+
+<details class="qa"><summary>10. What's a common production incident caused by stale taints?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Undocumented, leftover taints from a decommissioned dedication scheme silently block scheduling on otherwise healthy nodes.
+<br><strong>Detailed explanation:</strong> Because taints are node-level and invisible unless explicitly inspected, they can persist for years after their original purpose is gone, confusing later engineers about why Pods won't schedule.
+<br><strong>Production example:</strong> A "why won't my pod schedule" ticket traced back to a two-year-old taint from a since-abandoned team-dedication experiment.
+<br><strong>Common mistake:</strong> Not documenting every custom taint's purpose and owner at creation time.</div></details>
+
+<details class="qa"><summary>11–50. Additional rapid-fire questions</summary>
+<div class="qa-body">
+<strong>11.</strong> Where are taints stored? — In <code>Node.spec.taints</code>, an array field on the Node object in etcd.<br>
+<strong>12.</strong> Which Scheduler plugin evaluates taints? — The TaintToleration plugin, during Filter (NoSchedule/NoExecute) and Score (PreferNoSchedule).<br>
+<strong>13.</strong> Does a taint affect Pods already running on the node when first applied with NoSchedule? — No, NoSchedule only blocks new Pods; existing Pods are left alone.<br>
+<strong>14.</strong> Does NoExecute affect already-running Pods? — Yes, it evicts any running Pod lacking a matching toleration.<br>
+<strong>15.</strong> What's the imperative command to add a taint? — <code>kubectl taint nodes &lt;node&gt; key=value:effect</code>.<br>
+<strong>16.</strong> How do you list taints across all nodes? — <code>kubectl get nodes -o jsonpath</code> pulling <code>.spec.taints</code>, or custom-columns.<br>
+<strong>17.</strong> Is a taint a standalone API object? — No, it's a field within the Node object's spec, not its own resource kind.<br>
+<strong>18.</strong> What effect does PreferNoSchedule have during the Filter phase? — None — it only influences scoring, never filters out a node.<br>
+<strong>19.</strong> Why is dedicating nodes with taints preferred over relying on affinity alone? — Affinity alone doesn't stop unrelated workloads from landing on the pool; the taint is what actively repels them.<br>
+<strong>20.</strong> What happens if you taint a node but forget to add a matching toleration to the intended workload? — The intended workload also gets blocked, since it has no toleration either.<br>
+<strong>21.</strong> Which component executes the actual container termination during a NoExecute eviction? — kubelet, once the eviction controller's timer for that Pod expires.<br>
+<strong>22.</strong> Do DaemonSets automatically tolerate all taints? — Not automatically for custom taints, but the DaemonSet controller injects tolerations for several built-in node conditions by default.<br>
+<strong>23.</strong> What's the relationship between taints and the API Server's admission control? — None directly — taints are evaluated by the Scheduler and Node Controller, not by admission webhooks.<br>
+<strong>24.</strong> Can a single node have multiple taints? — Yes, <code>spec.taints</code> is an array; a Pod's tolerations must cover every taint that would otherwise block it.<br>
+<strong>25.</strong> What's the default grace period before eviction if <code>tolerationSeconds</code> is unset on a not-ready taint? — Kubernetes' built-in default toleration typically applies 300 seconds unless the Pod specifies otherwise.<br>
+<strong>26.</strong> Why might a platform team use PreferNoSchedule instead of NoSchedule for a new pool? — To softly steer workloads away during a migration without immediately blocking scheduling if no other capacity exists.<br>
+<strong>27.</strong> How does a spot-instance pool commonly use taints? — Tainted so only workloads that explicitly tolerate interruption/spot-eviction risk are scheduled there.<br>
+<strong>28.</strong> What's the risk of taints without documentation across a large platform team? — Engineers waste time diagnosing "why won't this pod schedule" tickets caused by unexplained legacy taints.<br>
+<strong>29.</strong> Do taints have any effect on Services/Endpoints? — No, taints only affect scheduling eligibility, not traffic routing.<br>
+<strong>30.</strong> What's the difference between a taint and a node label used in nodeSelector? — A label is neutral/attractive metadata a Pod can select on; a taint is an active repellent that blocks Pods by default.<br>
+<strong>31.</strong> Why is NoExecute the effect used for automatic failure handling? — Because on real node failure you want existing Pods actively evicted and rescheduled, not just blocked from new placement.<br>
+<strong>32.</strong> What field would you check to see why a pod isn't scheduling onto a specific node? — <code>kubectl describe pod</code> Events, cross-referenced with <code>kubectl describe node | grep Taints</code>.<br>
+<strong>33.</strong> Can you taint a node to isolate it for maintenance? — Yes, applying a NoSchedule or NoExecute taint is a common way to prevent new workloads while draining for maintenance.<br>
+<strong>34.</strong> What's the interaction between a taint and Cluster Autoscaler node groups? — CA must simulate whether a new node's taints would still block a Pending pod before scaling that node group up.<br>
+<strong>35.</strong> Is a taint enough to guarantee compliance isolation for regulated workloads? — No — taints are scheduling-only; combine with RBAC and NetworkPolicies for real compliance-grade isolation.<br>
+<strong>36.</strong> How do you verify the built-in control-plane taint exists? — <code>kubectl describe node &lt;control-plane-node&gt; | grep Taints</code>.<br>
+<strong>37.</strong> What happens to a Pod with no tolerations at all when its node gets any taint applied? — It's affected by every effect present — blocked from re-scheduling and evicted if any taint is NoExecute.<br>
+<strong>38.</strong> Why is manually removing the not-ready taint logic risky? — It's the exact automatic mechanism that reschedules Pods off failed nodes; disabling it removes self-healing for node failures.<br>
+<strong>39.</strong> What's a realistic multi-tenant use of taints? — Dedicating a node pool per team for cost-allocation/compliance, with each team's Pods carrying the matching toleration.<br>
+<strong>40.</strong> How does a taint's effect interact with a toleration missing that same effect? — No match occurs — the toleration must specify the same effect (or omit it, matching all effects for that key) to cancel the taint.<br>
+<strong>41.</strong> Why are taints described as "node-driven repulsion" versus affinity's "Pod-driven attraction"? — Because the node declares the repellent once via a taint, rather than every Pod needing to know about every special node.<br>
+<strong>42.</strong> What's the operational cost of leaving stale taints on decommissioned pools? — They silently block scheduling on otherwise usable capacity, sometimes for years, wasting cluster resources.<br>
+<strong>43.</strong> How would an interviewer expect you to answer "what's the difference between a taint and anti-affinity"? — Taint = node-side repulsion against any non-tolerating Pod; anti-affinity = Pod-side rule about other Pods' placement.<br>
+<strong>44.</strong> What's the risk of applying NoExecute to a node hosting a singleton stateful workload with no PDB? — Immediate eviction with no availability guard, potentially causing real downtime.<br>
+<strong>45.</strong> Can a taint be scoped to only affect specific namespaces? — No, taints are node-level and apply cluster-wide to any Pod lacking a matching toleration, regardless of namespace.<br>
+<strong>46.</strong> What's the quickest way to confirm a taint is actually blocking a specific Pending pod? — Check the FailedScheduling event text in <code>kubectl describe pod</code>, which names the untolerated taint.<br>
+<strong>47.</strong> Why do platform teams often standardize taint key naming conventions? — To keep toleration keys/values consistent across the org and avoid confusion between similarly-purposed taints.<br>
+<strong>48.</strong> What's the failure mode of forgetting to re-taint a repaired node before returning it to service? — None by itself — the concern is the opposite: forgetting to *remove* a taint after a workaround, blocking future scheduling.<br>
+<strong>49.</strong> How does taint-based node dedication reduce noisy-neighbor risk? — By ensuring only intentionally-tolerating workloads land on a pool, isolating resource contention to a known set of workloads.<br>
+<strong>50.</strong> What's the one-line distinction to remember for interviews? — Taint = node says "keep out unless you tolerate me"; toleration = Pod's permission slip; affinity = Pod's explicit request to go there.
+</div></details>
+
+<footer class="course-footer">Next up: Topic 34 — Tolerations, the Pod-side counterpart that lets specific pods bypass a taint.</footer>
+
+<script>
+  mermaid.initialize({ startOnLoad: true, theme: 'dark' });
+</script>
+
+</body>
+</html>

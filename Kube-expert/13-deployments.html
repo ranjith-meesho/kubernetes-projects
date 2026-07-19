@@ -1,0 +1,298 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Topic 13: Deployments — Kubernetes Expert Course</title>
+<link rel="stylesheet" href="styles.css">
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+</head>
+<body>
+
+<header class="course-header">
+  <div class="kicker">Topic 13 of 70</div>
+  <h1>Deployments</h1>
+  <div class="subtitle">The workhorse controller for stateless workloads — rolling updates, rollbacks, and revision history on top of ReplicaSets.</div>
+</header>
+
+<nav class="topic-nav">
+  <a href="12-replicasets.html">&larr; ReplicaSets</a>
+  <a href="index.html">Course Index</a>
+  <a href="14-statefulsets.html">StatefulSets &rarr;</a>
+</nav>
+
+<h2 id="explanation">Explanation</h2>
+<p>A <strong>Deployment</strong> is a higher-level controller that manages ReplicaSets on your behalf to provide
+declarative updates for stateless applications. Where a bare ReplicaSet only guarantees "N identical Pods exist,"
+a Deployment adds the crucial missing piece: a safe, controlled way to change <em>what</em> those Pods run —
+a new image version, new env vars, new resource limits — without downtime and with the ability to roll back.</p>
+
+<p>Kubernetes needs this because real applications change constantly. If you edited a ReplicaSet's Pod template
+directly, nothing would happen to already-running Pods (templates only apply to newly created Pods), so you'd have
+to manually delete old Pods and let the RS recreate new ones — with no control over ordering, batching, or a safety
+net if the new version is broken. Deployments solve this by never editing a ReplicaSet's Pods directly; instead, on
+every spec change, the Deployment controller creates a <strong>brand new ReplicaSet</strong> with the updated
+template and gradually shifts replica counts from the old RS to the new one according to a configurable strategy.</p>
+
+<p>The default and most common strategy is <strong>RollingUpdate</strong>: the Deployment controller incrementally
+scales the new ReplicaSet up and the old one down, bounded by <code>maxSurge</code> (how many extra Pods above the
+desired count are allowed temporarily) and <code>maxUnavailable</code> (how many Pods below desired count are
+tolerated temporarily). This guarantees that at every point during the rollout, enough healthy Pods exist to serve
+traffic — turning a risky "stop everything, start everything new" update into a gradual, observable, reversible
+process.</p>
+
+<p>Because every update creates a new ReplicaSet rather than mutating the old one, Deployments get <strong>revision
+history</strong> almost for free: old ReplicaSets are kept around (scaled to zero) up to
+<code>revisionHistoryLimit</code>, letting you <code>kubectl rollout undo</code> back to any previous template
+instantly by simply scaling an old RS back up and the current one down — no rebuild, no re-pull needed if the image
+is still cached.</p>
+
+<p>This gives Kubernetes a clean three-layer ownership chain: <strong>Deployment &rarr; ReplicaSet &rarr; Pod</strong>.
+The Deployment owns ReplicaSets via owner references and orchestrates the rollout strategy; each ReplicaSet
+independently guarantees its own replica count is met; Pods are the actual running units. This separation of concerns
+is why Deployments are the default choice for essentially all stateless workloads in production.</p>
+
+<h2 id="internal-working">Internal Working / Interactions</h2>
+<ul>
+  <li><strong>API Server / etcd</strong> — the Deployment object, and every ReplicaSet + Pod it creates, are all
+  persisted as ordinary objects; the Deployment controller only ever talks to the API Server.</li>
+  <li><strong>Deployment controller</strong> (in kube-controller-manager) — watches Deployment objects; on spec
+  change, computes a new pod-template hash, checks if a ReplicaSet with that hash already exists (reuse on rollback),
+  and otherwise creates a new ReplicaSet, then drives the surge/unavailable math each reconcile tick.</li>
+  <li><strong>ReplicaSet controller</strong> — completely unaware a Deployment exists; it just keeps whichever
+  replica count the Deployment controller last set on each RS.</li>
+  <li><strong>pod-template-hash label</strong> — the Deployment controller injects this label into every ReplicaSet's
+  selector and Pod template, which is how it distinguishes "old" vs "new" ReplicaSets/Pods during a rollout.</li>
+  <li><strong>Scheduler / kubelet</strong> — unchanged; they operate purely at the Pod level and have no concept of
+  Deployments or ReplicaSets.</li>
+</ul>
+
+<h2 id="architecture-diagram">Architecture Diagram</h2>
+<pre class="mermaid">
+flowchart TB
+    D["Deployment\ncheckout-service\nimage: v2.4.1"]
+    D -->|owns, scales up| RSnew["ReplicaSet (new)\nhash=7f9c8d\nreplicas: 3"]
+    D -->|owns, scales down to 0| RSold["ReplicaSet (old)\nhash=4a1b2e\nreplicas: 0"]
+    RSnew --> P1["Pod v2.4.1"]
+    RSnew --> P2["Pod v2.4.1"]
+    RSnew --> P3["Pod v2.4.1"]
+    RSold -.-> P4["(scaled down, Pods terminated)"]
+</pre>
+
+<pre class="mermaid">
+sequenceDiagram
+    participant U as kubectl
+    participant DC as Deployment Controller
+    participant A as API Server
+    participant RS1 as ReplicaSet (old)
+    participant RS2 as ReplicaSet (new)
+
+    U->>A: kubectl set image deployment/checkout checkout=v2.4.1
+    A-->>DC: Deployment spec changed
+    DC->>A: Create ReplicaSet (new template hash)
+    A-->>RS2: replicas=1 (maxSurge)
+    loop RollingUpdate steps
+        DC->>A: Scale RS2 up by 1
+        DC->>A: Wait for new Pods Ready
+        DC->>A: Scale RS1 down by 1
+    end
+    DC->>A: RS1 replicas=0, RS2 replicas=6
+    A-->>U: rollout status: successfully rolled out
+</pre>
+
+<h2 id="code-example">Code Example</h2>
+<pre><code>apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: checkout-service
+  namespace: payments
+  labels:
+    app: checkout-service
+spec:
+  replicas: 6                        # Total desired Pods once rollout completes.
+  revisionHistoryLimit: 5            # Keep 5 old ReplicaSets around for fast rollback.
+  strategy:
+    type: RollingUpdate              # Default; alternative is "Recreate" (kill all, then start all — has downtime).
+    rollingUpdate:
+      maxSurge: 2                    # Up to 2 EXTRA Pods above desired count during rollout.
+      maxUnavailable: 0              # Never fewer than desired count -> zero-downtime rollout.
+  minReadySeconds: 10                # Pod must stay Ready this long before counted "available" (guards flapping).
+  selector:
+    matchLabels:
+      app: checkout-service          # Immutable — must match template labels below.
+  template:
+    metadata:
+      labels:
+        app: checkout-service
+    spec:
+      containers:
+        - name: checkout
+          image: registry.internal/checkout-service:2.4.1   # Changing this tag triggers a new rollout.
+          readinessProbe:
+            httpGet: { path: /healthz, port: 8080 }
+            initialDelaySeconds: 5
+          resources:
+            requests: { cpu: "500m", memory: "512Mi" }
+            limits:   { cpu: "1",    memory: "1Gi" }
+</code></pre>
+
+<h2 id="kubectl-commands">kubectl Commands</h2>
+<pre><code># Trigger a new rollout by updating the image
+kubectl set image deployment/checkout-service checkout=registry.internal/checkout-service:2.4.2 -n payments
+
+# Watch the rollout progress live
+kubectl rollout status deployment/checkout-service -n payments
+
+# View revision history (each entry = one ReplicaSet the Deployment created)
+kubectl rollout history deployment/checkout-service -n payments
+
+# Roll back to the previous revision
+kubectl rollout undo deployment/checkout-service -n payments
+
+# Roll back to a specific revision number
+kubectl rollout undo deployment/checkout-service --to-revision=3 -n payments
+
+# Pause/resume a rollout to batch multiple template changes into one rollout
+kubectl rollout pause deployment/checkout-service -n payments
+kubectl rollout resume deployment/checkout-service -n payments
+
+# See the ReplicaSets a Deployment owns (old + new)
+kubectl get rs -l app=checkout-service -n payments
+</code></pre>
+
+<h2 id="best-practices">Best Practices &amp; Common Pitfalls</h2>
+<div class="grid-2">
+<div>
+<h4>Best Practices</h4>
+<ul>
+  <li>Always set <code>readinessProbe</code> — the rollout's "wait for Pods Ready" step is meaningless without one.</li>
+  <li>Use <code>maxUnavailable: 0</code> for latency-sensitive services; accept a slower rollout for zero downtime.</li>
+  <li>Set <code>revisionHistoryLimit</code> deliberately — too high wastes etcd storage with dead ReplicaSets.</li>
+  <li>Prefer <code>kubectl apply</code> with version-controlled YAML over imperative <code>kubectl set image</code> in production.</li>
+</ul>
+</div>
+<div>
+<h4>Pitfalls</h4>
+<ul>
+  <li>Forgetting <code>minReadySeconds</code> lets a rollout race ahead even if new Pods crash shortly after starting.</li>
+  <li>Editing the Deployment's ReplicaSet or Pods directly — changes are overwritten on the next reconcile.</li>
+  <li>Using <code>Recreate</code> strategy for a service that needs zero downtime.</li>
+  <li>Not setting resource requests, causing rollout Pods to fail scheduling mid-rollout and stall it.</li>
+</ul>
+</div>
+</div>
+
+<h2 id="interview-questions">50 Interview Questions</h2>
+
+<details class="qa"><summary>1. What problem does a Deployment solve that a bare ReplicaSet cannot?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Safe, controlled updates to a running workload — new image, new config — without downtime and with rollback.
+<br><strong>Detailed explanation:</strong> A ReplicaSet has no update mechanism; editing its Pod template does nothing to existing Pods. A Deployment instead creates a brand-new ReplicaSet on every spec change and shifts replica counts between old and new according to a strategy.
+<br><strong>Production example:</strong> Changing <code>checkout-service</code>'s image tag via <code>kubectl set image</code> creates a new ReplicaSet and gradually scales it up while scaling the old one down.
+<br><strong>Common mistake:</strong> Editing a ReplicaSet's Pod template directly and expecting a rollout to happen — nothing occurs until Pods are manually deleted.</div></details>
+
+<details class="qa"><summary>2. How does the RollingUpdate strategy guarantee availability during a rollout?</summary>
+<div class="qa-body"><strong>Short answer:</strong> By bounding surge (extra Pods allowed above desired count) and unavailable (Pods allowed below desired count) at every step.
+<br><strong>Detailed explanation:</strong> <code>maxSurge</code> and <code>maxUnavailable</code> together define the safe range the Deployment controller operates within while incrementally scaling the new ReplicaSet up and the old one down.
+<br><strong>Production example:</strong> Setting <code>maxSurge: 2, maxUnavailable: 0</code> guarantees the full desired capacity is always available, at the cost of temporarily running up to 2 extra Pods.
+<br><strong>Common mistake:</strong> Setting <code>maxUnavailable</code> too high for a latency-sensitive service, causing real capacity dips during rollout.</div></details>
+
+<details class="qa"><summary>3. Why does every spec change create a brand new ReplicaSet instead of mutating the existing one?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Because a ReplicaSet's template changes never affect already-running Pods, so mutating in place wouldn't actually update anything.
+<br><strong>Detailed explanation:</strong> By creating a new RS with a new pod-template-hash, the Deployment controller can gradually shift traffic between two independently-reconciling ReplicaSets and retain the old one for instant rollback.
+<br><strong>Production example:</strong> Rolling back is just re-scaling a previous ReplicaSet back up (if still retained within revisionHistoryLimit) rather than rebuilding anything.
+<br><strong>Common mistake:</strong> Assuming a Deployment update "patches" the existing ReplicaSet in place rather than creating a new one.</div></details>
+
+<details class="qa"><summary>4. What is the pod-template-hash label and why does the Deployment controller need it?</summary>
+<div class="qa-body"><strong>Short answer:</strong> A hash of the Pod template that the Deployment controller injects into each ReplicaSet's selector and Pods to distinguish "old" from "new" during a rollout.
+<br><strong>Detailed explanation:</strong> Without this label, the controller would have no reliable way to tell which ReplicaSet corresponds to which template revision, especially across multiple past rollouts.
+<br><strong>Production example:</strong> <code>kubectl get rs -l app=checkout-service</code> shows multiple ReplicaSets, each identifiable by a distinct pod-template-hash suffix in its name.
+<br><strong>Common mistake:</strong> Manually setting a label that collides with the auto-injected pod-template-hash, breaking the Deployment's own bookkeeping.</div></details>
+
+<details class="qa"><summary>5. How does kubectl rollout undo actually perform a rollback?</summary>
+<div class="qa-body"><strong>Short answer:</strong> By reusing a previously retained ReplicaSet (if the template hash matches) and swapping replica counts back — scaling the old RS up and current RS down.
+<br><strong>Detailed explanation:</strong> Because the Deployment controller checks for a matching pod-template-hash before creating a new RS, rolling back to an identical previous template reuses the existing RS instead of building a new one, making rollback instant if the image is still cached.
+<br><strong>Production example:</strong> <code>kubectl rollout undo deployment/checkout-service --to-revision=3</code> targets a specific retained revision by number.
+<br><strong>Common mistake:</strong> Assuming rollback always requires re-pulling an image — it doesn't, if the old ReplicaSet's Pods can still reference an already-cached image.</div></details>
+
+<details class="qa"><summary>6. Why is revisionHistoryLimit important and what's the tradeoff in setting it?</summary>
+<div class="qa-body"><strong>Short answer:</strong> It bounds how many old ReplicaSets (scaled to zero) are kept for fast rollback — too high wastes etcd storage, too low limits rollback depth.
+<br><strong>Detailed explanation:</strong> Each retained ReplicaSet is a full object in etcd even at zero replicas; keeping dozens around for workloads that deploy frequently adds unnecessary storage/watch overhead.
+<br><strong>Production example:</strong> A team deploying 20 times a day sets <code>revisionHistoryLimit: 5</code> deliberately rather than the implicit unlimited default some tools assume.
+<br><strong>Common mistake:</strong> Never setting it explicitly, letting hundreds of dead ReplicaSets accumulate over months of frequent deploys.</div></details>
+
+<details class="qa"><summary>7. Why must readinessProbe be set for a rolling update to behave safely?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Because the rollout's "wait for new Pods to be Ready before continuing" step depends entirely on readiness reporting.
+<br><strong>Detailed explanation:</strong> Without a readinessProbe, a Pod is considered Ready the instant its containers start, so the rollout can race ahead scaling down old (working) Pods before new ones are actually able to serve traffic.
+<br><strong>Production example:</strong> A checkout service without a readinessProbe rolling out a broken image would replace all healthy old Pods before anyone notices the new ones are failing.
+<br><strong>Common mistake:</strong> Relying only on a livenessProbe, which restarts a crashing container but does nothing to gate rollout progression.</div></details>
+
+<details class="qa"><summary>8. What does minReadySeconds add on top of a readinessProbe?</summary>
+<div class="qa-body"><strong>Short answer:</strong> A minimum duration a Pod must stay continuously Ready before being counted "available" for rollout progression.
+<br><strong>Detailed explanation:</strong> This guards against a Pod that passes its readiness probe once, then immediately crashes — without minReadySeconds, the rollout could count it as done before the crash is detected.
+<br><strong>Production example:</strong> <code>minReadySeconds: 10</code> on <code>checkout-service</code> forces new Pods to prove stability for 10 seconds before the rollout proceeds to the next batch.
+<br><strong>Common mistake:</strong> Omitting minReadySeconds and having a rollout "succeed" moments before new Pods start crash-looping.</div></details>
+
+<details class="qa"><summary>9. Why is Recreate strategy dangerous for services that need zero downtime?</summary>
+<div class="qa-body"><strong>Short answer:</strong> It kills all old Pods before creating any new ones, guaranteeing a window with zero available capacity.
+<br><strong>Detailed explanation:</strong> Unlike RollingUpdate, Recreate does not interleave old/new Pod lifecycles at all — it's simplest but sacrifices availability entirely, appropriate only for workloads that genuinely cannot run two versions simultaneously (e.g. exclusive-lock singleton processes).
+<br><strong>Production example:</strong> A legacy batch coordinator that can't tolerate two active instances at once might deliberately use Recreate despite the downtime.
+<br><strong>Common mistake:</strong> Using Recreate by default/inertia for a normal stateless HTTP service that could easily use RollingUpdate instead.</div></details>
+
+<details class="qa"><summary>10. What is the three-layer ownership chain of a Deployment, and why does that separation of concerns matter?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Deployment → ReplicaSet → Pod, where each layer owns exactly one concern: rollout orchestration, replica-count guarantee, and actual execution.
+<br><strong>Detailed explanation:</strong> This lets each layer reconcile independently — a Pod crash is handled at the RS layer without the Deployment controller getting involved, while template/version changes are handled at the Deployment layer without the RS needing any rollout awareness.
+<br><strong>Production example:</strong> During a rollout, if a brand-new Pod crashes, its owning ReplicaSet replaces it immediately — the Deployment's surge/unavailable accounting is unaffected by which specific Pod failed.
+<br><strong>Common mistake:</strong> Debugging rollout issues by looking only at the Deployment object, missing that the actual state (which Pods exist, why) lives at the ReplicaSet layer.</div></details>
+
+<details class="qa"><summary>11–50. Additional rapid-fire questions</summary>
+<div class="qa-body">
+<strong>11.</strong> What API group/version is Deployment under? — <code>apps/v1</code>.<br>
+<strong>12.</strong> Can you pause a Deployment mid-rollout? — Yes, <code>kubectl rollout pause</code>, useful for batching multiple template changes into a single rollout.<br>
+<strong>13.</strong> What does kubectl rollout resume do? — Un-pauses a paused Deployment, letting queued spec changes roll out as one combined rollout.<br>
+<strong>14.</strong> Does the Deployment controller talk to Pods directly? — No — it only ever creates/scales ReplicaSets; ReplicaSets manage Pods.<br>
+<strong>15.</strong> What triggers a new rollout besides image changes? — Any change to the Pod template: env vars, resource limits, labels, volumes, etc.<br>
+<strong>16.</strong> Does changing spec.replicas alone trigger a new ReplicaSet? — No — scaling doesn't change the template hash, so it just resizes the existing active ReplicaSet.<br>
+<strong>17.</strong> What's the default value of maxSurge and maxUnavailable? — Both default to 25% of desired replicas.<br>
+<strong>18.</strong> How do you check if a rollout is stuck? — <code>kubectl rollout status deployment/&lt;name&gt;</code> blocks and reports progress or a timeout.<br>
+<strong>19.</strong> What field bounds how long a rollout can be "stuck" before being marked failed? — <code>progressDeadlineSeconds</code>.<br>
+<strong>20.</strong> Can a Deployment manage Pods across multiple namespaces? — No — Deployment, its ReplicaSets, and Pods are all in the same namespace.<br>
+<strong>21.</strong> What happens if you delete a Deployment? — Cascading delete removes its ReplicaSets and their Pods by default.<br>
+<strong>22.</strong> How would you keep a Deployment's Pods running while removing just the Deployment object? — <code>kubectl delete deployment &lt;name&gt; --cascade=orphan</code>.<br>
+<strong>23.</strong> What's the difference between kubectl apply and kubectl set image for triggering rollouts? — apply is declarative (full manifest, GitOps-friendly); set image is an imperative patch, harder to track in version control.<br>
+<strong>24.</strong> Why is kubectl apply with version-controlled YAML preferred in production? — Ensures the desired state in Git matches the cluster, supporting GitOps and auditability.<br>
+<strong>25.</strong> Does a Deployment support canary releases natively? — Not directly — true weighted canary requires something like Argo Rollouts or a service mesh; Deployment only supports coarse partial-rollout via surge math.<br>
+<strong>26.</strong> What happens to HPA if it targets a Deployment mid-rollout? — HPA continues adjusting Deployment.spec.replicas, which the rollout math incorporates into surge/unavailable calculations.<br>
+<strong>27.</strong> Can two Deployments accidentally select the same Pods? — Yes, if their selectors overlap — causes the same flapping fight seen with overlapping ReplicaSets, but one layer up.<br>
+<strong>28.</strong> Is spec.selector on a Deployment mutable? — No — immutable after creation, same constraint as ReplicaSet.<br>
+<strong>29.</strong> What's the purpose of kubectl rollout history? — Lists retained revisions (backed by retained ReplicaSets) with change-cause annotations if set.<br>
+<strong>30.</strong> How do you annotate a rollout with a human-readable change reason? — <code>kubectl annotate deployment &lt;name&gt; kubernetes.io/change-cause="..."</code> or the <code>--record</code> flag (deprecated in newer versions).<br>
+<strong>31.</strong> What happens if a new ReplicaSet's Pods never become Ready? — The rollout stalls; after progressDeadlineSeconds it's marked as failed progress (but doesn't auto-rollback unless external tooling does so).<br>
+<strong>32.</strong> Does Kubernetes auto-rollback a failed Deployment rollout? — No, not by default — you must run <code>kubectl rollout undo</code> manually or use external automation.<br>
+<strong>33.</strong> What's the risk of not setting resource requests on the Pod template during a rollout? — New Pods may fail to schedule mid-rollout, stalling progress with a partially-updated fleet.<br>
+<strong>34.</strong> How does a Deployment interact with PodDisruptionBudgets during a rollout? — The rollout process itself isn't bound by PDBs (those govern voluntary evictions like drains); it's bounded by maxUnavailable/maxSurge instead.<br>
+<strong>35.</strong> Can you run two different container images simultaneously under one Deployment intentionally? — No — a Deployment's whole model assumes one template; you'd need two Deployments (or a mesh-based canary) for that.<br>
+<strong>36.</strong> What's the effect of setting maxUnavailable: 100% and maxSurge: 0%? — Equivalent to a Recreate-like behavior — old Pods are killed before new ones exist, with no surge capacity.<br>
+<strong>37.</strong> Why does a Deployment need its own controller separate from the ReplicaSet controller? — Different responsibilities — Deployment computes surge/rollout math and decides when to create new RS objects; RS controller only manages a fixed replica count.<br>
+<strong>38.</strong> What does kubectl rollout restart do differently from a normal update? — Forces a new rollout (new ReplicaSet, new Pods) without changing any spec fields — useful for picking up ConfigMap/Secret changes that aren't otherwise detected.<br>
+<strong>39.</strong> Why doesn't editing a mounted ConfigMap trigger a rollout automatically? — The Deployment only reacts to changes in its own Pod template spec, not to changes in referenced objects like ConfigMaps/Secrets.<br>
+<strong>40.</strong> What's a common pattern to force a rollout on ConfigMap change? — Add a checksum/hash annotation of the ConfigMap's content into the Pod template so its hash changes whenever the ConfigMap does.<br>
+<strong>41.</strong> Does scaling to zero replicas delete the Deployment? — No — the Deployment object and its active ReplicaSet remain, just with zero running Pods.<br>
+<strong>42.</strong> What status field tells you the count of Pods that have successfully rolled out to the new spec? — <code>status.updatedReplicas</code>, compared against <code>status.replicas</code>.<br>
+<strong>43.</strong> How does kubectl diff help before applying a Deployment change? — Shows exactly what will change server-side before committing, catching unintended template drift.<br>
+<strong>44.</strong> Is topologySpreadConstraints set on the Deployment or the Pod template? — On the Pod template (spec.template.spec) — the Deployment object itself has no such field.<br>
+<strong>45.</strong> What happens if you set replicas higher than the cluster can schedule? — Extra Pods stay Pending; rollout progress may stall depending on maxUnavailable/maxSurge accounting.<br>
+<strong>46.</strong> Can a Deployment reference a ServiceAccount? — Yes, via the Pod template's spec.serviceAccountName, same as any Pod.<br>
+<strong>47.</strong> What's the safest way to test a risky rollout in production? — Use maxUnavailable: 0 with a small maxSurge and closely watch rollout status/metrics before letting it fully complete, or pause mid-rollout.<br>
+<strong>48.</strong> Why would a team choose Argo Rollouts over plain Deployment? — For advanced strategies (canary with automated analysis, blue/green) that plain Deployment's RollingUpdate/Recreate can't express.<br>
+<strong>49.</strong> How do you verify a rollback actually reused an old ReplicaSet instead of creating a new one? — Compare pod-template-hash and creationTimestamp on the scaled-up ReplicaSet — a reused RS retains its original timestamp.<br>
+<strong>50.</strong> What's the first thing to check when a Deployment rollout appears stuck? — <code>kubectl rollout status</code> plus <code>kubectl describe rs</code> on the new ReplicaSet for scheduling/readiness failures blocking progression.
+</div></details>
+
+<footer class="course-footer">Next: Topic 14 — StatefulSets, for workloads that need stable identity instead of interchangeable replicas.</footer>
+
+<script>
+  mermaid.initialize({ startOnLoad: true, theme: 'dark' });
+</script>
+
+</body>
+</html>

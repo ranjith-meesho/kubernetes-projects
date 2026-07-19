@@ -1,0 +1,304 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Topic 14: StatefulSets — Kubernetes Expert Course</title>
+<link rel="stylesheet" href="styles.css">
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+</head>
+<body>
+
+<header class="course-header">
+  <div class="kicker">Topic 14 of 70</div>
+  <h1>StatefulSets</h1>
+  <div class="subtitle">Stable network identity and ordered lifecycle for workloads that can't treat replicas as interchangeable.</div>
+</header>
+
+<nav class="topic-nav">
+  <a href="13-deployments.html">&larr; Deployments</a>
+  <a href="index.html">Course Index</a>
+  <a href="15-daemonsets.html">DaemonSets &rarr;</a>
+</nav>
+
+<h2 id="explanation">Explanation</h2>
+<p>A <strong>StatefulSet</strong> is a controller for workloads where each replica needs a <strong>stable, unique
+identity</strong> that survives rescheduling — think databases, message brokers, or anything using leader election
+or per-node persistent data (Kafka, Cassandra, ZooKeeper, Elasticsearch, PostgreSQL replicas). Deployments treat all
+Pods as identical and interchangeable, which is exactly wrong for these systems: replica "2" of a Kafka broker isn't
+just any broker, it's the specific broker holding a specific set of partitions on a specific volume, and it must keep
+coming back as "kafka-2" with the same disk every time.</p>
+
+<p>Kubernetes needs a distinct mechanism for this because a Deployment/ReplicaSet's Pods get random name suffixes and
+random IPs, and their PersistentVolumeClaims (if any) are shared across all replicas rather than one-per-replica.
+Neither property works for stateful systems that need to find "the same peer" after a restart or reschedule.
+StatefulSets solve both problems: Pods get a <strong>predictable, stable name</strong> in the form
+<code>&lt;statefulset-name&gt;-&lt;ordinal&gt;</code> (e.g. <code>kafka-0</code>, <code>kafka-1</code>, <code>kafka-2</code>),
+and a stable DNS hostname via a required <strong>headless Service</strong>, and each replica gets its own
+PersistentVolumeClaim generated from a <code>volumeClaimTemplates</code> spec, so <code>kafka-1</code> always
+reattaches to the same volume it had before, no matter which node it's rescheduled to.</p>
+
+<p>StatefulSets also guarantee <strong>ordered, sequential</strong> Pod creation, scaling, and deletion by default:
+<code>kafka-0</code> must be Running and Ready before <code>kafka-1</code> is created, and on scale-down the
+highest-ordinal Pod is removed first. This matters for systems with bootstrap dependencies (e.g. a cluster's first
+node needs to exist and be healthy before others join) or where tearing down out of order could break quorum.</p>
+
+<p>The pairing with a <strong>headless Service</strong> (a Service with <code>clusterIP: None</code>) is essential:
+instead of load-balancing across replicas behind one virtual IP, a headless Service's DNS returns one A/AAAA record
+per Pod, at a name like <code>kafka-0.kafka-headless.default.svc.cluster.local</code>. This is what lets a client — or
+a peer in the same cluster — address a specific, stable replica directly rather than "some randomly chosen instance."</p>
+
+<p>Because ordering and identity add operational cost (rollouts are one Pod at a time by default, scaling is
+sequential), StatefulSets should only be used when a workload genuinely needs stable identity or per-replica storage —
+for pure stateless services, a Deployment remains simpler and faster to roll out.</p>
+
+<h2 id="internal-working">Internal Working / Interactions</h2>
+<ul>
+  <li><strong>Headless Service</strong> — required alongside the StatefulSet; provides the per-Pod DNS names.
+  CoreDNS answers queries for it directly from Endpoints, without a ClusterIP.</li>
+  <li><strong>StatefulSet controller</strong> — watches StatefulSet objects, creates Pods one ordinal at a time,
+  waiting for each to become Ready before creating the next (unless <code>podManagementPolicy: Parallel</code>).</li>
+  <li><strong>PersistentVolumeClaim / CSI driver</strong> — for each ordinal, the controller instantiates a PVC from
+  <code>volumeClaimTemplates</code> (e.g. <code>data-kafka-0</code>); the CSI driver provisions/attaches the actual
+  volume; the PVC is NOT deleted automatically when the Pod/StatefulSet is deleted, by design.</li>
+  <li><strong>API Server / etcd</strong> — as with all controllers, all state (StatefulSet spec, Pod objects, PVCs)
+  lives in etcd via the API Server; the controller only watches/writes through it.</li>
+  <li><strong>Scheduler / kubelet</strong> — bind and run each ordinal Pod exactly as any other Pod, but must respect
+  the PVC's storage topology (e.g. a Pod may be forced onto a specific zone if its volume is zonal).</li>
+</ul>
+
+<h2 id="architecture-diagram">Architecture Diagram</h2>
+<pre class="mermaid">
+flowchart TB
+    SVC["Headless Service\nkafka-headless\nclusterIP: None"]
+    SS["StatefulSet: kafka\nreplicas: 3"]
+    SS -->|ordinal 0, created first| P0["Pod kafka-0"]
+    SS -->|ordinal 1, after kafka-0 Ready| P1["Pod kafka-1"]
+    SS -->|ordinal 2, after kafka-1 Ready| P2["Pod kafka-2"]
+    P0 --- PVC0[("PVC data-kafka-0")]
+    P1 --- PVC1[("PVC data-kafka-1")]
+    P2 --- PVC2[("PVC data-kafka-2")]
+    SVC -.DNS: kafka-0.kafka-headless.-.-> P0
+    SVC -.DNS: kafka-1.kafka-headless.-.-> P1
+    SVC -.DNS: kafka-2.kafka-headless.-.-> P2
+</pre>
+
+<pre class="mermaid">
+stateDiagram-v2
+    [*] --> Creating_0: Scale to 3
+    Creating_0 --> Ready_0: kafka-0 Ready
+    Ready_0 --> Creating_1
+    Creating_1 --> Ready_1: kafka-1 Ready
+    Ready_1 --> Creating_2
+    Creating_2 --> Ready_2: kafka-2 Ready
+    Ready_2 --> AllReady
+    AllReady --> Terminating_2: Scale down to 2 (reverse order)
+    Terminating_2 --> [*]
+</pre>
+
+<h2 id="code-example">Code Example</h2>
+<pre><code>apiVersion: v1
+kind: Service
+metadata:
+  name: kafka-headless
+spec:
+  clusterIP: None                 # Headless — no load balancing, one DNS record per Pod.
+  selector:
+    app: kafka
+  ports:
+    - port: 9092
+      name: broker
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: kafka
+spec:
+  serviceName: kafka-headless      # MUST match the headless Service above; used to build Pod DNS names.
+  replicas: 3
+  podManagementPolicy: OrderedReady  # Default: strictly sequential create/scale/delete.
+  selector:
+    matchLabels:
+      app: kafka
+  template:
+    metadata:
+      labels:
+        app: kafka
+    spec:
+      containers:
+        - name: kafka
+          image: bitnami/kafka:3.6
+          ports:
+            - containerPort: 9092
+          volumeMounts:
+            - name: data
+              mountPath: /bitnami/kafka   # Each replica's own persistent data directory.
+  volumeClaimTemplates:               # Stamped out per-ordinal: data-kafka-0, data-kafka-1, data-kafka-2.
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 20Gi
+</code></pre>
+
+<h2 id="kubectl-commands">kubectl Commands</h2>
+<pre><code># List StatefulSet Pods — note the stable, ordinal-suffixed names
+kubectl get pods -l app=kafka -o wide
+
+# Show current vs desired replicas and rollout status
+kubectl describe statefulset kafka
+
+# Scale a StatefulSet (ordinals added/removed in order)
+kubectl scale statefulset kafka --replicas=5
+
+# Watch the ordered rollout of a RollingUpdate on a StatefulSet
+kubectl rollout status statefulset/kafka
+
+# List PVCs — confirm one-per-ordinal, and that they survive Pod deletion
+kubectl get pvc -l app=kafka
+
+# Resolve a specific replica's stable DNS name from inside the cluster
+kubectl run -it --rm dns-test --image=busybox -- nslookup kafka-1.kafka-headless.default.svc.cluster.local
+
+# Force-delete a stuck StatefulSet Pod (use cautiously — bypasses graceful termination)
+kubectl delete pod kafka-1 --grace-period=0 --force
+</code></pre>
+
+<h2 id="best-practices">Best Practices &amp; Common Pitfalls</h2>
+<div class="grid-2">
+<div>
+<h4>Best Practices</h4>
+<ul>
+  <li>Always pair a StatefulSet with a dedicated headless Service — it will not work correctly without one.</li>
+  <li>Use <code>volumeClaimTemplates</code> rather than a single shared PVC across replicas.</li>
+  <li>Set Pod anti-affinity so ordinals spread across nodes/zones for real redundancy.</li>
+  <li>Plan PVC cleanup explicitly — deleting a StatefulSet never deletes its PVCs, which is usually what you want.</li>
+</ul>
+</div>
+<div>
+<h4>Pitfalls</h4>
+<ul>
+  <li>Assuming scale-down deletes data — PVCs persist and will be reattached if you scale back up later.</li>
+  <li>Using <code>podManagementPolicy: Parallel</code> for systems that truly need ordered bootstrap (e.g. some ZooKeeper configs).</li>
+  <li>Forgetting that StatefulSet updates are one Pod at a time by default — a bad rollout is much slower to detect/roll back than a Deployment's.</li>
+  <li>Treating StatefulSets as a general-purpose "Deployment with storage" when the workload doesn't actually need identity or ordering.</li>
+</ul>
+</div>
+</div>
+
+<h2 id="interview-questions">50 Interview Questions</h2>
+
+<details class="qa"><summary>1. What core problem does a StatefulSet solve that a Deployment cannot?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Giving each replica a stable, unique identity (name, network address, and storage) that survives rescheduling.
+<br><strong>Detailed explanation:</strong> Deployments treat all Pods as interchangeable with random name suffixes and shared/random storage; stateful systems like Kafka or PostgreSQL need "replica 2" to always come back as the same peer with the same disk.
+<br><strong>Production example:</strong> A Kafka broker rescheduled after a node failure must reattach as <code>kafka-1</code> with the same partitions on the same volume, not a fresh random identity.
+<br><strong>Common mistake:</strong> Trying to run a clustered database under a Deployment and being surprised peers can't find each other reliably after any restart.</div></details>
+
+<details class="qa"><summary>2. Why is a headless Service required alongside a StatefulSet?</summary>
+<div class="qa-body"><strong>Short answer:</strong> It provides one DNS A/AAAA record per Pod instead of a single load-balanced virtual IP, enabling stable per-replica addressing.
+<br><strong>Detailed explanation:</strong> A headless Service (clusterIP: None) tells CoreDNS to return individual Pod records at names like <code>kafka-0.kafka-headless.default.svc.cluster.local</code> rather than one shared ClusterIP that hides which specific replica you're talking to.
+<br><strong>Production example:</strong> Kafka brokers use this DNS pattern to discover and address specific peers by ordinal during cluster bootstrap and rebalancing.
+<br><strong>Common mistake:</strong> Creating a normal ClusterIP Service for a StatefulSet and being unable to address individual replicas by stable name.</div></details>
+
+<details class="qa"><summary>3. How does volumeClaimTemplates differ from a single PVC referenced by a Deployment?</summary>
+<div class="qa-body"><strong>Short answer:</strong> It stamps out one dedicated PVC per ordinal (e.g. <code>data-kafka-0</code>, <code>data-kafka-1</code>) instead of one shared PVC across all replicas.
+<br><strong>Detailed explanation:</strong> Each replica gets its own PersistentVolumeClaim generated from the template, and the CSI driver provisions/attaches a distinct volume per ordinal, so <code>kafka-1</code> always reattaches to its own specific volume regardless of which node it lands on.
+<br><strong>Production example:</strong> A 3-replica Elasticsearch StatefulSet ends up with three independent PVCs, each holding a different shard's data.
+<br><strong>Common mistake:</strong> Assuming all replicas share one PVC the way they might share a ConfigMap — this would corrupt per-replica data.</div></details>
+
+<details class="qa"><summary>4. Why does StatefulSet enforce ordered, sequential Pod creation by default?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Many stateful systems have bootstrap dependencies — the first node must exist and be healthy before others join a cluster/quorum.
+<br><strong>Detailed explanation:</strong> With the default <code>podManagementPolicy: OrderedReady</code>, ordinal N+1 is only created after ordinal N reports Ready, and scale-down removes the highest ordinal first — protecting quorum-sensitive systems from losing multiple members simultaneously.
+<br><strong>Production example:</strong> A ZooKeeper ensemble relies on this ordering so node 0 (often the initial leader candidate) is fully up before node 1 attempts to join.
+<br><strong>Common mistake:</strong> Setting <code>podManagementPolicy: Parallel</code> for a system that genuinely needs ordered bootstrap, causing join races.</div></details>
+
+<details class="qa"><summary>5. What happens to a StatefulSet's PVCs when you scale it down or delete it?</summary>
+<div class="qa-body"><strong>Short answer:</strong> PVCs are never deleted automatically — they persist even after their owning Pod or the whole StatefulSet is gone.
+<br><strong>Detailed explanation:</strong> This is a deliberate safety design: accidentally deleting a StatefulSet must not silently destroy stateful data; scaling back up later reattaches the same PVC to the recreated ordinal.
+<br><strong>Production example:</strong> Scaling a Cassandra StatefulSet from 5 down to 3 and back up to 5 later reattaches <code>data-cassandra-3</code> and <code>data-cassandra-4</code> exactly as they were.
+<br><strong>Common mistake:</strong> Assuming scale-down "cleans up" storage, then being surprised (or relieved) that old data reappears on scale-up.</div></details>
+
+<details class="qa"><summary>6. Why should StatefulSet Pods typically use Pod anti-affinity across nodes/zones?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Because stable identity alone doesn't guarantee redundancy — without spreading, all replicas could land on the same node and share its failure domain.
+<br><strong>Detailed explanation:</strong> The Scheduler has no inherent knowledge that StatefulSet replicas are meant to be redundant; without explicit anti-affinity or topology spread constraints, three "redundant" Kafka brokers could all be co-located on one failing node.
+<br><strong>Production example:</strong> A production Kafka StatefulSet adds pod anti-affinity keyed on <code>app: kafka</code> to force each broker onto a distinct node.
+<br><strong>Common mistake:</strong> Assuming stable identity implies fault-tolerant placement — they are unrelated guarantees.</div></details>
+
+<details class="qa"><summary>7. What's the operational cost of choosing a StatefulSet over a Deployment when it isn't strictly needed?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Slower rollouts and scaling, since both default to one-Pod-at-a-time, ordered operations.
+<br><strong>Detailed explanation:</strong> A Deployment can surge multiple new Pods and scale/rollout in parallel; a StatefulSet's default ordering makes both scaling and rolling updates strictly sequential, which is significantly slower for large replica counts.
+<br><strong>Production example:</strong> Rolling out an image update across a 10-replica StatefulSet takes far longer than the equivalent Deployment rollout because each Pod must finish before the next starts.
+<br><strong>Common mistake:</strong> Using a StatefulSet as a "Deployment with storage" for stateless workloads that don't actually need identity or ordering, paying the rollout-speed cost for nothing.</div></details>
+
+<details class="qa"><summary>8. How does a StatefulSet's Pod naming scheme work, and why does it matter?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Pods are named <code>&lt;statefulset-name&gt;-&lt;ordinal&gt;</code> (e.g. kafka-0, kafka-1) — predictable and stable, unlike a ReplicaSet's random suffixes.
+<br><strong>Detailed explanation:</strong> This predictable naming is what lets other systems (config, DNS, peer-discovery logic embedded in the application itself) reference a specific replica reliably, since the name doesn't change across restarts or rescheduling.
+<br><strong>Production example:</strong> A Kafka broker's own configuration can hardcode <code>kafka-2.kafka-headless</code> as a peer address, knowing it will always resolve to the same logical broker.
+<br><strong>Common mistake:</strong> Assuming ordinal names are just cosmetic — applications often depend on them for identity-sensitive configuration (broker IDs, node IDs).</div></details>
+
+<details class="qa"><summary>9. Why does a Pod might get forced onto a specific node/zone under a StatefulSet?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Because its PVC may be a zonal volume, and the Scheduler must place the Pod where that volume is actually accessible.
+<br><strong>Detailed explanation:</strong> Many CSI-backed block storage types (e.g. AWS EBS) are zone-scoped, so once a PVC is bound and provisioned in a zone, its Pod is effectively pinned to that zone on every future reschedule.
+<br><strong>Production example:</strong> A <code>kafka-1</code> Pod originally scheduled in <code>ap-south-1a</code> stays pinned there on every subsequent restart, because its EBS volume can't be attached from a different zone.
+<br><strong>Common mistake:</strong> Not accounting for storage topology when planning multi-zone HA, leading to replicas that can't actually fail over across zones.</div></details>
+
+<details class="qa"><summary>10. What is podManagementPolicy: Parallel and when is it appropriate?</summary>
+<div class="qa-body"><strong>Short answer:</strong> It launches/terminates all StatefulSet Pods concurrently instead of waiting for ordinal-by-ordinal readiness.
+<br><strong>Detailed explanation:</strong> Appropriate for stateful workloads that need stable identity/storage but have no actual bootstrap-ordering dependency between replicas — you keep the identity guarantees while dropping the sequencing cost.
+<br><strong>Production example:</strong> Some Cassandra deployments use Parallel since nodes can bootstrap concurrently once seed nodes are configured, unlike ZooKeeper's stricter sequential joining.
+<br><strong>Common mistake:</strong> Blanket-applying Parallel to every StatefulSet for speed without checking whether the specific workload actually tolerates concurrent bootstrap.</div></details>
+
+<details class="qa"><summary>11–50. Additional rapid-fire questions</summary>
+<div class="qa-body">
+<strong>11.</strong> What API group/version is StatefulSet under? — <code>apps/v1</code>.<br>
+<strong>12.</strong> Does a StatefulSet require serviceName to be set? — Yes — it must match the headless Service's name, used to construct Pod DNS.<br>
+<strong>13.</strong> What happens if you delete the headless Service but keep the StatefulSet? — Pod DNS resolution for individual replicas breaks even though the Pods keep running.<br>
+<strong>14.</strong> Can a StatefulSet's spec.selector be changed after creation? — No — immutable, same as Deployment/ReplicaSet.<br>
+<strong>15.</strong> What's the default update strategy for a StatefulSet? — RollingUpdate, applied in reverse ordinal order (highest ordinal updated first).<br>
+<strong>16.</strong> What does the partition field in RollingUpdate do? — Only ordinals >= partition are updated, letting you canary-test an update on just the highest-numbered replicas first.<br>
+<strong>17.</strong> How do you force-delete a stuck StatefulSet Pod safely? — <code>kubectl delete pod &lt;name&gt; --grace-period=0 --force</code>, used cautiously since it bypasses graceful shutdown.<br>
+<strong>18.</strong> Why is force-deleting a StatefulSet Pod risky? — The controller may believe two instances of the same ordinal identity exist briefly, risking split-brain for quorum-sensitive apps.<br>
+<strong>19.</strong> Does scaling a StatefulSet down remove the lowest or highest ordinal first? — The highest ordinal is always removed first.<br>
+<strong>20.</strong> What object actually creates the per-ordinal PVCs? — The StatefulSet controller, instantiating volumeClaimTemplates for each new ordinal.<br>
+<strong>21.</strong> Can two different StatefulSets share the same headless Service? — Not meaningfully — each StatefulSet expects its own serviceName-based DNS naming scheme to be unambiguous.<br>
+<strong>22.</strong> What field in a Pod's spec reflects its ordinal-derived identity? — Its <code>metadata.name</code> and hostname, both set to <code>&lt;statefulset&gt;-&lt;ordinal&gt;</code>.<br>
+<strong>23.</strong> Is StatefulSet rollout paused automatically on a failed Pod? — Yes for OrderedReady — the controller won't proceed to the next ordinal if the current one isn't Ready.<br>
+<strong>24.</strong> What CSI feature is essential for StatefulSets using local/zonal storage? — Topology-aware provisioning, ensuring PVCs are created in a zone the Scheduler can actually place the Pod in.<br>
+<strong>25.</strong> Does StatefulSet support HPA? — Yes, technically, though it's less common than scaling stateless Deployments due to the ordering/storage implications of adding/removing ordinals.<br>
+<strong>26.</strong> What happens to a StatefulSet's Pod hostname inside the container? — It's set to the Pod name (e.g. kafka-1), usable by the application for self-identification.<br>
+<strong>27.</strong> How do you resolve a specific replica's DNS name from another Pod? — <code>&lt;pod-name&gt;.&lt;headless-service&gt;.&lt;namespace&gt;.svc.cluster.local</code>, e.g. kafka-1.kafka-headless.default.svc.cluster.local.<br>
+<strong>28.</strong> What's a common reason a StatefulSet Pod gets stuck in Pending? — Its PVC can't be provisioned/attached, often due to zone mismatch or exhausted storage capacity.<br>
+<strong>29.</strong> Can StatefulSet Pods use ephemeral (non-persistent) storage instead? — Yes, if you skip volumeClaimTemplates and just use emptyDir — but then you lose the durable-per-replica-storage guarantee entirely.<br>
+<strong>30.</strong> Why is minReadySeconds still relevant for StatefulSets? — Same purpose as Deployments — ensures a Pod stays healthy for a minimum time before the controller proceeds to the next ordinal.<br>
+<strong>31.</strong> What's the risk of an application hardcoding assumptions about ordinal 0 being "special" (e.g. bootstrap leader)? — If ordinal 0 is ever deleted/recreated, re-electing or re-bootstrapping logic must handle that correctly, or the cluster can get stuck.<br>
+<strong>32.</strong> Does deleting a StatefulSet delete its headless Service? — No — the Service is a separate object you must manage/delete independently.<br>
+<strong>33.</strong> What's the effect of changing volumeClaimTemplates on an existing StatefulSet? — It only affects newly created ordinals going forward — existing PVCs are untouched.<br>
+<strong>34.</strong> How would you migrate a StatefulSet to larger storage per replica? — Typically via PVC resize (if the StorageClass supports expansion) rather than editing volumeClaimTemplates, since existing PVCs aren't retroactively changed.<br>
+<strong>35.</strong> What's the purpose of updateStrategy: OnDelete? — Disables automatic rolling updates entirely — Pods are only replaced with the new template when manually deleted, giving full manual control over timing.<br>
+<strong>36.</strong> Why might a team choose OnDelete for a critical database StatefulSet? — To control exactly when each replica is updated, coordinating with maintenance windows or manual failover checks.<br>
+<strong>37.</strong> Does the StatefulSet controller use owner references on Pods like a ReplicaSet does? — Yes — Pods carry ownerReferences back to the StatefulSet for garbage collection purposes.<br>
+<strong>38.</strong> What happens if you try to change serviceName after creation? — It's immutable — you'd need to recreate the StatefulSet to change it.<br>
+<strong>39.</strong> Can a StatefulSet's Pods be part of a NetworkPolicy the same way as any other Pod? — Yes — NetworkPolicy selection is purely label-based and doesn't distinguish controller type.<br>
+<strong>40.</strong> Why is it important to monitor PVC capacity for StatefulSet workloads specifically? — Databases/brokers commonly hit disk-full conditions gradually, and PVC resize/replacement is more involved than for stateless storage.<br>
+<strong>41.</strong> What's a realistic StatefulSet incident scenario? — A node hosting kafka-1's zonal volume fails permanently — the Pod can't reschedule elsewhere without manual PVC/volume intervention.<br>
+<strong>42.</strong> How does a StatefulSet differ from a Deployment in terms of Service requirement? — A Deployment works fine with just a normal ClusterIP Service; a StatefulSet specifically needs a headless one for per-Pod DNS to function.<br>
+<strong>43.</strong> What's the significance of stable network identity for leader election protocols? — Peers can reliably reference a specific, unchanging address for quorum/voting logic instead of re-discovering shifting IPs.<br>
+<strong>44.</strong> Is it possible to run a StatefulSet without any volumeClaimTemplates at all? — Yes — if the workload only needs stable naming/identity/ordering but no persistent per-replica storage.<br>
+<strong>45.</strong> What's the risk of accidentally deleting a PVC belonging to a live StatefulSet ordinal? — The next scheduling of that ordinal provisions a brand-new empty volume, silently losing that replica's data.<br>
+<strong>46.</strong> How do you safely decommission a StatefulSet replica and its data together? — Explicitly delete both the StatefulSet's replica count (scale down) and the corresponding orphaned PVC afterward.<br>
+<strong>47.</strong> Why do some teams run their own Operator instead of a bare StatefulSet for complex databases? — Operators encode domain-specific logic (backup, failover, version-aware upgrades) that a bare StatefulSet's generic ordering/identity model doesn't cover.<br>
+<strong>48.</strong> Can StatefulSet Pods be part of a Deployment's rollout at the same time? — No — they're mutually exclusive controller types; a Pod belongs to exactly one owning controller.<br>
+<strong>49.</strong> What field would show you the currently observed vs desired generation of a StatefulSet? — <code>status.observedGeneration</code> compared to <code>metadata.generation</code>.<br>
+<strong>50.</strong> What's the first thing to check when a StatefulSet is stuck creating ordinal N? — <code>kubectl describe pod &lt;name&gt;-N</code> for PVC binding failures or scheduling constraints blocking that specific ordinal.
+</div></details>
+
+<footer class="course-footer">Next: Topic 15 — DaemonSets, for running exactly one Pod per node.</footer>
+
+<script>
+  mermaid.initialize({ startOnLoad: true, theme: 'dark' });
+</script>
+
+</body>
+</html>

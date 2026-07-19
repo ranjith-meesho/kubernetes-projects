@@ -1,0 +1,316 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Topic 40: Health Probes — Kubernetes Expert Course</title>
+<link rel="stylesheet" href="styles.css">
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+</head>
+<body>
+
+<header class="course-header">
+  <div class="kicker">Topic 40 of 70</div>
+  <h1>Health Probes</h1>
+  <div class="subtitle">Liveness, readiness, and startup probes — how Kubernetes actually knows whether a container is healthy.</div>
+</header>
+
+<nav class="topic-nav">
+  <a href="39-cluster-autoscaler.html">&larr; Cluster Autoscaler</a>
+  <a href="index.html">Course Index</a>
+  <a href="41-rbac.html">RBAC &rarr;</a>
+</nav>
+
+<h2 id="explanation">Explanation</h2>
+<p><strong>Health probes</strong> are how the kubelet actively checks whether a container is working correctly, rather
+than assuming a running process means a healthy service. Kubernetes defines three distinct probe types, each answering
+a different question:</p>
+<ul>
+  <li><strong>Liveness probe</strong> — "is this container still alive, or is it stuck/deadlocked and needs to be restarted?" Failure triggers a container restart.</li>
+  <li><strong>Readiness probe</strong> — "is this container currently able to serve traffic?" Failure removes the Pod from Service Endpoints, but does <em>not</em> restart it.</li>
+  <li><strong>Startup probe</strong> — "has this container finished its (possibly slow) initial startup yet?" While it's failing, liveness and readiness probes are suppressed entirely, preventing a slow-starting app from being killed prematurely.</li>
+</ul>
+
+<p>Kubernetes needs these because "the process is running" and "the process is healthy" are very different facts. A
+container can be alive but permanently deadlocked (needs a restart) or alive but temporarily overloaded/warming up its
+cache (should stop receiving traffic but shouldn't be killed). Without probes, Kubernetes has no signal for either
+situation — it would keep sending traffic to a hung Pod, or keep declaring a Pod "Running" indefinitely even if the
+application inside crashed into an unresponsive state without exiting the process.</p>
+
+<p>Each probe can be implemented via one of four mechanisms: <strong>HTTP GET</strong> (success = 2xx/3xx response
+code), <strong>TCP socket</strong> (success = connection opens), <strong>exec</strong> (success = command exits 0
+inside the container), or <strong>gRPC</strong> (success = the gRPC health-checking protocol reports SERVING). HTTP
+and gRPC probes are the most expressive since they let the application report its own true internal state (e.g. "DB
+connection pool exhausted" can fail readiness specifically), while TCP/exec are simpler fallbacks for apps that don't
+expose a dedicated health endpoint.</p>
+
+<p>Timing fields control probe behavior precisely: <code>initialDelaySeconds</code> (wait before the first probe),
+<code>periodSeconds</code> (how often to probe), <code>timeoutSeconds</code> (how long to wait for a response),
+<code>successThreshold</code> (consecutive successes needed to flip from failing to healthy), and
+<code>failureThreshold</code> (consecutive failures needed to flip from healthy to failing). Getting these values
+wrong is one of the most common causes of production incidents: too aggressive and transient blips cause unnecessary
+restarts or traffic removal; too lax and a genuinely broken Pod keeps receiving traffic for too long.</p>
+
+<p>In production, the startup probe exists specifically to solve the tension between slow-starting applications (JVMs
+with large classpaths, apps warming caches) and aggressive liveness probes — before startup probes existed, teams had
+to set a huge <code>initialDelaySeconds</code> on the liveness probe itself, which meant a genuinely hung app during
+steady-state operation wouldn't be caught for just as long. Startup probes decouple "how long is startup allowed to
+take" from "how quickly should we detect a hang once running."</p>
+
+<div class="callout good">
+  <strong>Rule of thumb:</strong> readiness probes should check <em>this instance's</em> ability to serve traffic right
+  now (including its dependencies, like DB connectivity); liveness probes should check only whether the process itself
+  is fundamentally stuck — never make a liveness probe depend on an external service, or an external outage will
+  trigger a restart storm across every Pod that depends on it.
+</div>
+
+<h2 id="internal-working">Internal Working / Interactions</h2>
+<ul>
+  <li><strong>kubelet:</strong> owns and executes all probes locally on the node — it runs the HTTP/TCP/exec/gRPC check directly against the container, on the schedule defined by the probe's timing fields; no other component performs probing.</li>
+  <li><strong>Container runtime:</strong> invoked by kubelet for exec probes (runs the command inside the container's namespace) and implicitly for restarts triggered by liveness failures (kubelet asks the runtime to kill and recreate the container).</li>
+  <li><strong>API Server:</strong> kubelet reports probe-derived status (Ready condition, restart count) back to the API Server, updating the Pod's <code>status</code> subresource.</li>
+  <li><strong>EndpointSlice controller / kube-proxy:</strong> react to the Pod's Ready condition — a failing readiness probe removes the Pod from the Service's EndpointSlice, which kube-proxy then removes from its load-balancing rules, stopping new traffic within roughly one control-loop cycle.</li>
+  <li><strong>Deployment/ReplicaSet rollout logic:</strong> readiness gates whether a Pod counts as "available" during a rolling update — a new Pod that never becomes Ready blocks the rollout from progressing past <code>maxUnavailable</code>/<code>maxSurge</code> bounds.</li>
+</ul>
+
+<h2 id="architecture-diagram">Architecture Diagram</h2>
+<pre class="mermaid">
+flowchart LR
+    subgraph Pod["Pod: checkout-abc"]
+        C["Container"]
+    end
+    KL["kubelet"] -->|"startupProbe: exec/HTTP\n(suppresses others until success)"| C
+    KL -->|"livenessProbe: HTTP GET /healthz/live"| C
+    KL -->|"readinessProbe: HTTP GET /healthz/ready"| C
+
+    C -->|"liveness fails"| RESTART["kubelet restarts container"]
+    C -->|"readiness fails"| REMOVE["Pod removed from\nService EndpointSlice"]
+    REMOVE --> KP["kube-proxy updates\niptables/IPVS rules"]
+</pre>
+
+<pre class="mermaid">
+stateDiagram-v2
+    [*] --> Starting: Container created
+    Starting --> Starting: startupProbe failing (liveness/readiness suppressed)
+    Starting --> Running: startupProbe succeeds
+    Running --> Ready: readinessProbe succeeds
+    Ready --> NotReady: readinessProbe fails (traffic removed, no restart)
+    NotReady --> Ready: readinessProbe succeeds again
+    Running --> Restarting: livenessProbe fails failureThreshold times
+    Restarting --> Starting: Container recreated
+    Ready --> [*]: Pod deleted
+</pre>
+
+<h2 id="code-example">Code Example</h2>
+<pre><code>apiVersion: v1
+kind: Pod
+metadata:
+  name: checkout-service
+spec:
+  containers:
+    - name: checkout
+      image: registry.internal/checkout-service:2.4.1
+      ports:
+        - containerPort: 8080
+      startupProbe:                       # gives slow-starting JVM app room to boot
+        httpGet:
+          path: /healthz/startup
+          port: 8080
+        failureThreshold: 30                # 30 * 10s = up to 5 minutes to start
+        periodSeconds: 10
+      livenessProbe:                      # only checks "is the process fundamentally stuck"
+        httpGet:
+          path: /healthz/live
+          port: 8080
+        initialDelaySeconds: 0              # startup probe already handled the warmup wait
+        periodSeconds: 15
+        timeoutSeconds: 3
+        failureThreshold: 3                 # 3 consecutive failures (45s) before restart
+      readinessProbe:                     # checks real dependencies (DB, cache) too
+        httpGet:
+          path: /healthz/ready
+          port: 8080
+        periodSeconds: 5
+        timeoutSeconds: 2
+        failureThreshold: 2                 # fast to pull traffic away (10s)
+        successThreshold: 1
+</code></pre>
+
+<pre><code>apiVersion: v1
+kind: Pod
+metadata:
+  name: legacy-tcp-app
+spec:
+  containers:
+    - name: app
+      image: registry.internal/legacy-app:1.0
+      ports:
+        - containerPort: 9000
+      livenessProbe:
+        tcpSocket:                          # no HTTP health endpoint available - fall back to TCP
+          port: 9000
+        periodSeconds: 10
+        failureThreshold: 3
+      readinessProbe:
+        exec:                               # run a script inside the container to check readiness
+          command: ["sh", "-c", "pg_isready -h localhost -p 5432"]
+        periodSeconds: 10
+        failureThreshold: 2
+</code></pre>
+
+<h2 id="kubectl-commands">kubectl Commands</h2>
+<pre><code># See current Ready condition and restart count
+kubectl get pod checkout-service -o wide
+
+# Full probe configuration and recent restart events
+kubectl describe pod checkout-service
+
+# See exactly which probe failed and why (Events section)
+kubectl get events --field-selector involvedObject.name=checkout-service
+
+# Check readiness state feeding into a Service's endpoints
+kubectl get endpointslices -l kubernetes.io/service-name=checkout-svc
+
+# Watch restart count increase live during a liveness failure test
+kubectl get pod checkout-service -w
+
+# Manually exec the same command your exec probe runs, to debug it directly
+kubectl exec -it checkout-service -- sh -c "pg_isready -h localhost -p 5432"
+</code></pre>
+
+<h2 id="best-practices">Best Practices &amp; Common Pitfalls</h2>
+<div class="grid-2">
+<div>
+<h4>Do's</h4>
+<ul>
+  <li>Use separate endpoints for liveness vs readiness — liveness should never check downstream dependencies.</li>
+  <li>Use a startup probe for any app with variable or slow boot time instead of inflating liveness's initialDelaySeconds.</li>
+  <li>Set readiness failureThreshold low (fast to pull traffic) and liveness failureThreshold a bit higher (avoid restart storms on blips).</li>
+  <li>Make probe endpoints lightweight — they run frequently and shouldn't add real load to the app.</li>
+</ul>
+</div>
+<div>
+<h4>Don'ts</h4>
+<ul>
+  <li>Don't make liveness probes depend on external services (DB, downstream API) — an outage there causes a cascading restart storm everywhere.</li>
+  <li>Don't set aggressive timeouts on probes for apps under variable load — false failures cause unnecessary restarts/traffic pulls.</li>
+  <li>Don't skip readiness probes on Deployments — without one, a Pod is considered Ready the instant its container starts, even if the app isn't actually ready to serve.</li>
+  <li>Don't forget exec probes fork a process inside the container on every check — expensive/frequent exec probes can add real CPU overhead at scale.</li>
+</ul>
+</div>
+</div>
+
+<h2 id="interview-questions">50 Interview Questions</h2>
+
+<details class="qa"><summary>1. What are the three Kubernetes probe types and what question does each answer?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Liveness ("is this container stuck and needs a restart?"), readiness ("can this container serve traffic right now?"), and startup ("has this container finished its possibly-slow initial startup?").
+<br><strong>Detail:</strong> Liveness failure triggers a restart; readiness failure removes the Pod from Service Endpoints without restarting it; while startup is failing, liveness and readiness are suppressed entirely.
+<br><strong>Production example:</strong> checkout-service uses all three — a startup probe gating JVM boot, a liveness probe checking only process health, and a readiness probe checking real DB/cache dependencies.
+<br><strong>Common mistake:</strong> Using only a liveness probe and assuming it also handles "should this Pod receive traffic" — that's readiness's job specifically.</div></details>
+
+<details class="qa"><summary>2. Why does Kubernetes need probes at all — isn't "process running" enough?</summary>
+<div class="qa-body"><strong>Short answer:</strong> A container can be alive but permanently deadlocked, or alive but temporarily overloaded/warming up — "running" and "healthy" are different facts that only active checks can distinguish.
+<br><strong>Detail:</strong> Without probes, Kubernetes would keep sending traffic to a hung Pod, or keep declaring a Pod Running indefinitely even if the app crashed into an unresponsive state without exiting the process.
+<br><strong>Production example:</strong> A deadlocked JVM thread pool leaves the process alive but unable to handle requests — only a liveness probe failure and subsequent restart resolves it.
+<br><strong>Common mistake:</strong> Assuming Kubernetes has some built-in application-health awareness beyond the exit code and probes you explicitly configure.</div></details>
+
+<details class="qa"><summary>3. What are the four probe mechanisms and when would you choose each?</summary>
+<div class="qa-body"><strong>Short answer:</strong> HTTP GET (2xx/3xx success), TCP socket (connection opens), exec (command exits 0), and gRPC (SERVING via the gRPC health-checking protocol).
+<br><strong>Detail:</strong> HTTP and gRPC are most expressive since the app can report true internal state (e.g. fail readiness specifically for "DB pool exhausted"); TCP/exec are simpler fallbacks for apps without a dedicated health endpoint.
+<br><strong>Production example:</strong> legacy-tcp-app uses a tcpSocket liveness probe (no HTTP endpoint available) and an exec readiness probe running <code>pg_isready</code> inside the container.
+<br><strong>Common mistake:</strong> Defaulting to TCP/exec probes even when the app exposes a proper HTTP health endpoint that could report more specific failure states.</div></details>
+
+<details class="qa"><summary>4. Explain each of the five probe timing fields.</summary>
+<div class="qa-body"><strong>Short answer:</strong> <code>initialDelaySeconds</code> (wait before first probe), <code>periodSeconds</code> (how often to probe), <code>timeoutSeconds</code> (how long to wait for a response), <code>successThreshold</code> (consecutive successes to flip failing→healthy), <code>failureThreshold</code> (consecutive failures to flip healthy→failing).
+<br><strong>Detail:</strong> Getting these wrong is one of the most common causes of production incidents — too aggressive and blips cause unnecessary restarts/traffic removal; too lax and a genuinely broken Pod keeps receiving traffic too long.
+<br><strong>Production example:</strong> checkout-service's readiness probe uses <code>failureThreshold: 2</code> with <code>periodSeconds: 5</code> (10s to pull traffic) while its liveness probe uses <code>failureThreshold: 3</code> with <code>periodSeconds: 15</code> (45s before restart).
+<br><strong>Common mistake:</strong> Copy-pasting the same threshold values for liveness and readiness without considering their very different risk profiles.</div></details>
+
+<details class="qa"><summary>5. Why should liveness probes never depend on external services?</summary>
+<div class="qa-body"><strong>Short answer:</strong> If liveness checks a downstream dependency (DB, external API) and that dependency has an outage, every Pod depending on it fails liveness simultaneously and gets restarted — a self-inflicted restart storm that fixes nothing.
+<br><strong>Detail:</strong> Restarting the container doesn't fix an external outage; it just adds churn on top of an already-degraded situation, and may make recovery slower once the dependency comes back.
+<br><strong>Production example:</strong> checkout-service's liveness probe checks only <code>/healthz/live</code> (process health), while dependency checks (DB connectivity) live exclusively in the readiness probe.
+<br><strong>Common mistake:</strong> Wiring a liveness endpoint to return unhealthy whenever any downstream call fails, rather than reserving that signal for readiness.</div></details>
+
+<details class="qa"><summary>6. What problem does the startup probe solve that didn't have a good solution before it existed?</summary>
+<div class="qa-body"><strong>Short answer:</strong> It decouples "how long is startup allowed to take" from "how quickly should we detect a hang once running," which a single liveness probe with a huge <code>initialDelaySeconds</code> couldn't do.
+<br><strong>Detail:</strong> Before startup probes, teams had to inflate liveness's <code>initialDelaySeconds</code> to tolerate slow boots, which meant a genuinely hung app during steady-state operation wouldn't be caught for just as long.
+<br><strong>Production example:</strong> checkout-service's startup probe allows up to 5 minutes to boot (<code>failureThreshold: 30</code> at <code>periodSeconds: 10</code>) while its liveness probe uses <code>initialDelaySeconds: 0</code> since startup already handled the warmup wait.
+<br><strong>Common mistake:</strong> Still inflating liveness's initialDelaySeconds for a slow-booting app instead of adding a dedicated startup probe.</div></details>
+
+<details class="qa"><summary>7. What exactly happens to a Pod when its readiness probe fails?</summary>
+<div class="qa-body"><strong>Short answer:</strong> The Pod is removed from the Service's EndpointSlice (so kube-proxy stops routing traffic to it), but the container is not restarted and continues running.
+<br><strong>Detail:</strong> This happens within roughly one control-loop cycle — the EndpointSlice controller reacts to the Pod's Ready condition, and kube-proxy updates its iptables/IPVS rules accordingly.
+<br><strong>Production example:</strong> checkout-service's readiness probe checking DB connectivity fails during a brief DB blip, pulling that one Pod out of rotation for ~10s without restarting it.
+<br><strong>Common mistake:</strong> Expecting a readiness failure to eventually trigger a restart if it persists — it never does; only liveness failures cause restarts.</div></details>
+
+<details class="qa"><summary>8. How do readiness probes interact with a rolling update?</summary>
+<div class="qa-body"><strong>Short answer:</strong> A new Pod only counts as "available" during a rollout once it passes its readiness probe — a Pod that never becomes Ready blocks the rollout from progressing past its <code>maxUnavailable</code>/<code>maxSurge</code> bounds.
+<br><strong>Detail:</strong> This makes readiness probes a built-in safety gate for deployments — a broken new version that fails readiness will stall the rollout rather than fully replacing healthy old Pods.
+<br><strong>Production example:</strong> A bad checkout-service release that fails <code>/healthz/ready</code> immediately halts the rollout at the first unavailable new Pod, protecting the rest of the fleet.
+<br><strong>Common mistake:</strong> Skipping readiness probes on a Deployment, which removes this safety gate — a Pod is then considered Ready the instant its container starts, even if the app isn't truly ready.</div></details>
+
+<details class="qa"><summary>9. Who actually executes probes, and how does a liveness failure turn into a restart?</summary>
+<div class="qa-body"><strong>Short answer:</strong> The kubelet owns and executes all probes locally on the node against the container directly, on the schedule the probe's timing fields define; on liveness failure it asks the container runtime to kill and recreate the container.
+<br><strong>Detail:</strong> No other cluster component performs probing — it's entirely local to the node, which is why probe results feed back into the API Server only as a status update (Ready condition, restart count), not as a live decision made elsewhere.
+<br><strong>Production example:</strong> A restart count increase visible via <code>kubectl get pod -w</code> reflects the kubelet's own liveness-triggered restart action, taken without any round-trip to the control plane for the decision itself.
+<br><strong>Common mistake:</strong> Assuming the API Server or a controller decides to restart a container — the kubelet decides and acts locally, then reports the outcome.</div></details>
+
+<details class="qa"><summary>10. What's a hidden cost risk specifically with exec probes at scale?</summary>
+<div class="qa-body"><strong>Short answer:</strong> An exec probe forks a new process inside the container's namespace on every single check — frequent or expensive exec probes can add real CPU overhead across a large fleet.
+<br><strong>Detail:</strong> This is a cost HTTP/gRPC/TCP probes don't share, since those don't spawn a process per check — it's a specific reason to prefer HTTP/gRPC when an app exposes a proper health endpoint.
+<br><strong>Production example:</strong> legacy-tcp-app's readiness probe execs <code>pg_isready</code> every 10 seconds per Pod — multiplied across many replicas, this is measurable overhead compared to an equivalent HTTP check.
+<br><strong>Common mistake:</strong> Choosing exec probes purely out of convenience for apps that could instead expose a lightweight HTTP health endpoint.</div></details>
+
+<details class="qa"><summary>11–50. Additional rapid-fire questions</summary>
+<div class="qa-body">
+<strong>11.</strong> Which probe type never restarts a container on failure? — Readiness — it only removes the Pod from Service Endpoints.<br>
+<strong>12.</strong> Which probe type is entirely suppressed while another probe is still failing? — Liveness and readiness are both suppressed while the startup probe hasn't yet succeeded.<br>
+<strong>13.</strong> What does a startupProbe success threshold transition into? — Once it succeeds, liveness and readiness probes begin running normally.<br>
+<strong>14.</strong> What's the success condition for an HTTP GET probe? — A 2xx or 3xx response code.<br>
+<strong>15.</strong> What's the success condition for a TCP socket probe? — The connection opens successfully.<br>
+<strong>16.</strong> What's the success condition for an exec probe? — The command exits with status 0 inside the container.<br>
+<strong>17.</strong> What's the success condition for a gRPC probe? — The gRPC health-checking protocol reports SERVING.<br>
+<strong>18.</strong> What command shows a Pod's current Ready condition and restart count? — <code>kubectl get pod &lt;name&gt; -o wide</code>.<br>
+<strong>19.</strong> What command shows full probe configuration and recent restart events? — <code>kubectl describe pod &lt;name&gt;</code>.<br>
+<strong>20.</strong> How do you see exactly which probe failed and why? — <code>kubectl get events --field-selector involvedObject.name=&lt;pod&gt;</code>.<br>
+<strong>21.</strong> How do you check readiness state feeding into a Service's endpoints? — <code>kubectl get endpointslices -l kubernetes.io/service-name=&lt;svc&gt;</code>.<br>
+<strong>22.</strong> How do you watch restart count increase live during a liveness failure test? — <code>kubectl get pod &lt;name&gt; -w</code>.<br>
+<strong>23.</strong> How would you manually debug an exec probe's underlying command? — <code>kubectl exec -it &lt;pod&gt; -- &lt;same command the probe runs&gt;</code>.<br>
+<strong>24.</strong> What field determines how many consecutive successes flip a Pod from failing to healthy? — <code>successThreshold</code>.<br>
+<strong>25.</strong> What field determines how many consecutive failures flip a Pod from healthy to failing? — <code>failureThreshold</code>.<br>
+<strong>26.</strong> Why should readiness's failureThreshold typically be lower than liveness's? — To pull a struggling Pod out of traffic quickly, while giving liveness more tolerance to avoid restart storms on transient blips.<br>
+<strong>27.</strong> What kind of app most needs a startup probe? — One with variable or slow boot time, e.g. a JVM with a large classpath or an app warming caches.<br>
+<strong>28.</strong> What does a high startupProbe failureThreshold combined with periodSeconds actually control? — The total time budget allowed for startup (failureThreshold * periodSeconds).<br>
+<strong>29.</strong> What Kubernetes component reports probe-derived status back to the API Server? — The kubelet, updating the Pod's <code>status</code> subresource.<br>
+<strong>30.</strong> What two things react to a Pod's Ready condition changing? — The EndpointSlice controller and kube-proxy, which update load-balancing rules accordingly.<br>
+<strong>31.</strong> Why shouldn't probe endpoints add real load to the application? — They run frequently (often every few seconds per Pod), so an expensive endpoint adds ongoing overhead purely for health checking.<br>
+<strong>32.</strong> What's the risk of setting aggressive timeouts on probes for apps under variable load? — False failures — a temporarily slow-but-healthy response gets treated as a failure, causing unnecessary restarts or traffic pulls.<br>
+<strong>33.</strong> Can a readiness probe check that a downstream DB connection pool isn't exhausted? — Yes — that's exactly the kind of app-specific internal state an HTTP/gRPC readiness endpoint is well suited to report.<br>
+<strong>34.</strong> Should a liveness probe check the same DB connection pool? — No — that would make liveness fail during a DB outage, causing a needless restart storm rather than just pulling traffic.<br>
+<strong>35.</strong> What happens if you never configure a readiness probe on a Deployment at all? — The Pod is considered Ready the instant its container starts, potentially serving traffic before the app is actually ready.<br>
+<strong>36.</strong> What Kubernetes object subresource records probe-derived Pod state? — The Pod's <code>status</code> subresource.<br>
+<strong>37.</strong> What invokes the exec probe's command inside the container? — The container runtime, at kubelet's request, running it inside the container's namespace.<br>
+<strong>38.</strong> Does a liveness restart go through the full Pod scheduling pipeline again? — No — the kubelet asks the runtime to kill and recreate the same container in place, not reschedule a new Pod.<br>
+<strong>39.</strong> What's a good rule of thumb distinguishing what liveness vs readiness should check? — Readiness checks this instance's current ability to serve traffic (including dependencies); liveness checks only whether the process itself is fundamentally stuck.<br>
+<strong>40.</strong> Why is <code>initialDelaySeconds: 0</code> reasonable on a liveness probe when a startup probe is also configured? — The startup probe already handles the warmup wait, so liveness doesn't need its own separate delay.<br>
+<strong>41.</strong> What's a realistic production incident from skipping a startup probe on a slow-booting app? — The liveness probe fires and restarts the container mid-boot, creating a crash loop that never actually finishes starting.<br>
+<strong>42.</strong> Why is <code>pg_isready</code> a typical exec readiness check? — It directly tests whether the app's Postgres dependency is reachable, which an HTTP health endpoint might not otherwise expose.<br>
+<strong>43.</strong> What's the relationship between probes and QoS/OOM behavior? — None directly — probes govern traffic/restart behavior based on health signals, while QoS/OOM (topic 36) governs eviction under resource pressure; they're independent mechanisms.<br>
+<strong>44.</strong> Why might a team choose TCP socket over HTTP GET for a legacy app? — Because the app has no HTTP health endpoint available, so a simple "does the port accept connections" check is the best available fallback.<br>
+<strong>45.</strong> What's the danger of setting periodSeconds very low on an expensive exec probe? — Frequent forking of a process inside the container adds real, avoidable CPU overhead at scale.<br>
+<strong>46.</strong> Can readiness probes cause a rolling update to stall indefinitely? — Yes — if new Pods never pass readiness, the rollout can't progress past its maxUnavailable/maxSurge bounds.<br>
+<strong>47.</strong> What's the fastest way to confirm whether a Pod's traffic removal was a readiness failure or a crash? — Check restart count (crash/liveness) vs the Ready condition and readiness-related Events (readiness failure without a restart).<br>
+<strong>48.</strong> Why does gRPC get its own dedicated probe mechanism instead of relying on TCP? — Because the gRPC health-checking protocol reports a proper SERVING/NOT_SERVING status, which is more meaningful than a bare TCP connection check for gRPC services.<br>
+<strong>49.</strong> What's the risk of copying a liveness probe's failureThreshold onto readiness verbatim? — It removes the intentional asymmetry — readiness should typically react faster since removing traffic is lower-risk than restarting a container.<br>
+<strong>50.</strong> What's the one-line interview summary of health probes? — Three kubelet-executed checks — startup, liveness, readiness — that answer "has it booted," "is it stuck," and "can it serve traffic," each triggering a different, deliberately distinct consequence.
+</div></details>
+
+<footer class="course-footer">Next up: Topic 41 — RBAC: Roles, ClusterRoles, and bindings that enforce least-privilege access.</footer>
+
+<script>
+  mermaid.initialize({ startOnLoad: true, theme: 'dark' });
+</script>
+
+</body>
+</html>

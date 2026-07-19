@@ -1,0 +1,228 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Topic 26: StorageClass — Kubernetes Expert Course</title>
+<link rel="stylesheet" href="styles.css">
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+</head>
+<body>
+
+<header class="course-header">
+  <div class="kicker">Topic 26 of 70</div>
+  <h1>StorageClass</h1>
+  <div class="subtitle">The template for dynamic provisioning: provisioners, parameters, and volumeBindingMode.</div>
+</header>
+
+<nav class="topic-nav">
+  <a href="25-pvc.html">&larr; PersistentVolumeClaim</a>
+  <a href="index.html">Course Index</a>
+  <a href="27-csi.html">CSI &rarr;</a>
+</nav>
+
+<h2 id="explanation">Explanation</h2>
+<p>A <strong>StorageClass</strong> is the template that tells Kubernetes how to create storage on demand. Without it, every PV needs a human to provision the backing disk out-of-band and write the PV YAML by hand — workable for a handful of volumes, unworkable for hundreds of PVCs created daily by CI pipelines, StatefulSets, and self-service developer namespaces. A StorageClass names a <strong>provisioner</strong> (the plugin responsible for actually creating storage — almost always a CSI driver identifier like <code>ebs.csi.aws.com</code> or <code>pd.csi.storage.gke.io</code>) plus a set of <strong>parameters</strong> specific to that provisioner (disk type, IOPS, filesystem, encryption key, replication factor).</p>
+<p>The core idea: a PVC that sets <code>storageClassName: fast-ssd</code> is not requesting a specific disk — it's requesting "whatever <code>fast-ssd</code> is configured to produce." This lets platform teams define a small menu of storage tiers (e.g. <code>standard</code>, <code>fast-ssd</code>, <code>archive</code>) once, and every application team just picks a tier by name without needing storage-vendor knowledge.</p>
+<p><code>reclaimPolicy</code> on the StorageClass becomes the default reclaim policy stamped onto every PV it dynamically creates — this is where most teams first encounter the Delete-vs-Retain decision, since it's set once at the class level rather than per-PV.</p>
+<p><code>volumeBindingMode</code> controls <em>when</em> the actual disk gets created, and it matters a lot for multi-zone clusters. <code>Immediate</code> (the historical default) provisions the volume as soon as the PVC is created, before any Pod is scheduled — which can create a disk in zone A while the Scheduler later decides to place the Pod in zone B, resulting in a Pod that can never attach its volume. <code>WaitForFirstConsumer</code> delays provisioning until a Pod that uses the PVC is actually scheduled, so the provisioner can create the disk in the exact zone the Scheduler picked — the correct choice for essentially all zone-aware cloud storage today.</p>
+<p>A cluster typically has one StorageClass marked as default (via the <code>storageclass.kubernetes.io/is-default-class</code> annotation) so PVCs that omit <code>storageClassName</code> still get dynamically provisioned rather than staying Pending forever.</p>
+
+<h2 id="internal-working">Internal Working / Interactions</h2>
+<ul>
+<li><strong>PVC</strong> — references a StorageClass by name (or uses the cluster default).</li>
+<li><strong>External provisioner sidecar</strong> — a controller running alongside the CSI driver that watches PVCs and calls <code>CreateVolume</code> when their StorageClass matches its driver name.</li>
+<li><strong>Scheduler</strong> — with <code>WaitForFirstConsumer</code>, the scheduler's node decision happens first and informs which topology the provisioner uses.</li>
+<li><strong>CSI driver</strong> — receives the provisioner's request and talks to the actual cloud/storage backend.</li>
+</ul>
+
+<h2 id="architecture-diagram">Architecture Diagram</h2>
+<pre class="mermaid">
+flowchart LR
+  PVC[PVC: storageClassName=fast-ssd] --> SC[StorageClass fast-ssd]
+  SC -->|provisioner: ebs.csi.aws.com| Sidecar[External Provisioner Sidecar]
+  SC -->|volumeBindingMode| Mode{Immediate or WaitForFirstConsumer?}
+  Mode -->|WaitForFirstConsumer| Sched[Wait for Scheduler to pick a node/zone]
+  Sched --> Sidecar
+  Mode -->|Immediate| Sidecar
+  Sidecar --> CSI[CSI Driver CreateVolume]
+  CSI --> Cloud[(Cloud Disk in correct zone)]
+  CSI --> NewPV[New PV object, reclaimPolicy from SC]
+</pre>
+
+<h2 id="code-example">Code Example</h2>
+<pre><code># StorageClass for zone-aware SSD block storage on AWS
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: fast-ssd
+  annotations:
+    storageclass.kubernetes.io/is-default-class: "true"  # PVCs with no storageClassName use this
+provisioner: ebs.csi.aws.com          # CSI driver that implements provisioning
+parameters:
+  type: gp3                            # driver-specific: EBS volume type
+  fsType: ext4
+  encrypted: "true"
+reclaimPolicy: Delete                  # PVs created here default to Delete on PVC removal
+allowVolumeExpansion: true             # lets PVCs referencing this class be resized later
+volumeBindingMode: WaitForFirstConsumer  # provision only after a Pod is scheduled, in its zone
+
+---
+# StorageClass for a cheaper, retained "archive" tier
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: archive
+provisioner: ebs.csi.aws.com
+parameters:
+  type: sc1                            # cold HDD-backed, cheaper, lower IOPS
+reclaimPolicy: Retain                  # keep data even if the PVC is deleted — deliberate choice
+volumeBindingMode: WaitForFirstConsumer
+</code></pre>
+
+<h2 id="kubectl-commands">kubectl Commands</h2>
+<pre><code>kubectl get storageclass                        # list all StorageClasses, note the (default) marker
+kubectl describe storageclass fast-ssd          # provisioner, parameters, reclaimPolicy, bindingMode
+kubectl get sc -o jsonpath='{.items[*].metadata.name}'  # quick list of class names
+kubectl patch storageclass standard -p '{"metadata":{"annotations":{"storageclass.kubernetes.io/is-default-class":"false"}}}'  # unset old default
+kubectl get pvc -A -o custom-columns=NAME:.metadata.name,CLASS:.spec.storageClassName  # audit which class each PVC uses
+kubectl get events -A --field-selector reason=ProvisioningFailed  # find provisioning errors cluster-wide
+</code></pre>
+
+<h2 id="best-practices">Best Practices &amp; Common Pitfalls</h2>
+<div class="grid-2">
+<div class="callout good">
+<strong>Do</strong>
+<ul>
+<li>Default to <code>WaitForFirstConsumer</code> for any zone-aware/multi-AZ cluster.</li>
+<li>Keep exactly one StorageClass marked default to avoid ambiguity.</li>
+<li>Expose a small, well-documented menu of classes (tiered by performance/cost) rather than one-off classes per team.</li>
+<li>Set <code>allowVolumeExpansion: true</code> so growth doesn't require data migration.</li>
+</ul>
+</div>
+<div class="callout warn">
+<strong>Pitfalls</strong>
+<ul>
+<li><code>Immediate</code> binding mode in a multi-zone cluster causing "volume node affinity conflict" scheduling failures.</li>
+<li>Two StorageClasses both marked default, causing unpredictable PVC behavior.</li>
+<li>Leaving <code>reclaimPolicy: Delete</code> on a class used for stateful production data by default.</li>
+<li>Assuming StorageClass changes retroactively affect already-bound PVCs — they don't, only new PVCs.</li>
+</ul>
+</div>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="interview-questions">50 Interview Questions</h2>
+
+<details class="qa"><summary>1. Why does a StorageClass separate the "provisioner" field from the "parameters" block instead of having one flat driver config?</summary>
+<div class="qa-body"><strong>Short answer:</strong> The provisioner names which plugin (CSI driver) handles the request; parameters are an opaque, driver-specific bag of settings that only that plugin understands.
+<br><strong>Detailed explanation:</strong> Kubernetes core has no idea what "gp3" or "encrypted" mean — it just passes the parameters map straight through to whichever CSI driver the provisioner field identifies. This keeps the StorageClass API stable across every possible backend while still letting each driver expose its own knobs.
+<br><strong>Production example:</strong> The same cluster can have a <code>fast-ssd</code> class using <code>provisioner: ebs.csi.aws.com</code> with <code>type: gp3</code> and an on-prem <code>vsan</code> class using a completely different provisioner and parameter set, with no changes needed to Kubernetes itself.
+<br><strong>Common mistake:</strong> Copy-pasting parameters from one cloud's StorageClass example into a different provisioner's class, where those keys are silently ignored or rejected.</div></details>
+
+<details class="qa"><summary>2. What actually happens between a PVC being created and a disk existing, when it references a StorageClass?</summary>
+<div class="qa-body"><strong>Short answer:</strong> An external-provisioner sidecar running alongside the CSI driver watches for unbound PVCs, matches their StorageClass to its own driver name, and calls the CSI <code>CreateVolume</code> RPC.
+<br><strong>Detailed explanation:</strong> The StorageClass itself does nothing passively — it's just a lookup target. The sidecar controller is the active component: it lists PVCs, filters to ones whose <code>storageClassName</code> resolves to a class with a matching provisioner, and drives the actual create-and-bind sequence, producing a new PV object once the disk exists.
+<br><strong>Production example:</strong> If the external-provisioner Pod for a given CSI driver crashes, new PVCs referencing that driver's StorageClass sit indefinitely in <code>Pending</code> even though the StorageClass YAML looks perfectly correct.
+<br><strong>Common mistake:</strong> Debugging a stuck PVC by only inspecting the StorageClass object, instead of checking the health/logs of the provisioner sidecar that's supposed to act on it.</div></details>
+
+<details class="qa"><summary>3. Why does reclaimPolicy live on the StorageClass rather than being set per-PVC?</summary>
+<div class="qa-body"><strong>Short answer:</strong> reclaimPolicy governs what happens to the underlying disk, which is a property of the PV the class creates — so it's set once at the class level and stamped onto every PV it produces.
+<br><strong>Detailed explanation:</strong> PVCs are a request for storage, not an owner of disk-lifecycle policy; letting every PVC author choose Delete vs Retain would make data-loss risk inconsistent across a namespace. Centralizing it on the class means a platform team makes that call once per storage tier.
+<br><strong>Production example:</strong> A <code>fast-ssd</code> class defaults to <code>reclaimPolicy: Delete</code> for ephemeral CI workloads, while an <code>archive</code> class defaults to <code>Retain</code> so accidental PVC deletion never destroys long-term backup volumes.
+<br><strong>Common mistake:</strong> Assuming you can change a PV's reclaim policy by editing the StorageClass after the PV already exists — the class's setting only applies at PV-creation time, not retroactively.</div></details>
+
+<details class="qa"><summary>4. What's the practical difference between volumeBindingMode: Immediate and WaitForFirstConsumer, and why does it matter in a multi-zone cluster?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Immediate provisions the disk the moment the PVC is created, before any Pod is scheduled; WaitForFirstConsumer delays provisioning until the Scheduler has picked a node, so the disk is created in the correct zone.
+<br><strong>Detailed explanation:</strong> Cloud block storage is typically zone-locked — a disk created in zone A cannot attach to a node in zone B. With Immediate, the provisioner has no idea where the Pod will land, so it just picks a zone (often arbitrarily), creating a race condition against the Scheduler's later, independent decision.
+<br><strong>Production example:</strong> A StatefulSet Pod gets scheduled to a node in zone B, but its PVC's disk was already provisioned in zone A under Immediate mode — the Pod's volume attach step fails and it never becomes Ready.
+<br><strong>Common mistake:</strong> Leaving a multi-AZ cluster's StorageClass on the historical default of Immediate instead of explicitly setting WaitForFirstConsumer.</div></details>
+
+<details class="qa"><summary>5. What error would you see, and why, if a PVC with Immediate binding gets its disk provisioned in the wrong zone?</summary>
+<div class="qa-body"><strong>Short answer:</strong> The Pod stays stuck in scheduling with an event describing a "volume node affinity conflict."
+<br><strong>Detailed explanation:</strong> The PV created under Immediate mode carries a node affinity restricting it to the zone/nodes where the disk actually lives; if the Scheduler later tries to place the Pod anywhere outside that zone, the PV's affinity rules make every candidate node ineligible, and the Pod can never be scheduled without manual intervention.
+<br><strong>Production example:</strong> A cluster autoscaler adds nodes preferentially in zone C for cost reasons, and Pods whose PVCs were provisioned under Immediate in zone A start failing to schedule cluster-wide.
+<br><strong>Common mistake:</strong> Trying to "fix" the conflict by cordon/draining nodes rather than recognizing the root cause is the StorageClass's binding mode.</div></details>
+
+<details class="qa"><summary>6. Why should a cluster have exactly one StorageClass marked as default, and what happens with the is-default-class annotation?</summary>
+<div class="qa-body"><strong>Short answer:</strong> The <code>storageclass.kubernetes.io/is-default-class: "true"</code> annotation tells Kubernetes which class to use when a PVC omits <code>storageClassName</code>; having more than one creates ambiguity.
+<br><strong>Detailed explanation:</strong> Without a default class, any PVC that doesn't specify one stays unbound with no provisioner to satisfy it. If two classes are both annotated default, the admission behavior becomes implementation-dependent and unpredictable — some PVCs may bind to one, some to the other, with no clear rule from the application author's perspective.
+<br><strong>Production example:</strong> A platform migration that adds a new default-marked class without first unsetting the old one's annotation causes newly created PVCs across the cluster to unpredictably split between the old and new storage tier.
+<br><strong>Common mistake:</strong> Forgetting to patch the old class's annotation to <code>"false"</code> before marking a replacement class as the new default.</div></details>
+
+<details class="qa"><summary>7. Why is allowVolumeExpansion: true on a StorageClass important, and what happens if it's left off?</summary>
+<div class="qa-body"><strong>Short answer:</strong> It permits PVCs referencing that class to be resized later by editing <code>spec.resources.requests.storage</code>; without it, a PVC's size is fixed for life.
+<br><strong>Detailed explanation:</strong> Many CSI drivers support online volume expansion, but Kubernetes only allows the resize request through if the StorageClass that produced the PV explicitly opts in. Omitting it forces teams into disruptive migrate-to-a-bigger-PVC workflows instead of a simple in-place resize.
+<br><strong>Production example:</strong> A database PVC nearing capacity can have its size bumped from 100Gi to 250Gi with a single <code>kubectl edit pvc</code>, with no Pod restart needed if the underlying filesystem supports online growth — but only because the class had <code>allowVolumeExpansion: true</code> set from the start.
+<br><strong>Common mistake:</strong> Discovering the class doesn't allow expansion only after a production disk is nearly full, with no way to retroactively enable it on already-created PVs from a different class.</div></details>
+
+<details class="qa"><summary>8. Why does editing an existing StorageClass's parameters not affect PVs that were already provisioned from it?</summary>
+<div class="qa-body"><strong>Short answer:</strong> A StorageClass is only consulted at the moment a PVC is provisioned; once a PV exists, it's a standalone object disconnected from any future edits to the class.
+<br><strong>Detailed explanation:</strong> The provisioner reads the class's parameters exactly once, at <code>CreateVolume</code> time, and bakes the result into the PV/disk. There's no reconciliation loop that re-applies StorageClass changes to previously created volumes — the class is a template used at creation, not a live source of truth.
+<br><strong>Production example:</strong> Changing a class's <code>type</code> parameter from <code>gp3</code> to a faster tier has zero effect on the hundreds of PVs already provisioned under the old parameters — only PVCs created after the edit get the new disk type.
+<br><strong>Common mistake:</strong> Assuming a StorageClass edit is a fleet-wide upgrade lever, when in reality existing volumes need to be manually recreated or migrated to pick up the change.</div></details>
+
+<details class="qa"><summary>9. Why would a platform team expose a small menu of named StorageClasses (e.g. standard, fast-ssd, archive) instead of letting teams configure raw provisioner parameters directly?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Named tiers hide storage-vendor complexity behind a simple label so application teams pick a tier by name without needing to know CSI parameter semantics.
+<br><strong>Detailed explanation:</strong> This is the whole point of the StorageClass abstraction — a PVC author writes <code>storageClassName: fast-ssd</code> without knowing or caring that it maps to <code>ebs.csi.aws.com</code> with <code>type: gp3</code> and encryption on. It also gives the platform team a single place to change encryption defaults, disk types, or reclaim policy for an entire tier at once.
+<br><strong>Production example:</strong> A compliance requirement to encrypt all new disks is satisfied by adding <code>encrypted: "true"</code> to each StorageClass's parameters once, rather than auditing every application's raw storage config.
+<br><strong>Common mistake:</strong> Letting every team define its own one-off StorageClass with slightly different parameters, defeating the purpose of a curated, auditable tier menu.</div></details>
+
+<details class="qa"><summary>10. How would you troubleshoot a PVC that stays Pending and never gets a PV, when the StorageClass looks correctly configured?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Check <code>kubectl get events</code> for <code>ProvisioningFailed</code> reasons, then confirm the named provisioner's driver Pods are healthy and actually watching that StorageClass.
+<br><strong>Detailed explanation:</strong> A YAML-correct StorageClass can still fail silently if its <code>provisioner</code> string doesn't match any installed CSI driver, the driver's controller Pods are crashlooping, or backend quota/permissions reject the create call — none of which show up by reading the StorageClass object itself.
+<br><strong>Production example:</strong> A typo like <code>ebs.csi.aws.co</code> (missing "m") in the provisioner field leaves the PVC permanently unbound with no driver ever claiming it, and no obvious YAML validation error at apply time.
+<br><strong>Common mistake:</strong> Repeatedly re-applying the same PVC/StorageClass YAML expecting a different result, instead of checking events and the provisioner sidecar's logs for the actual failure reason.</div></details>
+
+<details class="qa"><summary>11–50. Additional rapid-fire questions</summary>
+<div class="qa-body">
+<strong>11.</strong> What API group and kind does a StorageClass belong to? — <code>storage.k8s.io/v1</code>, kind <code>StorageClass</code>.<br>
+<strong>12.</strong> Is StorageClass a namespaced or cluster-scoped resource? — Cluster-scoped; it's shared across all namespaces.<br>
+<strong>13.</strong> What field identifies the CSI driver a StorageClass delegates to? — <code>provisioner</code>.<br>
+<strong>14.</strong> What are the two valid values for reclaimPolicy on a StorageClass? — <code>Delete</code> and <code>Retain</code>.<br>
+<strong>15.</strong> What are the two valid values for volumeBindingMode? — <code>Immediate</code> and <code>WaitForFirstConsumer</code>.<br>
+<strong>16.</strong> Which volumeBindingMode is recommended for multi-zone/multi-AZ clusters? — <code>WaitForFirstConsumer</code>.<br>
+<strong>17.</strong> What annotation marks a StorageClass as the cluster default? — <code>storageclass.kubernetes.io/is-default-class: "true"</code>.<br>
+<strong>18.</strong> What happens to a PVC with no storageClassName if no default class exists? — It stays Pending indefinitely with no provisioner assigned.<br>
+<strong>19.</strong> What field enables resizing PVCs created from a StorageClass? — <code>allowVolumeExpansion: true</code>.<br>
+<strong>20.</strong> Can allowVolumeExpansion be enabled after PVs from that class already exist? — Yes, editing the class affects future resize requests, but retroactive behavior depends on the driver supporting expansion.<br>
+<strong>21.</strong> What field on a StorageClass holds provisioner-specific settings like disk type or IOPS? — <code>parameters</code>.<br>
+<strong>22.</strong> Is the parameters block validated by Kubernetes core? — No, it's opaque to Kubernetes and interpreted entirely by the CSI driver.<br>
+<strong>23.</strong> What CSI provisioner string is commonly used for AWS EBS? — <code>ebs.csi.aws.com</code>.<br>
+<strong>24.</strong> What CSI provisioner string is commonly used for GCP Persistent Disk? — <code>pd.csi.storage.gke.io</code>.<br>
+<strong>25.</strong> What command lists all StorageClasses and shows which is marked default? — <code>kubectl get storageclass</code> (default shown with a <code>(default)</code> suffix).<br>
+<strong>26.</strong> What command shows a StorageClass's provisioner, parameters, and policies in detail? — <code>kubectl describe storageclass <name></code>.<br>
+<strong>27.</strong> Can a StorageClass specify mountOptions? — Yes, a <code>mountOptions</code> field applies default mount flags to PVs it creates.<br>
+<strong>28.</strong> What happens if two StorageClasses are both annotated as default? — Behavior is undefined/implementation-dependent; typically only one is effectively honored, causing inconsistent PVC binding.<br>
+<strong>29.</strong> Does deleting a StorageClass affect PVs already created from it? — No, existing PVs are unaffected; only future provisioning using that class name fails.<br>
+<strong>30.</strong> Why can't Immediate binding mode guarantee correct zone placement? — The disk is created before the Scheduler decides which node/zone the consuming Pod will run on.<br>
+<strong>31.</strong> What Kubernetes component actually invokes CreateVolume on the CSI driver? — The external-provisioner sidecar running alongside the CSI controller plugin.<br>
+<strong>32.</strong> What's a typical reclaimPolicy choice for a StorageClass backing StatefulSet databases? — Often <code>Retain</code>, to prevent accidental data loss on PVC deletion.<br>
+<strong>33.</strong> What's a typical reclaimPolicy choice for ephemeral CI/test PVCs? — <code>Delete</code>, so disks are cleaned up automatically.<br>
+<strong>34.</strong> How would you unset an existing default StorageClass before assigning a new one? — Patch its annotation to <code>"false"</code> via <code>kubectl patch storageclass</code>.<br>
+<strong>35.</strong> What event reason indicates a dynamic provisioning attempt failed? — <code>ProvisioningFailed</code>.<br>
+<strong>36.</strong> Why might a "fast-ssd" and an "archive" StorageClass share the same provisioner but differ in behavior? — Their <code>parameters</code> (disk type, IOPS) and <code>reclaimPolicy</code> differ even though the same CSI driver implements both.<br>
+<strong>37.</strong> Does changing volumeBindingMode on a StorageClass affect PVCs already bound under the old mode? — No, only PVCs provisioned after the change use the new binding behavior.<br>
+<strong>38.</strong> What's a reason a PVC referencing a valid StorageClass name still fails to provision? — The named provisioner isn't installed, is unhealthy, or the parameters are rejected by the backend (e.g. invalid disk type).<br>
+<strong>39.</strong> How can you audit which StorageClass each PVC in the cluster uses? — <code>kubectl get pvc -A -o custom-columns</code> selecting <code>.spec.storageClassName</code>.<br>
+<strong>40.</strong> Why is WaitForFirstConsumer especially important for StatefulSets with per-Pod PVCs? — Each replica's PVC must bind in the same zone its Pod is scheduled to, which only WaitForFirstConsumer guarantees.<br>
+<strong>41.</strong> What's a downside of Immediate binding mode in a single-zone cluster? — Little downside there — the zone-affinity race condition mainly matters when nodes span multiple zones.<br>
+<strong>42.</strong> Can a StorageClass restrict which nodes/zones it provisions into directly? — Yes, via <code>allowedTopologies</code>, independent of or alongside volumeBindingMode.<br>
+<strong>43.</strong> What's the relationship between a StorageClass and a VolumeSnapshotClass? — They're separate but analogous constructs — one names a provisioner for volumes, the other for snapshots of those volumes.<br>
+<strong>44.</strong> Why would encrypted: "true" appear in a StorageClass's parameters rather than as a top-level field? — Encryption is a provisioner-specific capability, so it's expressed through the opaque parameters map, not the core API schema.<br>
+<strong>45.</strong> What happens if a PVC specifies a storageClassName that doesn't exist? — It stays Pending; there's no provisioner to match against, and no PV is ever created.<br>
+<strong>46.</strong> Is it possible to have zero default StorageClasses in a cluster? — Yes; then every PVC must explicitly set <code>storageClassName</code> or remain unbound.<br>
+<strong>47.</strong> What's a common mistake when migrating workloads between StorageClasses with different reclaimPolicy defaults? — Assuming the new policy applies to old PVs, when in fact only newly provisioned PVs get it.<br>
+<strong>48.</strong> Why do some parameters (like IOPS) only make sense for certain disk types within the same provisioner? — Because the parameters map is passed through unchanged to the CSI driver, which may reject or ignore combinations that don't apply to the chosen underlying disk type.<br>
+<strong>49.</strong> How would you quickly find every namespace using a specific StorageClass before deleting it? — <code>kubectl get pvc -A -o custom-columns=NS:.metadata.namespace,CLASS:.spec.storageClassName | grep <class-name></code>.<br>
+<strong>50.</strong> Why is it good practice to document each StorageClass's parameters and reclaimPolicy alongside its name? — Because the name alone (e.g. "fast-ssd") tells consumers nothing about cost, durability, or data-loss risk on deletion — that context lives only in the opaque parameters and policy fields.
+</div></details>
+
+<footer class="course-footer">Next: Topic 27 — CSI (Container Storage Interface architecture and gRPC flow).</footer>
+
+<script>
+  mermaid.initialize({ startOnLoad: true, theme: 'dark' });
+</script>
+
+</body>
+</html>

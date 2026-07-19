@@ -1,0 +1,235 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Topic 30: Scheduling — Kubernetes Expert Course</title>
+<link rel="stylesheet" href="styles.css">
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+</head>
+<body>
+
+<header class="course-header">
+  <div class="kicker">Topic 30 of 70</div>
+  <h1>Scheduling</h1>
+  <div class="subtitle">How the scheduler picks a node: the filter/score/bind framework, and where nodeSelector, affinity, and taints plug in.</div>
+</header>
+
+<nav class="topic-nav">
+  <a href="29-secrets.html">&larr; Secrets</a>
+  <a href="index.html">Course Index</a>
+  <a href="31-affinity.html">Affinity &rarr;</a>
+</nav>
+
+<h2 id="explanation">Explanation</h2>
+<p>Every Pod that doesn't specify a node needs one assigned before kubelet can run it — that assignment is the <strong>kube-scheduler</strong>'s entire job. Kubernetes needs a dedicated component for this because node selection is a genuinely hard constraint-satisfaction problem: it has to consider available CPU/memory, storage topology, taints and tolerations, affinity/anti-affinity rules, and Pod priority, then produce a decision fast enough to keep up with clusters scheduling thousands of Pods per minute.</p>
+<p>Modern kube-scheduler is built on the <strong>Scheduling Framework</strong>, a plugin architecture with well-defined extension points rather than one monolithic algorithm. The two extension points that matter most conceptually are <strong>Filter</strong> (also called predicates historically) and <strong>Score</strong> (priorities). Filtering runs first and is a hard pass/fail: for each candidate node, plugins check things like "does this node have enough allocatable memory," "does the Pod tolerate this node's taints," "is this node in a zone the PVC's volume can attach to" — any node that fails any filter is removed from consideration entirely. Scoring then runs only on nodes that survived filtering, ranking them 0-100 on criteria like resource balance (spread load evenly), image locality (prefer a node that already has the image cached), and affinity preference weight — the highest-scoring node wins and gets the Pod bound to it.</p>
+<p>nodeSelector, node affinity, pod affinity/anti-affinity, and taints/tolerations are not separate scheduling systems — they're all inputs that specific Filter and Score plugins consume within this same framework. <code>nodeSelector</code> is the simplest: a flat label match, hard filter, no scoring nuance. <code>nodeAffinity</code> generalizes it with richer expressions and, crucially, a "preferred" (soft, scored) mode alongside "required" (hard, filtered). <code>podAffinity</code>/<code>podAntiAffinity</code> let Pods react to where <em>other Pods</em> already are, not just node labels — used for co-locating chatty Pods or spreading replicas across failure domains. <strong>Taints</strong> work in the opposite direction: instead of a Pod expressing a preference, a node repels Pods unless they carry a matching <strong>toleration</strong> — this is how dedicated node pools (GPU nodes, spot instances) stay reserved for the workloads that explicitly opt in.</p>
+<p>Other extension points round out the framework: PreFilter/PostFilter (preemption logic when no node fits), Reserve/Permit (hold a slot during multi-step scheduling decisions, e.g. gang scheduling), and Bind (the final API call that writes the node assignment). Understanding this pipeline is what lets you reason about why a Pod is stuck <code>Pending</code> — it failed every node at some Filter stage, and <code>kubectl describe pod</code> will name exactly which one.</p>
+
+<h2 id="internal-working">Internal Working / Interactions</h2>
+<ul>
+<li><strong>API Server</strong> — the scheduler watches for unscheduled Pods (<code>spec.nodeName</code> empty) and writes the binding decision back via a Bind subresource call.</li>
+<li><strong>etcd</strong> — stores Node objects (capacity, allocatable, labels, taints) that the scheduler's cache is built from.</li>
+<li><strong>kubelet</strong> — only starts acting on a Pod once it sees itself named in <code>spec.nodeName</code>; the scheduler never talks to kubelet directly.</li>
+<li><strong>Controller Manager (e.g. Node controller)</strong> — updates Node conditions/taints (e.g. <code>NotReady</code> taint) that feed back into future scheduling decisions.</li>
+</ul>
+
+<h2 id="architecture-diagram">Architecture Diagram</h2>
+<pre class="mermaid">
+flowchart TD
+  Pod[Unscheduled Pod: nodeName empty] --> Queue[Scheduling Queue]
+  Queue --> Filter[Filter Plugins: resources, taints/tolerations, nodeAffinity required, PVC topology]
+  Filter -->|nodes that pass| Score[Score Plugins: resource balance, image locality, affinity preferred weight]
+  Score --> Pick[Highest-scoring node selected]
+  Pick --> Bind[Bind: API Server writes nodeName]
+  Bind --> Kubelet[kubelet on chosen node starts the Pod]
+  Filter -->|no nodes pass| Preempt{Preemption possible?}
+  Preempt -->|yes| Evict[Evict lower-priority Pod, retry]
+  Preempt -->|no| Pending[Pod stays Pending]
+</pre>
+
+<h2 id="code-example">Code Example</h2>
+<pre><code># Pod using multiple scheduling inputs at once — all consumed by the same framework
+apiVersion: v1
+kind: Pod
+metadata:
+  name: gpu-training-job
+spec:
+  nodeSelector:
+    workload-type: gpu               # hard filter: node must carry this label
+  tolerations:
+  - key: "dedicated"
+    operator: "Equal"
+    value: "gpu-pool"
+    effect: "NoSchedule"              # allows scheduling onto tainted GPU nodes
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+        - matchExpressions:
+          - key: node.kubernetes.io/instance-type
+            operator: In
+            values: ["p3.2xlarge", "p3.8xlarge"]   # hard filter, richer than nodeSelector
+  priorityClassName: high-priority     # lets this Pod preempt lower-priority Pods if no node fits
+  containers:
+  - name: trainer
+    image: myco/gpu-trainer:2.1
+    resources:
+      requests:
+        nvidia.com/gpu: 1              # extended resource — a Filter plugin checks node capacity for this
+      limits:
+        nvidia.com/gpu: 1
+
+---
+# Taint applied to a node (via kubectl, shown here as the equivalent declarative intent)
+# kubectl taint nodes gpu-node-1 dedicated=gpu-pool:NoSchedule
+</code></pre>
+
+<h2 id="kubectl-commands">kubectl Commands</h2>
+<pre><code>kubectl get pods --field-selector=status.phase=Pending -A   # find unscheduled Pods
+kubectl describe pod gpu-training-job                        # events show exactly which Filter rejected each node
+kubectl get nodes -o custom-columns=NAME:.metadata.name,TAINTS:.spec.taints  # audit node taints
+kubectl taint nodes gpu-node-1 dedicated=gpu-pool:NoSchedule # apply a taint
+kubectl label nodes gpu-node-1 workload-type=gpu             # apply a label for nodeSelector/affinity
+kubectl get pod gpu-training-job -o jsonpath='{.spec.nodeName}'  # see final scheduling decision
+kubectl logs -n kube-system -l component=kube-scheduler       # scheduler decision logs (self-managed clusters)
+</code></pre>
+
+<h2 id="best-practices">Best Practices &amp; Common Pitfalls</h2>
+<div class="grid-2">
+<div class="callout good">
+<strong>Do</strong>
+<ul>
+<li>Always set resource requests — the scheduler's bin-packing is meaningless without them.</li>
+<li>Use taints+tolerations to reserve specialized nodes (GPU, high-memory) rather than relying on labels alone.</li>
+<li>Reserve <code>requiredDuringScheduling</code> rules for true hard constraints; use "preferred" for soft preferences.</li>
+<li>Set PriorityClasses deliberately for workloads that must preempt lower-priority Pods under pressure.</li>
+</ul>
+</div>
+<div class="callout warn">
+<strong>Pitfalls</strong>
+<ul>
+<li>Over-constraining scheduling with too many required rules, leaving Pods permanently Pending with no valid node.</li>
+<li>Forgetting a taint exists on all nodes in a pool, causing every non-tolerating Pod to mysteriously never land there.</li>
+<li>Ignoring topology-aware volume binding, causing "volume node affinity conflict" scheduling failures.</li>
+<li>Assuming the scheduler re-evaluates running Pods — <code>requiredDuringSchedulingIgnoredDuringExecution</code> means it does not react once a Pod is already running.</li>
+</ul>
+</div>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="interview-questions">50 Interview Questions</h2>
+
+<details class="qa"><summary>1. What is the kube-scheduler's actual job, and why does it need to exist as a separate component?</summary>
+<div class="qa-body"><strong>Short answer:</strong> It assigns a node to every Pod that doesn't already specify one, by setting <code>spec.nodeName</code> — and it's separate because node selection is a constraint-satisfaction problem distinct from the API Server's storage/validation role or kubelet's per-node execution role.
+<br><strong>Detailed explanation:</strong> Node selection has to weigh available CPU/memory, storage topology, taints/tolerations, affinity rules, and priority, then decide fast enough to keep up with clusters scheduling thousands of Pods per minute — a specialized enough job to warrant its own control-plane component watching for unscheduled Pods.
+<br><strong>Production example:</strong> A cluster autoscaler adds a new node; the scheduler is what actually notices Pending Pods and decides to place them there, not the autoscaler itself.
+<br><strong>Common mistake:</strong> Assuming the API Server or kubelet decides Pod placement — they only store the decision and execute it, respectively.</div></details>
+
+<details class="qa"><summary>2. What is the Scheduling Framework, and why did Kubernetes move to it instead of a monolithic algorithm?</summary>
+<div class="qa-body"><strong>Short answer:</strong> It's a plugin architecture with well-defined extension points (Filter, Score, Bind, etc.) that replaced one hardcoded scheduling algorithm, making scheduling behavior extensible and composable.
+<br><strong>Detailed explanation:</strong> Instead of one giant function handling every scheduling concern, each concern (resource fit, taints, affinity, image locality) is a plugin hooked into a specific extension point, so behavior can be added, removed, or reordered without rewriting the core loop.
+<br><strong>Production example:</strong> Adding a custom scoring plugin for cost-optimized bin-packing across spot vs on-demand nodes without forking kube-scheduler.
+<br><strong>Common mistake:</strong> Thinking nodeSelector, affinity, and taints are separate scheduling "systems" rather than inputs consumed by plugins within this one framework.</div></details>
+
+<details class="qa"><summary>3. What is the difference between the Filter and Score extension points?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Filter is a hard pass/fail per node — any node that fails is removed entirely; Score runs only on surviving nodes and ranks them 0-100 to pick the best one.
+<br><strong>Detailed explanation:</strong> Filtering answers "can this node run this Pod at all" (enough memory, tolerates taints, PVC topology compatible). Scoring answers "which of the eligible nodes is the best choice" (resource balance, image locality, affinity preference weight) — it never runs on nodes Filter already eliminated.
+<br><strong>Production example:</strong> A node with insufficient allocatable memory never even reaches scoring; among nodes that do have room, the one with the training image already cached scores higher via image locality.
+<br><strong>Common mistake:</strong> Believing a "preferred" affinity rule can override a failed hard resource check — Filter failures are absolute and Score never gets a chance to compensate.</div></details>
+
+<details class="qa"><summary>4. Are nodeSelector, nodeAffinity, podAffinity/podAntiAffinity, and taints/tolerations separate scheduling mechanisms?</summary>
+<div class="qa-body"><strong>Short answer:</strong> No — they are all just inputs consumed by specific Filter and/or Score plugins inside the same Scheduling Framework, not independent systems running in parallel.
+<br><strong>Detailed explanation:</strong> <code>nodeSelector</code> feeds a hard-filter plugin doing flat label matching. <code>nodeAffinity</code> feeds the same family of plugin but with richer expressions and both a required (Filter) and preferred (Score) mode. <code>podAffinity</code>/<code>podAntiAffinity</code> feed plugins that look at where other Pods already are. Taints/tolerations feed a Filter plugin that repels Pods unless a matching toleration is present. All of them plug into the one Filter→Score→Bind pipeline.
+<br><strong>Production example:</strong> A single Pod spec combining nodeSelector, tolerations, and required nodeAffinity all gets evaluated by different plugins within the same scheduling cycle, not by four different subsystems.
+<br><strong>Common mistake:</strong> Debugging each mechanism in isolation instead of realizing a Pending Pod's failure is one Filter-stage rejection that could originate from any of them.</div></details>
+
+<details class="qa"><summary>5. Why does a "required" nodeAffinity rule behave like a Filter while a "preferred" rule behaves like a Score?</summary>
+<div class="qa-body"><strong>Short answer:</strong> <code>requiredDuringSchedulingIgnoredDuringExecution</code> is a hard constraint enforced at the Filter stage; <code>preferredDuringSchedulingIgnoredDuringExecution</code> is a soft weight applied only during Scoring among nodes that already passed filtering.
+<br><strong>Detailed explanation:</strong> A required rule can eliminate every candidate node and leave the Pod Pending if none match. A preferred rule never eliminates a node — it only nudges the score up or down for nodes that satisfy it, so the Pod can still land somewhere even if no node satisfies the preference.
+<br><strong>Production example:</strong> A Pod with a preferred affinity toward SSD-labeled nodes will still schedule onto an HDD node if that's the only one available; a required rule for the same label would leave it Pending instead.
+<br><strong>Common mistake:</strong> Using "required" when "preferred" was intended, causing unexpected Pending Pods the moment the preferred nodes are full.</div></details>
+
+<details class="qa"><summary>6. What role do taints and tolerations play differently from affinity in the scheduling pipeline?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Affinity is a Pod expressing a preference toward nodes; taints are a node actively repelling Pods unless they carry a matching toleration — the direction of intent is reversed.
+<br><strong>Detailed explanation:</strong> With affinity, the default is "any node is fine" and the Pod opts into a subset. With taints, the default is "this node rejects everything" and the Pod must explicitly opt in via a toleration — this is what keeps dedicated pools (GPU, spot) reserved unless a workload deliberately declares it belongs there.
+<br><strong>Production example:</strong> Tainting GPU nodes with <code>dedicated=gpu-pool:NoSchedule</code> keeps ordinary Deployments off them even without any nodeSelector on those Deployments, because the taint filter runs regardless.
+<br><strong>Common mistake:</strong> Forgetting a node pool is tainted and being confused why unrelated Pods never land there — the omission is invisible unless you inspect node taints directly.</div></details>
+
+<details class="qa"><summary>7. What are PreFilter and PostFilter, and when does PostFilter trigger preemption?</summary>
+<div class="qa-body"><strong>Short answer:</strong> PreFilter runs setup/precomputation before Filter plugins execute; PostFilter runs only when Filter rejects every node, and it's where preemption logic lives.
+<br><strong>Detailed explanation:</strong> If no node survives filtering, PostFilter plugins evaluate whether evicting a lower-priority Pod elsewhere would free up enough room for the pending Pod, and if so trigger that eviction so the Pod can be retried in a future scheduling cycle.
+<br><strong>Production example:</strong> A high-priority batch job that can't fit anywhere causes the scheduler to evict a lower-priority best-effort Pod on a node, then re-attempt scheduling the batch job there.
+<br><strong>Common mistake:</strong> Assuming preemption happens automatically for any Pending Pod — it only triggers when the Pod has a PriorityClass that makes it eligible to preempt others.</div></details>
+
+<details class="qa"><summary>8. What do the Reserve and Permit extension points do, and how do they relate to gang scheduling?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Reserve holds a tentative slot on a node for a Pod mid-decision, and Permit can pause binding until some external condition is met — together they enable coordinated multi-Pod ("gang") scheduling.
+<br><strong>Detailed explanation:</strong> Reserve prevents two scheduling cycles from double-booking the same resources on a node before Bind actually commits. Permit lets a plugin hold a Pod's binding until, for example, all Pods in a distributed training job have found a node, so the whole group starts together or not at all.
+<br><strong>Production example:</strong> A framework like Volcano or Kueue uses these hooks to ensure a multi-Pod ML training job doesn't partially schedule and deadlock waiting for the rest of its Pods.
+<br><strong>Common mistake:</strong> Assuming vanilla kube-scheduler natively does all-or-nothing gang scheduling — the base extension points support it, but the actual gang logic typically comes from a scheduler plugin/framework built on top.</div></details>
+
+<details class="qa"><summary>9. What happens at the Bind extension point, and why does the scheduler never talk to kubelet directly?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Bind is the final step where the scheduler writes the chosen node into the Pod's <code>spec.nodeName</code> via the API Server's Bind subresource — kubelet only learns of the assignment by watching the API Server, not from the scheduler.
+<br><strong>Detailed explanation:</strong> This decoupling keeps the scheduler and kubelet independent: the scheduler's entire output is one API write, and kubelet on every node continuously watches for Pods bound to itself, picking up the work asynchronously rather than being pushed to directly.
+<br><strong>Production example:</strong> If the API Server is briefly unavailable, the scheduler simply can't commit new bindings, and kubelet has nothing new to pick up — no direct scheduler-kubelet channel exists to route around that.
+<br><strong>Common mistake:</strong> Assuming a slow or crashed scheduler blocks kubelet from running already-bound Pods — kubelet operates independently once <code>nodeName</code> is set.</div></details>
+
+<details class="qa"><summary>10. A Pod is stuck Pending — what's the systematic way to find out why?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Run <code>kubectl describe pod</code> and read the Events section — it names the exact Filter-stage reason the scheduler rejected every node.
+<br><strong>Detailed explanation:</strong> The scheduler emits a FailedScheduling event summarizing how many nodes failed for which reason (e.g. "2 Insufficient cpu, 1 node(s) had untolerated taint"), which maps directly back to which Filter plugin eliminated candidates.
+<br><strong>Production example:</strong> A Pending Pod's events show "1 node(s) had untolerated taint {dedicated: gpu-pool}" — immediately pointing to a missing toleration rather than a resource shortage.
+<br><strong>Common mistake:</strong> Guessing at causes (assuming it's always a resource shortage) instead of reading the specific Filter-stage rejection reasons in the Pod's events.</div></details>
+
+<details class="qa"><summary>11–50. Additional rapid-fire questions</summary>
+<div class="qa-body">
+<strong>11.</strong> What condition must be true of <code>spec.nodeName</code> for a Pod to be considered "unscheduled"? — It must be empty; the scheduler only watches Pods where this field is unset.<br>
+<strong>12.</strong> Which component stores Node capacity, allocatable, labels, and taints that the scheduler reads? — etcd, via Node objects served through the API Server.<br>
+<strong>13.</strong> Does the scheduler build its view of node state by querying kubelet directly? — No, it watches Node objects via the API Server and maintains its own cache.<br>
+<strong>14.</strong> What extension point is responsible for image locality scoring? — Score, specifically an ImageLocality-style scoring plugin.<br>
+<strong>15.</strong> Can a Score plugin cause a Pod to become Pending? — No, only Filter (and PreFilter/PostFilter for preemption failure) can eliminate all nodes and leave a Pod Pending.<br>
+<strong>16.</strong> What does a PVC's topology-aware volume binding requirement act as in scheduling terms? — A Filter constraint — nodes outside the volume's attachable zone/topology are eliminated.<br>
+<strong>17.</strong> What's a common symptom of ignoring topology-aware volume binding? — "volume node affinity conflict" errors when the Pod is scheduled to a node that can't attach its bound PV.<br>
+<strong>18.</strong> Why should you always set resource requests on Pods? — Without them, the scheduler's bin-packing/resource-fit Filter and Score plugins have nothing meaningful to evaluate.<br>
+<strong>19.</strong> What's the effect of a PriorityClass on scheduling behavior? — Higher-priority Pods can trigger preemption of lower-priority Pods via PostFilter when no node otherwise fits.<br>
+<strong>20.</strong> If two Pods have identical PriorityClass values, does one preempt the other? — No, preemption only targets Pods of strictly lower priority.<br>
+<strong>21.</strong> What kubectl command shows a node's configured taints? — <code>kubectl get nodes -o custom-columns=NAME:.metadata.name,TAINTS:.spec.taints</code>.<br>
+<strong>22.</strong> What kubectl command applies a taint to a node? — <code>kubectl taint nodes &lt;node&gt; key=value:NoSchedule</code>.<br>
+<strong>23.</strong> Does adding a label to a node retroactively affect already-running Pods? — No — labels/affinity are evaluated at scheduling time and the scheduler does not re-evaluate Pods already bound and running.<br>
+<strong>24.</strong> Why doesn't <code>requiredDuringSchedulingIgnoredDuringExecution</code> evict a Pod if node labels change after it's running? — The "IgnoredDuringExecution" suffix explicitly means the rule is only checked at scheduling time, not continuously enforced.<br>
+<strong>25.</strong> What's the risk of over-constraining a Pod with many required rules? — The intersection of eligible nodes can shrink to zero, leaving the Pod permanently Pending.<br>
+<strong>26.</strong> Why is nodeSelector considered the simplest scheduling input? — It's a flat exact-match on labels with no soft/scored variant — pure hard filter, no nuance.<br>
+<strong>27.</strong> What does podAffinity let a Pod do that nodeAffinity cannot? — React to where other specific Pods are already running/scheduled, not just static node labels.<br>
+<strong>28.</strong> What's a typical production use for podAffinity? — Co-locating chatty Pods (e.g. app and cache) on the same node or zone to reduce network latency.<br>
+<strong>29.</strong> What's a typical production use for podAntiAffinity? — Spreading replicas of the same Deployment across failure domains so one node/zone failure doesn't take down all replicas.<br>
+<strong>30.</strong> How does an extended resource like <code>nvidia.com/gpu</code> get enforced during scheduling? — A Filter plugin checks the requesting Pod's resource request against the node's advertised allocatable capacity for that resource name.<br>
+<strong>31.</strong> What happens if a Pod requests <code>nvidia.com/gpu: 1</code> but no node advertises that resource? — It fails the resource Filter on every node and stays Pending indefinitely.<br>
+<strong>32.</strong> Why is a toleration alone not sufficient to get a Pod onto a specific dedicated node pool? — A toleration only permits scheduling onto a tainted node; it doesn't attract the Pod there — you also need a nodeSelector/affinity for actual placement intent.<br>
+<strong>33.</strong> What kubectl command reveals the final node a Pod was scheduled to? — <code>kubectl get pod &lt;name&gt; -o jsonpath='{.spec.nodeName}'</code>.<br>
+<strong>34.</strong> Where would you look to see scheduler decision-making logs on a self-managed cluster? — <code>kubectl logs -n kube-system -l component=kube-scheduler</code>.<br>
+<strong>35.</strong> Why can managed Kubernetes offerings hide direct access to scheduler logs? — The control plane, including kube-scheduler, is often run by the cloud provider outside customer-visible namespaces.<br>
+<strong>36.</strong> What's the effect of the Node controller adding a NotReady taint to a node? — It feeds back into future Filter evaluations, causing new Pods to avoid that node without tolerations for it.<br>
+<strong>37.</strong> Does the scheduler communicate with the Controller Manager directly for taint updates? — No, both interact only through the API Server/etcd; the scheduler simply reads the current Node object state.<br>
+<strong>38.</strong> What's a good reason to use "preferred" nodeAffinity for a soft preference like SSD storage? — It lets the Pod schedule elsewhere rather than sitting Pending if the preferred nodes are unavailable.<br>
+<strong>39.</strong> Why might combining nodeSelector and required nodeAffinity for overlapping constraints be redundant? — nodeAffinity's match expressions already generalize nodeSelector's simple equality matching, so using both is usually unnecessary duplication.<br>
+<strong>40.</strong> What's the practical difference between a Filter rejection and a Score-based deprioritization for troubleshooting? — A Filter rejection means the node was never eligible at all; a Score issue means it was eligible but simply lost to a higher-ranked node — the fix approaches differ.<br>
+<strong>41.</strong> How would you confirm a Pending Pod's issue is resource exhaustion rather than an affinity mismatch? — Check the FailedScheduling event text for "Insufficient cpu/memory" versus "didn't match Pod's node affinity/selector."<br>
+<strong>42.</strong> Why is resource balance a Score criterion rather than a Filter criterion? — It's about choosing the best fit among viable nodes, not about ruling nodes in/out — nodes with adequate but uneven resource usage are still eligible, just ranked lower.<br>
+<strong>43.</strong> What's a consequence of a cluster-wide resource crunch on scheduling latency? — More Pods enter Pending and retry scheduling repeatedly, increasing scheduler queue churn even though nothing is misconfigured.<br>
+<strong>44.</strong> Why should GPU or high-memory nodes typically use both a taint and a label? — The taint keeps ordinary workloads off; the label lets the intended workloads' nodeSelector/affinity actually target those nodes.<br>
+<strong>45.</strong> What field on the Pod spec lets it explicitly request eviction rights over lower-priority Pods? — <code>priorityClassName</code>, referencing a PriorityClass object.<br>
+<strong>46.</strong> If a Pod's required nodeAffinity references a label no node currently has, what's the outcome? — It fails that Filter on every node and stays Pending until a matching node appears.<br>
+<strong>47.</strong> Why does kubectl describe pod show per-reason aggregate counts rather than a per-node breakdown? — Because reporting every node individually would be unwieldy at scale; the scheduler summarizes rejections by reason category instead.<br>
+<strong>48.</strong> What's the risk of not setting a PriorityClass on critical workloads in a resource-constrained cluster? — They compete as equals with low-priority workloads and won't preempt anything, potentially staying Pending under pressure.<br>
+<strong>49.</strong> Why is understanding the Filter→Score→Bind pipeline useful beyond just debugging Pending Pods? — It clarifies that nodeSelector, affinity, and taints are all just configuration surfaces feeding one predictable pipeline, making their combined interactions reasoned about rather than mysterious.<br>
+<strong>50.</strong> What single kubectl command combination best diagnoses why a specific Pod won't schedule? — <code>kubectl describe pod &lt;name&gt;</code> for the Filter-stage rejection reason, cross-referenced with <code>kubectl get nodes -o custom-columns=...TAINTS</code> and node labels/capacity.
+</div></details>
+
+<footer class="course-footer">Next: Topic 31 — Affinity (nodeAffinity vs podAffinity, required vs preferred).</footer>
+
+<script>
+  mermaid.initialize({ startOnLoad: true, theme: 'dark' });
+</script>
+
+</body>
+</html>

@@ -1,0 +1,1303 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kubernetes in 20 Hours — The 80/20 Beginner Roadmap</title>
+<style>
+:root{
+  --bg:#0f1216; --bg-panel:#161b22; --bg-raised:#1c2230;
+  --text:#e6edf3; --text-dim:#8b98a5; --text-faint:#5c6672;
+  --border:#262d38;
+  --blue:#5b9bf0; --blue-soft:#5b9bf022;
+  --teal:#4fd8c4; --teal-soft:#4fd8c422;
+  --amber:#f0a24a; --amber-soft:#f0a24a22;
+  --violet:#a78bfa; --violet-soft:#a78bfa22;
+  --code-bg:#1c2230;
+  --shadow: 0 8px 24px rgba(0,0,0,.35);
+}
+:root[data-theme="light"]{
+  --bg:#f5f4f1; --bg-panel:#ffffff; --bg-raised:#fbfaf8;
+  --text:#1b1f24; --text-dim:#5b6472; --text-faint:#8a92a0;
+  --border:#e2e0da;
+  --blue:#255bb3; --blue-soft:#255bb318;
+  --teal:#0f8a76; --teal-soft:#0f8a7618;
+  --amber:#c8511f; --amber-soft:#c8511f18;
+  --violet:#6d4fd1; --violet-soft:#6d4fd118;
+  --code-bg:#eef0f3;
+  --shadow: 0 4px 16px rgba(20,20,10,.08);
+}
+@media (prefers-color-scheme: light){
+  :root:not([data-theme="dark"]){
+    --bg:#f5f4f1; --bg-panel:#ffffff; --bg-raised:#fbfaf8;
+    --text:#1b1f24; --text-dim:#5b6472; --text-faint:#8a92a0;
+    --border:#e2e0da;
+    --blue:#255bb3; --blue-soft:#255bb318;
+    --teal:#0f8a76; --teal-soft:#0f8a7618;
+    --amber:#c8511f; --amber-soft:#c8511f18;
+    --violet:#6d4fd1; --violet-soft:#6d4fd118;
+    --code-bg:#eef0f3;
+    --shadow: 0 4px 16px rgba(20,20,10,.08);
+  }
+}
+*{box-sizing:border-box;}
+html,body{margin:0;padding:0;}
+body{
+  background:var(--bg); color:var(--text);
+  font-family: Georgia, 'Iowan Old Style', 'Palatino Linotype', serif;
+  line-height:1.62; font-size:17px;
+  -webkit-font-smoothing:antialiased;
+}
+.display{
+  font-family: -apple-system, 'Helvetica Neue', Arial, sans-serif;
+  font-stretch: condensed;
+  letter-spacing:-.01em;
+  font-weight:800;
+}
+.mono{ font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace; }
+.eyebrow{
+  font-family:-apple-system,'Helvetica Neue',Arial,sans-serif;
+  text-transform:uppercase; letter-spacing:.14em; font-size:.72rem;
+  font-weight:700; color:var(--text-faint);
+}
+a{ color:var(--blue); }
+h1,h2,h3,h4{ text-wrap:balance; }
+
+.shell{ display:flex; min-height:100vh; }
+
+/* ---------- Sidebar nav ---------- */
+nav.rail{
+  width:230px; flex:0 0 230px; position:sticky; top:0; align-self:flex-start;
+  height:100vh; overflow-y:auto; padding:28px 18px;
+  border-right:1px solid var(--border); background:var(--bg-panel);
+}
+nav.rail .brand{ font-family:-apple-system,sans-serif; font-weight:800; font-size:1.05rem; letter-spacing:-.01em; margin-bottom:2px; }
+nav.rail .brand-sub{ font-size:.72rem; color:var(--text-faint); margin-bottom:22px; letter-spacing:.04em; }
+nav.rail a.navlink{
+  display:block; padding:8px 10px; margin:2px 0; border-radius:6px;
+  font-family:-apple-system,sans-serif; font-size:.86rem; color:var(--text-dim);
+  text-decoration:none; border-left:2px solid transparent;
+}
+nav.rail a.navlink:hover{ background:var(--bg-raised); color:var(--text); }
+nav.rail .navgroup{ margin-bottom:14px; }
+nav.rail .navgroup-label{ font-size:.68rem; letter-spacing:.1em; text-transform:uppercase; color:var(--text-faint); margin:14px 0 4px 10px; font-family:-apple-system,sans-serif;}
+
+main{ flex:1; min-width:0; padding:48px clamp(20px,5vw,72px) 90px; max-width:920px; }
+
+/* ---------- Hero ---------- */
+.hero{ margin-bottom:56px; }
+.hero .eyebrow{ color:var(--blue); }
+.hero h1{ font-size:clamp(2rem,4.4vw,2.9rem); margin:8px 0 14px; line-height:1.08; }
+.hero p.lede{ font-size:1.12rem; color:var(--text-dim); max-width:62ch; margin:0 0 22px; }
+.hero .stat-row{ display:flex; gap:14px; flex-wrap:wrap; }
+.stat{ background:var(--bg-panel); border:1px solid var(--border); border-radius:10px; padding:12px 16px; min-width:120px; box-shadow:var(--shadow); }
+.stat .n{ font-family:-apple-system,sans-serif; font-weight:800; font-size:1.4rem; }
+.stat .l{ font-size:.72rem; color:var(--text-faint); text-transform:uppercase; letter-spacing:.08em; }
+
+/* ---------- 80/20 box ---------- */
+.rule8020{
+  background:linear-gradient(135deg, var(--blue-soft), transparent);
+  border:1px solid var(--border); border-left:3px solid var(--blue);
+  border-radius:8px; padding:18px 22px; margin:26px 0 0;
+}
+.rule8020 .eyebrow{ color:var(--blue); margin-bottom:6px; }
+
+/* ---------- Setup box ---------- */
+.setup{
+  background:var(--bg-panel); border:1px solid var(--border); border-radius:10px;
+  padding:18px 22px; margin:20px 0 0;
+}
+.setup .eyebrow{ color:var(--teal); margin-bottom:8px; }
+.setup ol{ margin:0; padding-left:1.2em; }
+.setup li{ margin-bottom:6px; }
+.setup code{ background:var(--code-bg); padding:1px 6px; border-radius:4px; font-size:.9em; }
+
+/* ---------- Day section ---------- */
+section.day{ padding-top:64px; scroll-margin-top:20px; border-top:1px solid var(--border); margin-top:20px;}
+section.day:first-of-type{ border-top:none; }
+.day-tag{ display:flex; align-items:center; gap:12px; margin-bottom:6px; }
+.day-num{ font-family:-apple-system,sans-serif; font-weight:800; font-size:.78rem; color:var(--bg); background:var(--blue); padding:3px 10px; border-radius:20px; }
+.day h2{ font-size:1.9rem; margin:6px 0 6px; }
+.day .day-meta{ color:var(--text-faint); font-size:.85rem; font-family:-apple-system,sans-serif; margin-bottom:28px; }
+
+h3.subhead{
+  font-family:-apple-system,sans-serif; font-weight:800; font-size:1.02rem;
+  margin:38px 0 10px; padding-bottom:8px; border-bottom:1px solid var(--border);
+  display:flex; align-items:center; gap:8px;
+}
+h3.subhead .tag{ font-size:.62rem; text-transform:uppercase; letter-spacing:.08em; padding:2px 8px; border-radius:20px; font-weight:700; }
+.tag-concept{ background:var(--blue-soft); color:var(--blue); }
+.tag-practice{ background:var(--amber-soft); color:var(--amber); }
+.tag-project{ background:var(--violet-soft); color:var(--violet); }
+.tag-interview{ background:var(--bg-raised); color:var(--text-dim); border:1px solid var(--border);}
+.tag-resource{ background:var(--teal-soft); color:var(--teal); }
+
+.concept p{ margin:0 0 14px; max-width:70ch; }
+.concept ul{ max-width:66ch; padding-left:1.2em; }
+.concept li{ margin-bottom:8px; }
+.concept strong{ color:var(--text); }
+
+/* ---------- Example / code ---------- */
+.example{
+  background:var(--code-bg); border:1px solid var(--border); border-radius:10px;
+  padding:18px 20px; margin:14px 0 20px; overflow-x:auto;
+}
+.example pre{ margin:0; white-space:pre; font-size:.86rem; line-height:1.55; }
+.example .exlabel{ font-family:-apple-system,sans-serif; font-size:.78rem; font-weight:700; color:var(--amber); margin:0 0 8px; text-transform:uppercase; letter-spacing:.06em; }
+.example + .example{ margin-top:-8px; }
+
+/* ---------- Interview accordion ---------- */
+.qa-groups{ display:flex; flex-direction:column; gap:10px; }
+details.qa-group{
+  background:var(--bg-panel); border:1px solid var(--border); border-radius:10px; overflow:hidden;
+}
+details.qa-group summary{
+  cursor:pointer; list-style:none; padding:14px 18px; font-family:-apple-system,sans-serif;
+  font-weight:700; font-size:.92rem; display:flex; justify-content:space-between; align-items:center;
+}
+details.qa-group summary::-webkit-details-marker{ display:none; }
+details.qa-group summary .count{ font-weight:400; color:var(--text-faint); font-size:.78rem; }
+details.qa-group summary::after{ content:'+'; font-size:1.2rem; color:var(--text-faint); margin-left:12px; }
+details.qa-group[open] summary::after{ content:'–'; }
+.qa-body{ padding:4px 18px 16px; border-top:1px solid var(--border); }
+.qa{ padding:14px 0; border-bottom:1px solid var(--border); }
+.qa:last-child{ border-bottom:none; }
+.qa .q{ font-family:-apple-system,sans-serif; font-weight:700; font-size:.92rem; margin:0 0 6px; }
+.qa .q .qnum{ color:var(--blue); margin-right:6px; }
+.qa .a{ margin:0; color:var(--text-dim); font-size:.94rem; max-width:68ch; }
+.qa .a code{ background:var(--code-bg); padding:1px 6px; border-radius:4px; font-size:.85em; }
+
+/* ---------- Resources ---------- */
+.resources{ display:grid; grid-template-columns:repeat(auto-fill,minmax(250px,1fr)); gap:12px; }
+.res-card{ background:var(--bg-panel); border:1px solid var(--border); border-radius:10px; padding:14px 16px; }
+.res-card .k{ font-family:-apple-system,sans-serif; font-size:.68rem; text-transform:uppercase; letter-spacing:.08em; color:var(--teal); font-weight:700; }
+.res-card .t{ font-weight:700; margin:4px 0 4px; font-size:.94rem; }
+.res-card .d{ color:var(--text-dim); font-size:.86rem; margin:0; }
+.res-card a{ text-decoration:none; }
+.res-card a:hover{ text-decoration:underline; }
+
+/* ---------- Project box ---------- */
+.projectbox{
+  margin-top:14px; padding:18px 22px; border-radius:10px;
+  background:var(--violet-soft); border:1px solid var(--violet); border-left:3px solid var(--violet);
+}
+.projectbox .eyebrow{ color:var(--violet); }
+.projectbox p{ margin:6px 0 0; max-width:70ch; }
+
+/* ---------- Table ---------- */
+.tblwrap{ overflow-x:auto; margin:14px 0 20px; }
+table.cmp{ border-collapse:collapse; width:100%; min-width:520px; font-size:.88rem; font-family:-apple-system,sans-serif; }
+table.cmp th, table.cmp td{ border:1px solid var(--border); padding:9px 12px; text-align:left; }
+table.cmp th{ background:var(--bg-raised); font-size:.74rem; text-transform:uppercase; letter-spacing:.05em; color:var(--text-faint); }
+table.cmp td code{ background:var(--code-bg); padding:1px 5px; border-radius:4px; }
+
+footer.end{ margin-top:70px; padding-top:26px; border-top:1px solid var(--border); color:var(--text-faint); font-size:.85rem; font-family:-apple-system,sans-serif; }
+
+@media (max-width:820px){
+  nav.rail{ display:none; }
+  main{ padding:32px 18px 70px; }
+}
+</style>
+</head>
+<body>
+
+<div class="shell">
+<nav class="rail">
+  <div class="brand">K8s in 20 Hours</div>
+  <div class="brand-sub">6 DAYS · 20 HOURS · 80/20</div>
+  <div class="navgroup">
+    <a class="navlink" href="#top">Overview</a>
+  </div>
+  <div class="navgroup">
+    <div class="navgroup-label">Day 1 · 4h</div>
+    <a class="navlink" href="#day1">Pods &amp; Deployments</a>
+  </div>
+  <div class="navgroup">
+    <div class="navgroup-label">Day 2 · 4h</div>
+    <a class="navlink" href="#day2">Services &amp; Networking</a>
+  </div>
+  <div class="navgroup">
+    <div class="navgroup-label">Day 3 · 3h</div>
+    <a class="navlink" href="#day3">ConfigMaps &amp; Secrets</a>
+  </div>
+  <div class="navgroup">
+    <div class="navgroup-label">Day 4 · 3h</div>
+    <a class="navlink" href="#day4">StatefulSets &amp; Storage</a>
+  </div>
+  <div class="navgroup">
+    <div class="navgroup-label">Day 5 · 3h</div>
+    <a class="navlink" href="#day5">Ingress, Namespaces &amp; RBAC</a>
+  </div>
+  <div class="navgroup">
+    <div class="navgroup-label">Day 6 · 3h</div>
+    <a class="navlink" href="#day6">Troubleshooting &amp; Capstone</a>
+  </div>
+</nav>
+
+<main id="top">
+
+  <div class="hero">
+    <div class="eyebrow">A six-day, twenty-hour beginner roadmap</div>
+    <h1 class="display">Kubernetes, the 80/20 way.</h1>
+    <p class="lede">Pods, Services, ConfigMaps, StatefulSets, Ingress, RBAC, storage, and troubleshooting — the 20% of Kubernetes that makes you functional on 80% of real, day-to-day work. No operators, no CRDs, no service meshes: just what a beginner needs to deploy, expose, configure, persist, route, secure, and debug a real app.</p>
+    <div class="stat-row">
+      <div class="stat"><div class="n">6</div><div class="l">Days</div></div>
+      <div class="stat"><div class="n">20h</div><div class="l">Total time</div></div>
+      <div class="stat"><div class="n">300</div><div class="l">Q&amp;A + commands</div></div>
+      <div class="stat"><div class="n">6</div><div class="l">Hands-on projects</div></div>
+    </div>
+    <div class="rule8020">
+      <div class="eyebrow">How to use the 80/20 rule here</div>
+      <p style="margin:0;">Every day is built around <strong>Core Concepts</strong> (3–5 ideas, no more) and a <strong>Project</strong> you build with your own hands — those two are non-negotiable. The <strong>Q&amp;A</strong> and extra <strong>Resources</strong> are reinforcement: skim them after the project, or on a second pass once the concepts are fresh.</p>
+    </div>
+    <div class="setup">
+      <div class="eyebrow">One-time setup (~20 min, free, not counted in the 20 hours)</div>
+      <ol>
+        <li>Install <a href="https://www.docker.com/products/docker-desktop/">Docker Desktop</a> (free)</li>
+        <li>Install <a href="https://minikube.sigs.k8s.io/docs/start/">Minikube</a> (free, official) — <code>brew install minikube</code> on Mac, or see the docs for Windows/Linux</li>
+        <li>Install <code>kubectl</code> — <a href="https://kubernetes.io/docs/tasks/tools/">official install docs</a></li>
+        <li>Start your cluster: <code>minikube start</code></li>
+        <li>Verify: <code>kubectl get nodes</code> — you should see one node in <code>Ready</code> status</li>
+      </ol>
+    </div>
+  </div>
+
+  <!-- ============================================================ DAY 1 ============================================================ -->
+  <section class="day" id="day1">
+    <div class="day-tag"><span class="day-num">DAY 1 · 4H</span></div>
+    <h2 class="display">Pods &amp; Deployments</h2>
+    <div class="day-meta">Goal: understand the smallest unit Kubernetes runs, and the controller that keeps it alive and rolling forward.</div>
+
+    <h3 class="subhead"><span class="tag tag-concept">Core Concepts</span></h3>
+    <div class="concept">
+      <ul>
+        <li><strong>Pod</strong> — the smallest deployable unit in Kubernetes; a wrapper around one or more tightly-coupled containers that share network/storage.</li>
+        <li><strong>Deployment</strong> — a controller that manages Pod replicas, handles rolling updates, and self-heals crashed Pods.</li>
+        <li><strong>ReplicaSet</strong> — the mechanism (managed by Deployments, rarely used directly) that ensures N copies of a Pod are running.</li>
+        <li><strong>Labels &amp; Selectors</strong> — key-value tags used to identify and group objects; the "glue" connecting Deployments to Pods and (later) Services to Pods.</li>
+        <li><strong>kubectl basics</strong> — the CLI you'll use for everything: <code class="mono">get</code>, <code class="mono">describe</code>, <code class="mono">apply</code>, <code class="mono">delete</code>, <code class="mono">logs</code>, <code class="mono">exec</code>.</li>
+      </ul>
+    </div>
+
+    <h3 class="subhead"><span class="tag tag-practice">Hands-On Examples</span></h3>
+    <div class="example">
+      <p class="exlabel">Example 1 — run a Pod imperatively</p>
+      <pre class="mono">kubectl run nginx-pod --image=nginx:latest --port=80
+kubectl get pods
+kubectl describe pod nginx-pod</pre>
+    </div>
+    <div class="example">
+      <p class="exlabel">Example 2 — declarative Pod YAML (pod.yaml)</p>
+      <pre class="mono">apiVersion: v1
+kind: Pod
+metadata:
+  name: nginx-pod
+  labels:
+    app: nginx
+spec:
+  containers:
+  - name: nginx
+    image: nginx:latest
+    ports:
+    - containerPort: 80</pre>
+      <pre class="mono" style="margin-top:12px;">kubectl apply -f pod.yaml
+kubectl delete -f pod.yaml</pre>
+    </div>
+    <div class="example">
+      <p class="exlabel">Example 3 — Deployment YAML (deployment.yaml)</p>
+      <pre class="mono">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nginx-deployment
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: nginx
+  template:
+    metadata:
+      labels:
+        app: nginx
+    spec:
+      containers:
+      - name: nginx
+        image: nginx:1.25
+        ports:
+        - containerPort: 80</pre>
+      <pre class="mono" style="margin-top:12px;">kubectl apply -f deployment.yaml
+kubectl get deployments
+kubectl get pods -o wide
+kubectl scale deployment nginx-deployment --replicas=5
+kubectl set image deployment/nginx-deployment nginx=nginx:1.26
+kubectl rollout status deployment/nginx-deployment
+kubectl rollout undo deployment/nginx-deployment</pre>
+    </div>
+
+    <h3 class="subhead"><span class="tag tag-project">Project</span> Deploy Your First Application</h3>
+    <div class="projectbox">
+      <p>Using Minikube, create a Deployment running <code class="mono">nginx:1.25</code> with 3 replicas. Scale it to 5, then perform a rolling update to <code class="mono">nginx:1.26</code>, watch the rollout with <code class="mono">kubectl rollout status</code>, then roll it back. Confirm at every step with <code class="mono">kubectl get pods -o wide</code>.</p>
+    </div>
+
+    <h3 class="subhead"><span class="tag tag-resource">Free Resources</span></h3>
+    <div class="resources">
+      <div class="res-card"><div class="k">Docs</div><div class="t"><a href="https://kubernetes.io/docs/concepts/workloads/pods/">Kubernetes Docs: Pods</a></div><p class="d">Official reference for Pod spec and lifecycle.</p></div>
+      <div class="res-card"><div class="k">Docs</div><div class="t"><a href="https://kubernetes.io/docs/concepts/workloads/controllers/deployment/">Kubernetes Docs: Deployments</a></div><p class="d">Official reference for rolling updates, rollbacks, and scaling.</p></div>
+      <div class="res-card"><div class="k">Interactive</div><div class="t"><a href="https://kubernetes.io/docs/tutorials/kubernetes-basics/">Kubernetes Basics Tutorial</a></div><p class="d">Official, browser-based, free interactive tutorial — no install needed.</p></div>
+      <div class="res-card"><div class="k">Tool</div><div class="t"><a href="https://minikube.sigs.k8s.io/docs/start/">Minikube Get Started</a></div><p class="d">Free local single-node cluster — what this whole roadmap runs on.</p></div>
+      <div class="res-card"><div class="k">Sandbox</div><div class="t"><a href="https://labs.play-with-k8s.com/">Play with Kubernetes</a></div><p class="d">Free browser sandbox, zero install, good for a quick second environment.</p></div>
+      <div class="res-card"><div class="k">Reference</div><div class="t"><a href="https://kubernetes.io/docs/reference/kubectl/cheatsheet/">kubectl Cheat Sheet</a></div><p class="d">Official command reference — bookmark this one.</p></div>
+    </div>
+
+    <h3 class="subhead"><span class="tag tag-interview">Top 50 Q&amp;A</span> Pods &amp; Deployments</h3>
+    <div class="qa-groups">
+      <details class="qa-group">
+        <summary>Pods &amp; core concepts <span class="count">10 questions</span></summary>
+        <div class="qa-body">
+          <div class="qa"><p class="q"><span class="qnum">1.</span>What is a Pod?</p><p class="a">The smallest deployable unit in Kubernetes. It wraps one or more containers that share the same network namespace (IP address) and storage volumes. You almost never create bare Pods in production — they're managed by controllers like Deployments.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">2.</span>Why does Kubernetes use Pods instead of scheduling containers directly?</p><p class="a">Some containers need to be co-located and share resources (e.g., a main app + a logging sidecar). Pods give Kubernetes an atomic unit to schedule, scale, and network — simplifying the scheduler's job.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">3.</span>Can a Pod contain multiple containers?</p><p class="a">Yes. Multi-container Pods share localhost networking and can share volumes — common patterns are sidecar (logging/proxy) and init containers (setup tasks before the main container starts).</p></div>
+          <div class="qa"><p class="q"><span class="qnum">4.</span>What is a Deployment?</p><p class="a">A higher-level controller that manages ReplicaSets and Pods for you — declaring "I want N replicas of this Pod spec running" and Kubernetes continuously works to make that true.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">5.</span>What's the difference between a Pod, a ReplicaSet, and a Deployment?</p><p class="a">Pod = single running instance. ReplicaSet = ensures a fixed number of identical Pods exist. Deployment = manages ReplicaSets over time, enabling rolling updates and rollbacks. In practice, you write Deployments; Kubernetes creates the ReplicaSets and Pods for you.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">6.</span>Why shouldn't you create Pods directly in production?</p><p class="a">A bare Pod has no self-healing — if the node dies or the Pod crashes, nothing recreates it. A Deployment (or other controller) watches and recreates Pods automatically.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">7.</span>What does <code>kubectl get pods</code> show you?</p><p class="a">Pod name, READY count (ready containers / total containers), STATUS (Running, Pending, CrashLoopBackOff, etc.), RESTARTS, and AGE.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">8.</span>How do you view detailed information and recent events for a Pod?</p><p class="a"><code>kubectl describe pod &lt;pod-name&gt;</code> — shows spec, container statuses, and an Events log at the bottom, which is usually the first place to look when debugging.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">9.</span>How do you view a container's logs?</p><p class="a"><code>kubectl logs &lt;pod-name&gt;</code>. For a specific container in a multi-container Pod: <code>kubectl logs &lt;pod-name&gt; -c &lt;container-name&gt;</code>. Add <code>-f</code> to stream/follow.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">10.</span>How do you get a shell inside a running container?</p><p class="a"><code>kubectl exec -it &lt;pod-name&gt; -- /bin/sh</code> (or <code>/bin/bash</code> if available). Useful for inspecting files, testing connectivity, or debugging from inside.</p></div>
+        </div>
+      </details>
+
+      <details class="qa-group">
+        <summary>Deployments &amp; rollouts <span class="count">10 questions</span></summary>
+        <div class="qa-body">
+          <div class="qa"><p class="q"><span class="qnum">11.</span>What are Labels used for?</p><p class="a">Arbitrary key-value pairs attached to objects (e.g., <code>app: nginx</code>) used to organize and select subsets of resources — Deployments find their Pods via label selectors, and Services find their target Pods the same way.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">12.</span>What is a Selector?</p><p class="a">A query that matches objects by their labels. A Deployment's <code>spec.selector.matchLabels</code> must match the labels in its Pod template, or Kubernetes will reject the Deployment as invalid.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">13.</span>What happens if you delete a Pod that's managed by a Deployment?</p><p class="a">The Deployment's ReplicaSet controller notices the replica count dropped below desired and immediately creates a replacement Pod. This is the self-healing behavior a bare Pod does not have.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">14.</span>Scenario — you run <code>kubectl delete pod nginx-abc123</code> and a new Pod appears seconds later with a different name. Why?</p><p class="a">It's managed by a Deployment/ReplicaSet. The controller detected the missing replica and created a new Pod (new name/ID, same spec) to restore the desired replica count.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">15.</span>What is a rolling update?</p><p class="a">A Deployment strategy that gradually replaces old Pods with new ones (a few at a time), keeping the app available throughout — as opposed to killing everything and starting fresh (recreate strategy).</p></div>
+          <div class="qa"><p class="q"><span class="qnum">16.</span>How do you trigger a rolling update to a new image version?</p><p class="a"><code>kubectl set image deployment/&lt;name&gt; &lt;container-name&gt;=&lt;new-image&gt;</code> or edit the YAML's image field and <code>kubectl apply -f</code>.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">17.</span>How do you check the status of a rollout?</p><p class="a"><code>kubectl rollout status deployment/&lt;name&gt;</code> — blocks and reports progress until the rollout completes or fails.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">18.</span>How do you roll back a bad deployment?</p><p class="a"><code>kubectl rollout undo deployment/&lt;name&gt;</code> reverts to the previous ReplicaSet/revision. Use <code>kubectl rollout history deployment/&lt;name&gt;</code> to see revisions and <code>--to-revision=N</code> to target a specific one.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">19.</span>Scenario — you deployed a new image and now all Pods are crash-looping. What's the fastest recovery action?</p><p class="a"><code>kubectl rollout undo deployment/&lt;name&gt;</code> to immediately revert to the last known-good revision, then investigate the bad image separately (check logs, describe pod) before retrying.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">20.</span>What is <code>replicas</code> in a Deployment spec?</p><p class="a">The desired number of identical Pod copies to keep running at all times. The Deployment controller continuously reconciles actual state toward this desired number.</p></div>
+        </div>
+      </details>
+
+      <details class="qa-group">
+        <summary>Pod states &amp; troubleshooting <span class="count">10 questions</span></summary>
+        <div class="qa-body">
+          <div class="qa"><p class="q"><span class="qnum">21.</span>Write the command to scale a Deployment to 5 replicas.</p><p class="a"><code>kubectl scale deployment &lt;name&gt; --replicas=5</code></p></div>
+          <div class="qa"><p class="q"><span class="qnum">22.</span>Scenario — a Pod shows STATUS <code>Pending</code> and stays that way. What are three possible causes?</p><p class="a">(1) Insufficient cluster resources (no node has enough CPU/memory) — check <code>kubectl describe pod</code> for "FailedScheduling" events. (2) A <code>nodeSelector</code>/affinity rule that no node satisfies. (3) A PersistentVolumeClaim the Pod depends on hasn't been bound yet.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">23.</span>Scenario — a Pod shows STATUS <code>CrashLoopBackOff</code>. What does that mean and how do you investigate?</p><p class="a">The container starts, exits with an error, and Kubernetes keeps retrying with increasing backoff delay. Investigate with <code>kubectl logs &lt;pod&gt; --previous</code> (logs from the crashed instance) and <code>kubectl describe pod</code> for exit codes/events.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">24.</span>Scenario — a Pod shows STATUS <code>ImagePullBackOff</code>. What are the likely causes?</p><p class="a">The image name/tag is wrong, the image doesn't exist in the registry, or the cluster lacks credentials to pull from a private registry. Check <code>kubectl describe pod</code> events for the exact pull error.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">25.</span>What is the difference between <code>kubectl apply</code> and <code>kubectl create</code>?</p><p class="a"><code>create</code> makes a new resource and fails if it already exists (imperative, one-shot). <code>apply</code> creates it if missing or updates it to match the YAML if it exists — the standard declarative approach for ongoing management.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">26.</span>Write the command to view all Pods with extra details like Node and IP.</p><p class="a"><code>kubectl get pods -o wide</code></p></div>
+          <div class="qa"><p class="q"><span class="qnum">27.</span>What does the READY column like <code>2/3</code> mean in <code>kubectl get pods</code>?</p><p class="a">2 of 3 containers in that Pod are passing their readiness checks / running. If it never reaches 3/3, one container is failing to start or stay healthy.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">28.</span>What is a container restart count, and when should you worry about it?</p><p class="a">The RESTARTS column shows how many times a container in the Pod has been restarted by the kubelet. A rising count indicates repeated crashes — investigate with logs even if the Pod currently shows Running.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">29.</span>How does Kubernetes decide which Node to schedule a Pod on?</p><p class="a">The scheduler filters Nodes that meet resource requests/constraints, then scores remaining candidates (e.g., by resource balance) and picks the best fit — unless you use nodeSelector/affinity to constrain it.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">30.</span>What is the <code>imagePullPolicy</code> field and its common values?</p><p class="a">Controls when the kubelet pulls the image: <code>Always</code> (every start), <code>IfNotPresent</code> (only if not cached locally), <code>Never</code>. Using <code>:latest</code> tag defaults to <code>Always</code>; a specific tag defaults to <code>IfNotPresent</code>.</p></div>
+        </div>
+      </details>
+
+      <details class="qa-group">
+        <summary>kubectl commands &amp; YAML <span class="count">10 questions</span></summary>
+        <div class="qa-body">
+          <div class="qa"><p class="q"><span class="qnum">31.</span>Scenario — you want zero downtime during an update but your app takes 30 seconds to become ready. What should you configure?</p><p class="a">A <code>readinessProbe</code> with an appropriate <code>initialDelaySeconds</code>/timing so the rolling update waits for new Pods to report ready before terminating old ones.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">32.</span>What is a livenessProbe and how does it differ from a readinessProbe?</p><p class="a">livenessProbe checks if a container is still healthy — if it fails, Kubernetes restarts the container. readinessProbe checks if it's ready to serve traffic — if it fails, the Pod is removed from Service load-balancing but not restarted.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">33.</span>Write a command to delete a Deployment and all its Pods.</p><p class="a"><code>kubectl delete deployment &lt;name&gt;</code> — this deletes the Deployment, its ReplicaSets, and all managed Pods.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">34.</span>What happens to a Pod's data when the container restarts?</p><p class="a">Anything not on a mounted volume is lost — container filesystems are ephemeral. Data on a volume (covered Day 4) survives container restarts.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">35.</span>Scenario — you need to run a one-off diagnostic container without a controller. What command creates it and cleans up automatically?</p><p class="a"><code>kubectl run debug --image=busybox --rm -it -- sh</code> — the <code>--rm</code> flag deletes the Pod once you exit.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">36.</span>What is the purpose of <code>metadata.name</code> vs <code>metadata.labels</code> on a Pod?</p><p class="a"><code>name</code> is the unique identifier for that specific object. <code>labels</code> are non-unique, arbitrary key-value tags used for grouping/selecting — many Pods can share the same label.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">37.</span>How do you find out which node a specific Pod is running on?</p><p class="a"><code>kubectl get pod &lt;name&gt; -o wide</code> (NODE column) or <code>kubectl describe pod &lt;name&gt;</code> (Node field near the top).</p></div>
+          <div class="qa"><p class="q"><span class="qnum">38.</span>What's the difference between <code>restartPolicy: Always</code>, <code>OnFailure</code>, and <code>Never</code>?</p><p class="a">Always (default, used by Deployments) restarts the container regardless of exit code. OnFailure restarts only on non-zero exit. Never doesn't restart — used for one-off Jobs where you want to inspect a failure.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">39.</span>Scenario — <code>kubectl apply -f deployment.yaml</code> fails with "selector does not match template labels." What's wrong?</p><p class="a">The <code>spec.selector.matchLabels</code> doesn't match <code>spec.template.metadata.labels</code>. Both must align — the selector is how the Deployment finds "its" Pods.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">40.</span>What is the command to edit a live Deployment directly without a YAML file on disk?</p><p class="a"><code>kubectl edit deployment &lt;name&gt;</code> — opens the live object in your default editor; saving triggers an update.</p></div>
+        </div>
+      </details>
+
+      <details class="qa-group">
+        <summary>Scaling, resources &amp; advanced scenarios <span class="count">10 questions</span></summary>
+        <div class="qa-body">
+          <div class="qa"><p class="q"><span class="qnum">41.</span>How can you see the YAML of a currently running resource?</p><p class="a"><code>kubectl get deployment &lt;name&gt; -o yaml</code> (or <code>-o json</code>).</p></div>
+          <div class="qa"><p class="q"><span class="qnum">42.</span>What is <code>kubectl diff -f file.yaml</code> used for?</p><p class="a">Shows what would change if you applied that file, without actually applying it — useful for reviewing changes before committing them.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">43.</span>Scenario — you have 3 replicas but only see 2 Pods running, one Pending. What single command tells you exactly why?</p><p class="a"><code>kubectl describe pod &lt;pending-pod-name&gt;</code> — read the Events section at the bottom (e.g., "Insufficient cpu" or "0/1 nodes are available").</p></div>
+          <div class="qa"><p class="q"><span class="qnum">44.</span>What does <code>minReadySeconds</code> do on a Deployment?</p><p class="a">The minimum time a new Pod must stay Ready before it's considered available, slowing down a rollout slightly to avoid counting a flaky Pod as healthy too early.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">45.</span>What's the difference between <code>RollingUpdate</code> and <code>Recreate</code> deployment strategies?</p><p class="a">RollingUpdate replaces Pods incrementally (default, zero-downtime capable). Recreate kills all old Pods first, then creates new ones (brief downtime, useful when old/new versions can't run simultaneously, e.g., conflicting DB migrations).</p></div>
+          <div class="qa"><p class="q"><span class="qnum">46.</span>Write the command to view the revision history of a Deployment.</p><p class="a"><code>kubectl rollout history deployment/&lt;name&gt;</code></p></div>
+          <div class="qa"><p class="q"><span class="qnum">47.</span>Scenario — you scaled a Deployment to 0 replicas. What happens to the Deployment object itself?</p><p class="a">It still exists (config, name, history) but has zero running Pods — a common way to "pause" a workload without deleting its definition.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">48.</span>What is the purpose of <code>resources.requests</code> and <code>resources.limits</code> on a container?</p><p class="a"><code>requests</code> is what the scheduler guarantees/reserves on a Node (used for placement decisions); <code>limits</code> is the hard ceiling the container cannot exceed (CPU throttled, memory OOM-killed if exceeded).</p></div>
+          <div class="qa"><p class="q"><span class="qnum">49.</span>Scenario — a Pod was OOMKilled. What does that mean and where do you see it?</p><p class="a">The container exceeded its memory <code>limit</code> and the kernel killed it. Visible via <code>kubectl describe pod</code> — look for "Reason: OOMKilled" under the container's Last State.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">50.</span>What is the single most useful first command to run when something is wrong with a Pod?</p><p class="a"><code>kubectl describe pod &lt;name&gt;</code> — it surfaces status, container states, exit codes/reasons, and the Events timeline, which almost always points to the root cause.</p></div>
+        </div>
+      </details>
+    </div>
+  </section>
+
+  <!-- ============================================================ DAY 2 ============================================================ -->
+  <section class="day" id="day2">
+    <div class="day-tag"><span class="day-num">DAY 2 · 4H</span></div>
+    <h2 class="display">Services &amp; Networking</h2>
+    <div class="day-meta">Goal: give Pods a stable address, so clients never depend on a Pod IP that can change any second.</div>
+
+    <h3 class="subhead"><span class="tag tag-concept">Core Concepts</span></h3>
+    <div class="concept">
+      <ul>
+        <li><strong>Service</strong> — a stable network endpoint (virtual IP + DNS name) that load-balances traffic across a set of Pods matched by label selector, decoupling clients from ever-changing Pod IPs.</li>
+        <li><strong>ClusterIP</strong> (default) — internal-only virtual IP reachable only inside the cluster.</li>
+        <li><strong>NodePort</strong> — exposes a Service on a static port on every Node's IP, reachable from outside the cluster.</li>
+        <li><strong>LoadBalancer</strong> — requests a cloud provider's external load balancer (on Minikube, simulated via <code class="mono">minikube tunnel</code>).</li>
+        <li><strong>Cluster DNS</strong> — every Service gets a DNS name (<code class="mono">&lt;service&gt;.&lt;namespace&gt;.svc.cluster.local</code>) automatically resolvable from any Pod.</li>
+      </ul>
+    </div>
+
+    <h3 class="subhead"><span class="tag tag-practice">Hands-On Examples</span></h3>
+    <div class="example">
+      <p class="exlabel">Example 1 — expose the Day 1 Deployment via ClusterIP</p>
+      <pre class="mono">apiVersion: v1
+kind: Service
+metadata:
+  name: nginx-service
+spec:
+  selector:
+    app: nginx
+  ports:
+  - port: 80
+    targetPort: 80</pre>
+      <pre class="mono" style="margin-top:12px;">kubectl apply -f service.yaml
+kubectl get svc
+kubectl run tmp-shell --rm -it --image=busybox -- wget -qO- nginx-service</pre>
+    </div>
+    <div class="example">
+      <p class="exlabel">Example 2 — expose externally with NodePort</p>
+      <pre class="mono">apiVersion: v1
+kind: Service
+metadata:
+  name: nginx-nodeport
+spec:
+  type: NodePort
+  selector:
+    app: nginx
+  ports:
+  - port: 80
+    targetPort: 80
+    nodePort: 30080</pre>
+      <pre class="mono" style="margin-top:12px;">kubectl apply -f nodeport.yaml
+minikube service nginx-nodeport --url</pre>
+    </div>
+    <div class="example">
+      <p class="exlabel">Example 3 — imperative shortcut</p>
+      <pre class="mono">kubectl expose deployment nginx-deployment --port=80 --target-port=80 --type=NodePort</pre>
+    </div>
+
+    <h3 class="subhead"><span class="tag tag-project">Project</span> Expose Your App to the World</h3>
+    <div class="projectbox">
+      <p>Take Day 1's Deployment, create a ClusterIP Service and verify internal DNS resolution from a temporary debug Pod, then create a second NodePort Service and access the app from your host machine's browser via <code class="mono">minikube service &lt;name&gt; --url</code>.</p>
+    </div>
+
+    <h3 class="subhead"><span class="tag tag-resource">Free Resources</span></h3>
+    <div class="resources">
+      <div class="res-card"><div class="k">Docs</div><div class="t"><a href="https://kubernetes.io/docs/concepts/services-networking/service/">Kubernetes Docs: Service</a></div><p class="d">Official reference for Service types and behavior.</p></div>
+      <div class="res-card"><div class="k">Docs</div><div class="t"><a href="https://kubernetes.io/docs/concepts/services-networking/dns-pod-service/">DNS for Services and Pods</a></div><p class="d">How cluster DNS names resolve, official reference.</p></div>
+      <div class="res-card"><div class="k">Tutorial</div><div class="t"><a href="https://kubernetes.io/docs/tutorials/kubernetes-basics/expose/expose-intro/">Kubernetes Basics: Expose Your App</a></div><p class="d">Official interactive walkthrough of this exact topic.</p></div>
+      <div class="res-card"><div class="k">Docs</div><div class="t"><a href="https://minikube.sigs.k8s.io/docs/handbook/accessing/">Minikube Networking Docs</a></div><p class="d">How to actually reach Services from your host machine.</p></div>
+      <div class="res-card"><div class="k">Sandbox</div><div class="t"><a href="https://labs.play-with-k8s.com/">Play with Kubernetes</a></div><p class="d">Free browser sandbox if you want a second environment.</p></div>
+    </div>
+
+    <h3 class="subhead"><span class="tag tag-interview">Top 50 Q&amp;A</span> Services &amp; Networking</h3>
+    <div class="qa-groups">
+      <details class="qa-group">
+        <summary>Service fundamentals <span class="count">10 questions</span></summary>
+        <div class="qa-body">
+          <div class="qa"><p class="q"><span class="qnum">1.</span>What problem does a Service solve?</p><p class="a">Pod IPs change every time a Pod is recreated (crash, rollout, rescheduling). A Service gives clients one stable virtual IP/DNS name that always routes to whichever Pods currently match its selector.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">2.</span>How does a Service know which Pods to send traffic to?</p><p class="a">Via a label selector — any Pod whose labels match the Service's <code>spec.selector</code> becomes an eligible backend, tracked automatically by an Endpoints/EndpointSlice object.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">3.</span>What is the default Service type?</p><p class="a"><code>ClusterIP</code> — an internal-only virtual IP reachable from within the cluster.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">4.</span>What is <code>ClusterIP</code> used for?</p><p class="a">Internal service-to-service communication — e.g., a frontend Pod calling a backend API Service. Not reachable from outside the cluster.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">5.</span>What is <code>NodePort</code> used for?</p><p class="a">Exposes the Service on the same static port (30000-32767 range) on every Node's IP address, making it reachable from outside the cluster — mainly useful for dev/test, not production-grade external access.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">6.</span>What is <code>LoadBalancer</code> type used for?</p><p class="a">Requests an external load balancer from the cloud provider (AWS ELB, GCP LB, etc.) that routes external traffic to the Service. On Minikube it's simulated with <code>minikube tunnel</code>.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">7.</span>What is <code>ExternalName</code> Service type?</p><p class="a">Maps a Service to an external DNS name (e.g., an external database) via a CNAME, with no selector or proxying — just DNS-level redirection.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">8.</span>Scenario — your Pod's IP changed after a restart but your app still works fine talking to "backend-service." Why?</p><p class="a">You're connecting via the Service's stable DNS name/ClusterIP, not the Pod IP directly — the Service transparently updates its backend list as Pods come and go.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">9.</span>What is the DNS name format for a Service inside the cluster?</p><p class="a"><code>&lt;service-name&gt;.&lt;namespace&gt;.svc.cluster.local</code> — Pods in the same namespace can just use <code>&lt;service-name&gt;</code>.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">10.</span>Write the command to expose an existing Deployment as a ClusterIP Service on port 80.</p><p class="a"><code>kubectl expose deployment &lt;name&gt; --port=80 --target-port=80</code></p></div>
+        </div>
+      </details>
+
+      <details class="qa-group">
+        <summary>ClusterIP, endpoints &amp; DNS <span class="count">10 questions</span></summary>
+        <div class="qa-body">
+          <div class="qa"><p class="q"><span class="qnum">11.</span>What is <code>targetPort</code> vs <code>port</code> in a Service spec?</p><p class="a"><code>port</code> is what clients connect to on the Service's virtual IP. <code>targetPort</code> is the actual port the container listens on inside the Pod — they can differ (e.g., Service port 80 → container port 8080).</p></div>
+          <div class="qa"><p class="q"><span class="qnum">12.</span>Scenario — you curl your ClusterIP Service and get "connection refused." What are two likely causes?</p><p class="a">(1) No Pods match the Service's selector (label mismatch) — check <code>kubectl get endpoints &lt;svc&gt;</code>, an empty list means no backends. (2) <code>targetPort</code> doesn't match the container's actual listening port.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">13.</span>How do you check which Pods a Service is currently routing to?</p><p class="a"><code>kubectl get endpoints &lt;service-name&gt;</code> — lists the Pod IPs currently registered as backends.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">14.</span>Scenario — <code>kubectl get endpoints my-svc</code> shows <code>&lt;none&gt;</code>. What's the root cause and fix?</p><p class="a">The Service's selector doesn't match any Pod's labels. Fix by correcting either the Service's <code>spec.selector</code> or the Pod template's <code>labels</code> so they align.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">15.</span>What component actually implements Service load-balancing on each Node?</p><p class="a"><code>kube-proxy</code>, which programs iptables (or IPVS) rules on every Node to route Service IP traffic to backend Pod IPs.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">16.</span>How does a Service load-balance across multiple backend Pods?</p><p class="a">By default, roughly round-robin/random distribution across all healthy (Ready) endpoint Pods via the kube-proxy rules.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">17.</span>What happens to Service routing if a backend Pod fails its readinessProbe?</p><p class="a">It's removed from the Service's Endpoints list immediately — no traffic is routed to it until it becomes Ready again, without needing a restart.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">18.</span>Write the command to list all Services in the current namespace.</p><p class="a"><code>kubectl get svc</code> (or <code>kubectl get services</code>)</p></div>
+          <div class="qa"><p class="q"><span class="qnum">19.</span>Scenario — you need external users to reach your app from Minikube on your laptop. What's the simplest approach?</p><p class="a">Create a NodePort Service, then run <code>minikube service &lt;name&gt; --url</code> to get a directly accessible URL (Minikube handles the tunneling for you locally).</p></div>
+          <div class="qa"><p class="q"><span class="qnum">20.</span>What port range is valid for NodePort?</p><p class="a">30000–32767 by default; if you don't specify one, Kubernetes auto-assigns from that range.</p></div>
+        </div>
+      </details>
+
+      <details class="qa-group">
+        <summary>NodePort/LoadBalancer &amp; headless services <span class="count">10 questions</span></summary>
+        <div class="qa-body">
+          <div class="qa"><p class="q"><span class="qnum">21.</span>Scenario — two different Deployments both have Pods labeled <code>app: web</code>, and you only want your Service to hit one of them. What should you check?</p><p class="a">Add a more specific/unique label (e.g., <code>tier: frontend-v2</code>) to the intended Deployment's Pod template and reference that in the Service's selector — ambiguous overlapping labels will route to both.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">22.</span>What is a headless Service (<code>clusterIP: None</code>)?</p><p class="a">A Service with no virtual IP — DNS lookups return the individual Pod IPs directly instead of one load-balanced IP. Used when clients need to address each backend Pod individually (common with StatefulSets, Day 4).</p></div>
+          <div class="qa"><p class="q"><span class="qnum">23.</span>How can a Pod discover a Service's ClusterIP via environment variables?</p><p class="a">Kubernetes injects <code>&lt;SVCNAME&gt;_SERVICE_HOST</code> and <code>&lt;SVCNAME&gt;_SERVICE_PORT</code> env vars into Pods started after the Service exists — though DNS is the more reliable, order-independent method.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">24.</span>Scenario — your app works when you curl from inside a Pod using the Service's ClusterIP, but not by DNS name. What's likely misconfigured?</p><p class="a">Cluster DNS (CoreDNS) may not be resolving correctly, or you're testing from a Pod in a different namespace without the full <code>&lt;svc&gt;.&lt;namespace&gt;.svc.cluster.local</code> suffix.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">25.</span>What is CoreDNS's role in the cluster?</p><p class="a">It's the cluster's internal DNS server, running as Pods, resolving Service and Pod names to their virtual/actual IPs for any Pod that queries it (configured automatically via each Pod's <code>/etc/resolv.conf</code>).</p></div>
+          <div class="qa"><p class="q"><span class="qnum">26.</span>Write the command to test DNS resolution of a Service from inside a temporary Pod.</p><p class="a"><code>kubectl run dns-test --rm -it --image=busybox -- nslookup &lt;service-name&gt;</code></p></div>
+          <div class="qa"><p class="q"><span class="qnum">27.</span>What's the difference between a Service and an Ingress (preview for Day 5)?</p><p class="a">A Service load-balances at L4 (TCP/UDP) to a set of Pods, typically one Service per app. An Ingress operates at L7 (HTTP), routing by hostname/path across multiple Services, usually with one external entry point for many apps.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">28.</span>Scenario — you delete and recreate a Service with the same name. Does the ClusterIP stay the same?</p><p class="a">Not guaranteed — deleting a Service releases its ClusterIP back to the pool; recreating it (without explicitly setting <code>spec.clusterIP</code>) may assign a different IP. Clients should always use the DNS name, not the IP.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">29.</span>What does <code>sessionAffinity: ClientIP</code> do on a Service?</p><p class="a">Routes all requests from the same client IP to the same backend Pod for the session duration, instead of default round-robin — useful for stateful in-memory sessions (though shared storage is usually a better fix).</p></div>
+          <div class="qa"><p class="q"><span class="qnum">30.</span>Scenario — after scaling a Deployment from 3 to 6 replicas, do you need to update the Service?</p><p class="a">No — the Service selector automatically picks up any Pod matching its labels, so new replicas are added to the Endpoints list with zero Service configuration changes.</p></div>
+        </div>
+      </details>
+
+      <details class="qa-group">
+        <summary>Multi-port, CNI &amp; EndpointSlices <span class="count">10 questions</span></summary>
+        <div class="qa-body">
+          <div class="qa"><p class="q"><span class="qnum">31.</span>What is the <code>port</code> field required for, even if <code>targetPort</code> is omitted?</p><p class="a">It's mandatory — the port the Service itself listens on. If <code>targetPort</code> is omitted, it defaults to the same value as <code>port</code>.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">32.</span>How would you expose multiple ports (e.g., 80 and 443) on one Service?</p><p class="a">List multiple entries under <code>spec.ports</code>, each with a unique <code>name</code> field (required when there's more than one port) — e.g., <code>name: http, port: 80</code> and <code>name: https, port: 443</code>.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">33.</span>Scenario — your NodePort Service works on <code>minikube ip</code>:30080 but a teammate on a different cloud cluster expects a real LoadBalancer URL. Why the difference?</p><p class="a">NodePort just opens a port on every Node's own IP — there's no managed external IP. LoadBalancer type additionally provisions a cloud load balancer with its own external IP/DNS, which Minikube doesn't natively provide (hence <code>minikube tunnel</code> as a substitute).</p></div>
+          <div class="qa"><p class="q"><span class="qnum">34.</span>What does <code>minikube tunnel</code> do?</p><p class="a">Creates a network route on your host so <code>LoadBalancer</code>-type Services get a routable external IP, simulating what a real cloud provider would provision.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">35.</span>Write the command to delete a Service.</p><p class="a"><code>kubectl delete svc &lt;service-name&gt;</code></p></div>
+          <div class="qa"><p class="q"><span class="qnum">36.</span>Scenario — you have a Service targeting port 8080 but your container's Dockerfile exposes port 3000. What breaks and what's the fix?</p><p class="a">Nothing routes correctly since traffic gets sent to a port nothing is listening on. Fix by setting <code>targetPort: 3000</code> (matching what the app actually listens on) while <code>port</code> can remain whatever clients should use.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">37.</span>How does Kubernetes networking guarantee every Pod gets its own unique, routable IP?</p><p class="a">Via the cluster's CNI (Container Network Interface) plugin, which implements the Kubernetes networking model: every Pod can reach every other Pod's IP directly, without NAT, cluster-wide.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">38.</span>Scenario — Pod A can curl Pod B's IP directly but you're told not to rely on that in your app code. Why?</p><p class="a">Pod IPs are ephemeral — they change on every restart/reschedule. Only Service names/IPs are meant to be stable references for application code.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">39.</span>What is an EndpointSlice?</p><p class="a">The modern, scalable version of the older Endpoints object — tracks the actual backend Pod IPs/ports for a Service, split into slices for performance at scale.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">40.</span>How do you check if a Service has any active traffic-routing issues quickly?</p><p class="a"><code>kubectl describe svc &lt;name&gt;</code> — shows the selector, Endpoints (or lack thereof), and Port mappings all in one place.</p></div>
+        </div>
+      </details>
+
+      <details class="qa-group">
+        <summary>Scenario-based troubleshooting <span class="count">10 questions</span></summary>
+        <div class="qa-body">
+          <div class="qa"><p class="q"><span class="qnum">41.</span>Scenario — you want internal-only access between microservices but also need one public entry point later. What Service type(s) should you use now?</p><p class="a">ClusterIP for all internal microservice-to-microservice communication now; you'll add an Ingress (Day 5) as the single external entry point later rather than exposing every Service externally.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">42.</span>What is the security implication of using NodePort in a real (non-learning) environment?</p><p class="a">It opens a port directly on every Node's network interface, potentially bypassing intended network boundaries/firewalls — generally discouraged for production external exposure in favor of Ingress or a cloud LoadBalancer with proper security groups.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">43.</span>Scenario — a Service selector is <code>app: nginx, tier: frontend</code> but your Pods only have the label <code>app: nginx</code>. What happens?</p><p class="a">The Service matches nothing (a Service selector requires ALL listed labels to match) — Endpoints will be empty and traffic will fail to route anywhere.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">44.</span>Write the command to see a Service's full YAML definition as currently applied in the cluster.</p><p class="a"><code>kubectl get svc &lt;name&gt; -o yaml</code></p></div>
+          <div class="qa"><p class="q"><span class="qnum">45.</span>What's the difference between "Service" and "Endpoints" as API objects?</p><p class="a">Service defines the stable virtual IP/selector/ports (the "front door" spec). Endpoints (or EndpointSlices) is the automatically-maintained list of actual backend Pod IPs currently matching that selector.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">46.</span>Scenario — you want zero-downtime deploys and notice new Pods briefly receive traffic before they're fully ready during a rollout. What's missing?</p><p class="a">A properly configured <code>readinessProbe</code> on the container — without it, Kubernetes assumes the Pod is ready as soon as it starts, even if the app inside hasn't finished initializing.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">47.</span>Can a single Pod be a backend for multiple different Services simultaneously?</p><p class="a">Yes — as long as its labels match each Service's selector, it can receive traffic through multiple independent Services (e.g., one for internal metrics, one for the main app).</p></div>
+          <div class="qa"><p class="q"><span class="qnum">48.</span>What is <code>kube-proxy</code> and does it run as a Pod?</p><p class="a">The Node-level component implementing Service virtual IPs by writing iptables/IPVS rules; it typically runs as a DaemonSet Pod on every Node.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">49.</span>Scenario — after deploying, curl to the Service times out (not "connection refused"). What does that suggest vs. a refused connection?</p><p class="a">A refused connection usually means something is listening but rejecting (or nothing is behind that specific port); a timeout usually points to a network/firewall/CNI issue or the request never reaching any Pod at all (e.g., no Endpoints, or NetworkPolicy blocking it).</p></div>
+          <div class="qa"><p class="q"><span class="qnum">50.</span>What's the single command to quickly diagnose "my Service isn't working"?</p><p class="a"><code>kubectl describe svc &lt;name&gt;</code> combined with <code>kubectl get endpoints &lt;name&gt;</code> — together they show selector correctness, registered backend Pods, and port mappings in seconds.</p></div>
+        </div>
+      </details>
+    </div>
+  </section>
+
+  <!-- ============================================================ DAY 3 ============================================================ -->
+  <section class="day" id="day3">
+    <div class="day-tag"><span class="day-num">DAY 3 · 3H</span></div>
+    <h2 class="display">ConfigMaps &amp; Secrets</h2>
+    <div class="day-meta">Goal: separate configuration and credentials from your container image, so the same image runs anywhere.</div>
+
+    <h3 class="subhead"><span class="tag tag-concept">Core Concepts</span></h3>
+    <div class="concept">
+      <ul>
+        <li><strong>ConfigMap</strong> — stores non-sensitive configuration data (key-value pairs, files) separately from container images, injected as env vars or mounted files.</li>
+        <li><strong>Secret</strong> — like a ConfigMap but for sensitive data (passwords, tokens, certs); base64-encoded at rest (not encrypted by default — a key nuance for beginners).</li>
+        <li><strong>Env var injection</strong> (<code class="mono">envFrom</code>/<code class="mono">valueFrom</code>) — pulling ConfigMap/Secret values into a container's environment.</li>
+        <li><strong>Volume mounting</strong> — projecting a ConfigMap/Secret as files inside a container's filesystem.</li>
+        <li><strong>Decoupling config from image</strong> — the core principle: the same container image should run in dev/staging/prod, with only the ConfigMap/Secret changing.</li>
+      </ul>
+    </div>
+
+    <h3 class="subhead"><span class="tag tag-practice">Hands-On Examples</span></h3>
+    <div class="example">
+      <p class="exlabel">Example 1 — ConfigMap from literals, consumed as env vars</p>
+      <pre class="mono">kubectl create configmap app-config --from-literal=APP_COLOR=blue --from-literal=APP_MODE=prod</pre>
+      <pre class="mono" style="margin-top:12px;">apiVersion: v1
+kind: Pod
+metadata:
+  name: config-demo
+spec:
+  containers:
+  - name: demo
+    image: busybox
+    command: ["sh", "-c", "env | grep APP_ && sleep 3600"]
+    envFrom:
+    - configMapRef:
+        name: app-config</pre>
+    </div>
+    <div class="example">
+      <p class="exlabel">Example 2 — Secret consumed as a mounted file</p>
+      <pre class="mono">kubectl create secret generic db-secret --from-literal=DB_PASSWORD=SuperSecret123</pre>
+      <pre class="mono" style="margin-top:12px;">apiVersion: v1
+kind: Pod
+metadata:
+  name: secret-demo
+spec:
+  containers:
+  - name: demo
+    image: busybox
+    command: ["sh", "-c", "cat /etc/secret/DB_PASSWORD && sleep 3600"]
+    volumeMounts:
+    - name: secret-vol
+      mountPath: /etc/secret
+  volumes:
+  - name: secret-vol
+    secret:
+      secretName: db-secret</pre>
+    </div>
+    <div class="example">
+      <p class="exlabel">Example 3 — ConfigMap from a file</p>
+      <pre class="mono">kubectl create configmap nginx-config --from-file=nginx.conf</pre>
+    </div>
+
+    <h3 class="subhead"><span class="tag tag-project">Project</span> Multi-Container Pod with ConfigMap and Secret</h3>
+    <div class="projectbox">
+      <p>Build a Pod with two containers: one running your app image reading <code class="mono">APP_COLOR</code>/<code class="mono">APP_MODE</code> from a ConfigMap as env vars, and a <code class="mono">DB_PASSWORD</code> value mounted from a Secret as a file. Verify both are accessible with <code class="mono">kubectl exec</code> inside the running Pod.</p>
+    </div>
+
+    <h3 class="subhead"><span class="tag tag-resource">Free Resources</span></h3>
+    <div class="resources">
+      <div class="res-card"><div class="k">Docs</div><div class="t"><a href="https://kubernetes.io/docs/concepts/configuration/configmap/">Kubernetes Docs: ConfigMaps</a></div><p class="d">Official reference for ConfigMap creation and consumption.</p></div>
+      <div class="res-card"><div class="k">Docs</div><div class="t"><a href="https://kubernetes.io/docs/concepts/configuration/secret/">Kubernetes Docs: Secrets</a></div><p class="d">Official reference for Secret types and handling.</p></div>
+      <div class="res-card"><div class="k">Tutorial</div><div class="t"><a href="https://kubernetes.io/docs/tutorials/configuration/">Kubernetes Basics: Configuration</a></div><p class="d">Official tutorial series on configuration patterns.</p></div>
+      <div class="res-card"><div class="k">Docs</div><div class="t"><a href="https://kubernetes.io/docs/tasks/configure-pod-container/configure-pod-configmap/">Configure a Pod to Use a ConfigMap</a></div><p class="d">Step-by-step official task guide.</p></div>
+    </div>
+
+    <h3 class="subhead"><span class="tag tag-interview">Top 50 Q&amp;A</span> ConfigMaps &amp; Secrets</h3>
+    <div class="qa-groups">
+      <details class="qa-group">
+        <summary>ConfigMap &amp; Secret fundamentals <span class="count">10 questions</span></summary>
+        <div class="qa-body">
+          <div class="qa"><p class="q"><span class="qnum">1.</span>What is a ConfigMap?</p><p class="a">A Kubernetes object that stores non-sensitive configuration data as key-value pairs, decoupled from your container image so the same image can be reused across environments with different config.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">2.</span>What is a Secret and how is it different from a ConfigMap?</p><p class="a">Structurally almost identical to a ConfigMap, but intended for sensitive data. Values are base64-encoded (not encrypted by default at the API level) and Kubernetes treats Secrets with slightly tighter defaults (e.g., not shown in plain in some describe output).</p></div>
+          <div class="qa"><p class="q"><span class="qnum">3.</span>Is base64 encoding the same as encryption?</p><p class="a">No — base64 is just an encoding, trivially reversible by anyone with access to the Secret object. Real protection requires enabling encryption-at-rest on the etcd datastore and restricting RBAC access to Secrets (covered Day 5).</p></div>
+          <div class="qa"><p class="q"><span class="qnum">4.</span>Why decouple configuration from the container image?</p><p class="a">So the exact same tested image can be promoted from dev → staging → prod without rebuilding — only the ConfigMap/Secret values change per environment.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">5.</span>Write the command to create a ConfigMap from literal key-value pairs.</p><p class="a"><code>kubectl create configmap &lt;name&gt; --from-literal=KEY=value --from-literal=KEY2=value2</code></p></div>
+          <div class="qa"><p class="q"><span class="qnum">6.</span>Write the command to create a ConfigMap from a file.</p><p class="a"><code>kubectl create configmap &lt;name&gt; --from-file=&lt;path-to-file&gt;</code></p></div>
+          <div class="qa"><p class="q"><span class="qnum">7.</span>Write the command to create a Secret from literal values.</p><p class="a"><code>kubectl create secret generic &lt;name&gt; --from-literal=PASSWORD=mysecret</code></p></div>
+          <div class="qa"><p class="q"><span class="qnum">8.</span>How do you inject an entire ConfigMap's keys as environment variables?</p><p class="a">Use <code>envFrom: - configMapRef: name: &lt;configmap-name&gt;</code> in the container spec — every key becomes an env var of the same name.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">9.</span>How do you inject a single specific key from a ConfigMap as one named env var?</p><p class="a"><code>env: - name: MY_VAR valueFrom: configMapKeyRef: name: &lt;configmap&gt; key: &lt;key&gt;</code></p></div>
+          <div class="qa"><p class="q"><span class="qnum">10.</span>How do you mount a ConfigMap as files inside a container?</p><p class="a">Define a volume of type <code>configMap</code> referencing the ConfigMap, then <code>volumeMounts</code> it into the container at a chosen <code>mountPath</code> — each key becomes a filename, its value the file's content.</p></div>
+        </div>
+      </details>
+
+      <details class="qa-group">
+        <summary>Env vars &amp; volume mounts <span class="count">10 questions</span></summary>
+        <div class="qa-body">
+          <div class="qa"><p class="q"><span class="qnum">11.</span>Scenario — you update a ConfigMap's value with <code>kubectl apply</code>, but the env var inside an already-running Pod doesn't change. Why?</p><p class="a">Env vars are injected only at container start time — they're a one-time snapshot. You must restart/recreate the Pod (e.g., <code>kubectl rollout restart deployment/&lt;name&gt;</code>) to pick up new values.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">12.</span>Scenario — you update a ConfigMap that's mounted as a volume (not env vars). Does the running Pod see the change?</p><p class="a">Yes, eventually — mounted ConfigMap files are updated automatically (usually within about a minute) without restarting the Pod, unlike env vars. The app itself must be watching the file for changes to act on it, though.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">13.</span>What is <code>subPath</code> used for when mounting a ConfigMap?</p><p class="a">Mounts a single key from the ConfigMap as one specific file at the mountPath, instead of replacing the whole target directory with all keys — useful when you only want to inject one config file into an existing directory without hiding other files there.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">14.</span>Scenario — you mount a ConfigMap at <code>/etc/config</code> and the directory already contained other files. What happens to those other files?</p><p class="a">The Kubernetes-managed mount fully replaces the target directory's contents — pre-existing files at that exact path get hidden/lost (this is why <code>subPath</code> exists, to mount just one file without wiping the directory).</p></div>
+          <div class="qa"><p class="q"><span class="qnum">15.</span>What does <code>kubectl get secret &lt;name&gt; -o yaml</code> show for values, and how do you decode them?</p><p class="a">Values shown are base64-encoded strings. Decode manually with <code>echo '&lt;value&gt;' | base64 --decode</code>, or use <code>kubectl get secret &lt;name&gt; -o jsonpath='{.data.KEY}' | base64 --decode</code>.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">16.</span>Write the command to view the decoded value of a specific Secret key.</p><p class="a"><code>kubectl get secret &lt;name&gt; -o jsonpath='{.data.PASSWORD}' | base64 --decode</code></p></div>
+          <div class="qa"><p class="q"><span class="qnum">17.</span>Scenario — a Pod is Pending and <code>kubectl describe pod</code> shows "configmap not found." What's the fix?</p><p class="a">Create the missing ConfigMap (the Pod references one by name that doesn't exist yet in that namespace) — <code>kubectl create configmap &lt;name&gt; ...</code> — then the Pod will schedule.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">18.</span>What is the difference between <code>configMapRef</code> and <code>configMapKeyRef</code>?</p><p class="a"><code>configMapRef</code> (used inside <code>envFrom</code>) imports ALL keys as env vars. <code>configMapKeyRef</code> (used inside <code>env[].valueFrom</code>) imports exactly ONE named key as one named env var — giving finer control.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">19.</span>Can a ConfigMap and Secret be used together in the same Pod?</p><p class="a">Yes, freely — e.g., non-sensitive app settings from a ConfigMap and a database password from a Secret, both injected into the same container via env vars or volumes.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">20.</span>What are the size limits for a ConfigMap/Secret?</p><p class="a">Each is limited to 1MiB total, because they're stored in etcd, which isn't designed for large blobs — use them for config/credentials, not large files or binaries.</p></div>
+        </div>
+      </details>
+
+      <details class="qa-group">
+        <summary>Security &amp; secret handling <span class="count">10 questions</span></summary>
+        <div class="qa-body">
+          <div class="qa"><p class="q"><span class="qnum">21.</span>Scenario — you accidentally committed a Secret's YAML (with base64 values) to a public Git repo. Is your data safe?</p><p class="a">No — base64 is trivially decodable by anyone. Treat this exactly like committing a plaintext password: rotate/invalidate the credential immediately and remove it from git history.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">22.</span>What's a common way to avoid committing Secret manifests to git while still using <code>kubectl apply</code> workflows?</p><p class="a">Generate Secrets from local files/env at apply time (<code>kubectl create secret generic ... --from-env-file=.env --dry-run=client -o yaml | kubectl apply -f -</code>) or use a secrets manager/sealed-secrets tool that keeps ciphertext in git instead of raw base64.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">23.</span>What is <code>kubectl create secret docker-registry</code> used for?</p><p class="a">Creates a Secret holding credentials for pulling images from a private container registry, referenced via <code>imagePullSecrets</code> in a Pod spec.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">24.</span>Scenario — your Pod needs to pull from a private Docker registry and shows ImagePullBackOff with an "unauthorized" error. What's missing?</p><p class="a">An <code>imagePullSecrets</code> entry on the Pod (or its ServiceAccount) referencing a <code>docker-registry</code>-type Secret with valid registry credentials.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">25.</span>What is the purpose of the <code>type</code> field on a Secret (e.g., <code>Opaque</code>, <code>kubernetes.io/tls</code>)?</p><p class="a">It tells Kubernetes (and tooling) what kind of data the Secret holds and enforces expected key structure — e.g., <code>kubernetes.io/tls</code> requires exactly <code>tls.crt</code> and <code>tls.key</code> keys, used later by Ingress for HTTPS.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">26.</span>Write the command to list all ConfigMaps in the current namespace.</p><p class="a"><code>kubectl get configmaps</code> (or <code>kubectl get cm</code>)</p></div>
+          <div class="qa"><p class="q"><span class="qnum">27.</span>Write the command to edit a ConfigMap in place.</p><p class="a"><code>kubectl edit configmap &lt;name&gt;</code></p></div>
+          <div class="qa"><p class="q"><span class="qnum">28.</span>Scenario — two containers in the same Pod both mount the same ConfigMap volume. Do they see the same content?</p><p class="a">Yes — both mounts read from the same underlying ConfigMap object, so any update is reflected consistently to all containers mounting it (subject to the same eventual-consistency propagation delay).</p></div>
+          <div class="qa"><p class="q"><span class="qnum">29.</span>What happens if you reference a ConfigMap key in <code>valueFrom.configMapKeyRef</code> that doesn't exist?</p><p class="a">The Pod fails to start, staying Pending, with an event describing the missing key — unless you set <code>optional: true</code> on that reference, in which case it's simply skipped.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">30.</span>What is the <code>optional: true</code> field used for on ConfigMap/Secret references?</p><p class="a">Allows the Pod to start successfully even if the referenced ConfigMap/Secret (or specific key) doesn't exist yet, instead of blocking scheduling — useful for gradually-rolled-out config.</p></div>
+        </div>
+      </details>
+
+      <details class="qa-group">
+        <summary>Advanced patterns <span class="count">10 questions</span></summary>
+        <div class="qa-body">
+          <div class="qa"><p class="q"><span class="qnum">31.</span>Scenario — you want the same app image to run with different settings in "dev" and "prod" namespaces. What's the cleanest approach?</p><p class="a">Deploy identical Deployment YAML in both namespaces, each referencing a ConfigMap of the same name but with environment-specific values — the image never changes, only the ConfigMap content per namespace.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">32.</span>How do immutable ConfigMaps/Secrets (<code>immutable: true</code>) help at scale?</p><p class="a">Prevents accidental updates to a ConfigMap/Secret in use, and lets the API server skip watching it for changes, improving performance in clusters with many ConfigMaps — you create a new one and update the reference instead of mutating in place.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">33.</span>Write the command to delete a Secret.</p><p class="a"><code>kubectl delete secret &lt;name&gt;</code></p></div>
+          <div class="qa"><p class="q"><span class="qnum">34.</span>Scenario — a teammate says "just put the password directly in the Deployment YAML env value" instead of a Secret. What's the risk?</p><p class="a">Plaintext credentials end up in version control, <code>kubectl get deployment -o yaml</code> output, and CI logs — anyone with read access to the manifest sees the password. A Secret at least separates the sensitive value and allows RBAC to restrict who can read it.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">35.</span>What is the difference between <code>Opaque</code> and <code>kubernetes.io/basic-auth</code> Secret types?</p><p class="a"><code>Opaque</code> (the default) is a generic free-form Secret. <code>kubernetes.io/basic-auth</code> enforces specific keys (<code>username</code>, <code>password</code>) for tooling that expects that standard shape.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">36.</span>Scenario — after mounting a Secret as a volume, the file <code>/etc/secret/DB_PASSWORD</code> contains a trailing newline your app doesn't expect. Why?</p><p class="a"><code>--from-literal</code> and file-based Secret creation preserve exact byte content; if the source file had a trailing newline it's included verbatim — trim it in your app or ensure the source value has no newline.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">37.</span>Can Secrets be shared across namespaces?</p><p class="a">No — Secrets (like ConfigMaps) are namespace-scoped; a Pod in namespace <code>dev</code> cannot reference a Secret living in namespace <code>prod</code> directly. You'd need to duplicate it or use a cross-namespace secret-sync tool.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">38.</span>What is the risk of using <code>kubectl get secret -o yaml</code> on a shared terminal/screen-share?</p><p class="a">It reveals the base64-encoded (easily decodable) sensitive value on screen — always be mindful of who can see your terminal when inspecting Secrets.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">39.</span>Scenario — your app reads <code>DB_PASSWORD</code> from an env var, but you rotate the Secret value. What's needed for the running Pod to pick up the new password?</p><p class="a">A Pod restart (env vars are snapshotted at start) — e.g., <code>kubectl rollout restart deployment/&lt;name&gt;</code> — mounted-volume Secrets would update live, but env-var-injected ones require a restart.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">40.</span>What does <code>kubectl describe configmap &lt;name&gt;</code> show that <code>get -o yaml</code> also shows?</p><p class="a">Both show the Data keys and values (ConfigMaps aren't obscured since they're non-sensitive) — <code>describe</code> gives a cleaner human-readable summary while <code>-o yaml</code> gives the full raw manifest.</p></div>
+        </div>
+      </details>
+
+      <details class="qa-group">
+        <summary>Scenario-based <span class="count">10 questions</span></summary>
+        <div class="qa-body">
+          <div class="qa"><p class="q"><span class="qnum">41.</span>Scenario — <code>kubectl describe secret &lt;name&gt;</code> shows key names but <code>&lt;redacted&gt;</code> or nothing for values. Why the difference from ConfigMap?</p><p class="a"><code>kubectl describe</code> intentionally hides Secret values by default to reduce accidental shoulder-surfing/leakage — you must explicitly <code>get -o yaml</code> and decode base64 to see them.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">42.</span>What's a Volume Projection (<code>projected</code> volume) and why is it useful with ConfigMaps/Secrets?</p><p class="a">Lets you combine multiple sources (ConfigMap + Secret + downward API) into a single mounted directory — useful when an app expects all its config files together in one folder regardless of source object type.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">43.</span>Scenario — you need a certificate and private key available to your app as files. What Secret type and structure fits best?</p><p class="a"><code>kubernetes.io/tls</code> Secret type with <code>tls.crt</code> and <code>tls.key</code> keys, mounted as a volume — this is also the exact format Ingress TLS termination expects (Day 5).</p></div>
+          <div class="qa"><p class="q"><span class="qnum">44.</span>Write the command to create a ConfigMap from an entire directory of files.</p><p class="a"><code>kubectl create configmap &lt;name&gt; --from-file=&lt;directory-path&gt;</code> — each file in the directory becomes a separate key.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">45.</span>What happens if a ConfigMap and an explicit <code>env</code> entry define the same variable name in a container spec?</p><p class="a">The explicit <code>env</code> entry (later in evaluation, more specific) generally wins/overrides values coming from <code>envFrom</code> — always verify the actual precedence for your Kubernetes version if it matters for correctness.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">46.</span>Scenario — you want to test a new config value without affecting the live ConfigMap other Pods use. What's a safe approach?</p><p class="a">Create a new ConfigMap (e.g., <code>app-config-v2</code>), point only your test Deployment/Pod at it, and leave the original untouched until you're ready to cut everything over.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">47.</span>What's the practical difference in reasoning between "ConfigMap for config" and "Secret for credentials," given both are technically similar?</p><p class="a">The distinction is about intent and tooling behavior (RBAC defaults, hidden describe output, encryption-at-rest support) — using the right type signals sensitivity correctly to teammates and to Kubernetes' own safeguards.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">48.</span>Scenario — you delete a ConfigMap that's still referenced (non-optional) by a running Deployment. What happens to already-running Pods?</p><p class="a">Already-running Pods with env vars keep running fine (values were snapshotted at start) — but any NEW Pod created afterward (e.g., during a restart or scale-up) will fail to start until the ConfigMap exists again.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">49.</span>What is the benefit of mounting a Secret as <code>readOnly</code> (the default for Secret volumes)?</p><p class="a">Prevents the container from accidentally (or maliciously) modifying credential files on disk — Secret volumes are read-only by default precisely because sensitive data shouldn't be writable from inside the container.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">50.</span>What's the single biggest beginner mistake with Secrets covered today?</p><p class="a">Assuming base64 encoding means "encrypted and safe to share/commit" — it is neither; treat any base64 Secret value exactly as you would a plaintext password.</p></div>
+        </div>
+      </details>
+    </div>
+  </section>
+
+  <!-- ============================================================ DAY 4 ============================================================ -->
+  <section class="day" id="day4">
+    <div class="day-tag"><span class="day-num">DAY 4 · 3H</span></div>
+    <h2 class="display">StatefulSets &amp; Persistent Volumes</h2>
+    <div class="day-meta">Goal: understand how Kubernetes handles data and identity that must survive a Pod being deleted and recreated.</div>
+
+    <h3 class="subhead"><span class="tag tag-concept">Core Concepts</span></h3>
+    <div class="concept">
+      <ul>
+        <li><strong>PersistentVolume (PV)</strong> — a piece of storage provisioned in the cluster (by an admin or dynamically), existing independently of any Pod's lifecycle.</li>
+        <li><strong>PersistentVolumeClaim (PVC)</strong> — a Pod's request for storage; Kubernetes binds it to a matching PV.</li>
+        <li><strong>StorageClass</strong> — enables dynamic provisioning: a PVC referencing a StorageClass automatically gets a PV created on demand (Minikube ships a default one).</li>
+        <li><strong>StatefulSet</strong> — like a Deployment but for stateful apps: gives Pods stable, unique network identities and stable, per-Pod persistent storage across restarts/rescheduling.</li>
+        <li><strong>Stable identity &amp; ordering</strong> — StatefulSet Pods get predictable names (<code class="mono">app-0</code>, <code class="mono">app-1</code>, ...), are created/deleted in order, and each keeps its own PVC even after being rescheduled.</li>
+      </ul>
+    </div>
+
+    <h3 class="subhead"><span class="tag tag-practice">Hands-On Examples</span></h3>
+    <div class="example">
+      <p class="exlabel">Example 1 — PVC using the default dynamic StorageClass</p>
+      <pre class="mono">apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: my-pvc
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi</pre>
+      <pre class="mono" style="margin-top:12px;">kubectl apply -f pvc.yaml
+kubectl get pvc
+kubectl get pv</pre>
+    </div>
+    <div class="example">
+      <p class="exlabel">Example 2 — Pod using the PVC</p>
+      <pre class="mono">apiVersion: v1
+kind: Pod
+metadata:
+  name: pvc-pod
+spec:
+  containers:
+  - name: app
+    image: busybox
+    command: ["sh", "-c", "echo hello > /data/test.txt && sleep 3600"]
+    volumeMounts:
+    - name: storage
+      mountPath: /data
+  volumes:
+  - name: storage
+    persistentVolumeClaim:
+      claimName: my-pvc</pre>
+    </div>
+    <div class="example">
+      <p class="exlabel">Example 3 — minimal StatefulSet with volumeClaimTemplates</p>
+      <pre class="mono">apiVersion: v1
+kind: Service
+metadata:
+  name: web-headless
+spec:
+  clusterIP: None
+  selector:
+    app: web
+  ports:
+  - port: 80
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: web
+spec:
+  serviceName: web-headless
+  replicas: 3
+  selector:
+    matchLabels:
+      app: web
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      containers:
+      - name: nginx
+        image: nginx
+        volumeMounts:
+        - name: www
+          mountPath: /usr/share/nginx/html
+  volumeClaimTemplates:
+  - metadata:
+      name: www
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      resources:
+        requests:
+          storage: 1Gi</pre>
+      <pre class="mono" style="margin-top:12px;">kubectl apply -f statefulset.yaml
+kubectl get pods -w   # observe ordered web-0, web-1, web-2 creation
+kubectl get pvc       # one PVC per Pod</pre>
+    </div>
+
+    <h3 class="subhead"><span class="tag tag-project">Project</span> Stateful App with Persistent Storage</h3>
+    <div class="projectbox">
+      <p>Deploy the 3-replica StatefulSet above. Write a unique file into each Pod's volume (<code class="mono">kubectl exec web-0 -- sh -c 'echo pod0 > /usr/share/nginx/html/index.html'</code>), delete <code class="mono">web-0</code>, and confirm after it's recreated that its data (and identity <code class="mono">web-0</code>) persists — unlike a Deployment Pod, which would come back with a fresh empty volume unless using the same PVC pattern.</p>
+    </div>
+
+    <h3 class="subhead"><span class="tag tag-resource">Free Resources</span></h3>
+    <div class="resources">
+      <div class="res-card"><div class="k">Docs</div><div class="t"><a href="https://kubernetes.io/docs/concepts/storage/persistent-volumes/">Kubernetes Docs: Persistent Volumes</a></div><p class="d">Official reference for PV/PVC binding and lifecycle.</p></div>
+      <div class="res-card"><div class="k">Docs</div><div class="t"><a href="https://kubernetes.io/docs/concepts/workloads/controllers/statefulset/">Kubernetes Docs: StatefulSets</a></div><p class="d">Official reference for ordering, identity, and scaling.</p></div>
+      <div class="res-card"><div class="k">Docs</div><div class="t"><a href="https://kubernetes.io/docs/concepts/storage/storage-classes/">Kubernetes Docs: Storage Classes</a></div><p class="d">How dynamic provisioning actually works.</p></div>
+      <div class="res-card"><div class="k">Tutorial</div><div class="t"><a href="https://kubernetes.io/docs/tutorials/stateful-application/basic-stateful-set/">Run a Stateful Application</a></div><p class="d">Official step-by-step tutorial, mirrors today's project.</p></div>
+      <div class="res-card"><div class="k">Docs</div><div class="t"><a href="https://minikube.sigs.k8s.io/docs/handbook/persistent_volumes/">Minikube Storage Docs</a></div><p class="d">How PV/PVC dynamic provisioning works locally.</p></div>
+    </div>
+
+    <h3 class="subhead"><span class="tag tag-interview">Top 50 Q&amp;A</span> StatefulSets &amp; Persistent Volumes</h3>
+    <div class="qa-groups">
+      <details class="qa-group">
+        <summary>PV/PVC fundamentals <span class="count">10 questions</span></summary>
+        <div class="qa-body">
+          <div class="qa"><p class="q"><span class="qnum">1.</span>What is a PersistentVolume (PV)?</p><p class="a">A cluster-level storage resource, provisioned either statically by an admin or dynamically via a StorageClass, that exists independently of any particular Pod's lifecycle.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">2.</span>What is a PersistentVolumeClaim (PVC)?</p><p class="a">A user's/Pod's request for storage ("I need 1Gi, ReadWriteOnce") — Kubernetes matches and binds it to a suitable PV, existing PVs get claimed or new ones get dynamically provisioned.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">3.</span>Why do we need both PV and PVC instead of just mounting storage directly?</p><p class="a">It separates "what storage exists" (infrastructure concern, PV) from "what storage an app needs" (application concern, PVC) — developers write PVCs without knowing the underlying storage details.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">4.</span>What is a StorageClass?</p><p class="a">A template that tells Kubernetes how to dynamically provision a PV when a PVC references it (e.g., which cloud disk type, replication settings) — removes the need to manually pre-create PVs.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">5.</span>What does <code>accessModes: ReadWriteOnce</code> mean?</p><p class="a">The volume can be mounted as read-write by a single Node at a time (multiple Pods on that same Node can still share it, but not across different Nodes simultaneously).</p></div>
+          <div class="qa"><p class="q"><span class="qnum">6.</span>What are the other common access modes besides ReadWriteOnce?</p><p class="a"><code>ReadOnlyMany</code> (many Nodes, read-only), <code>ReadWriteMany</code> (many Nodes, read-write — requires storage backends that support it, e.g., NFS), and <code>ReadWriteOncePod</code> (only a single Pod cluster-wide, stricter than RWO).</p></div>
+          <div class="qa"><p class="q"><span class="qnum">7.</span>Scenario — you create a PVC and it stays in <code>Pending</code> status. What are two likely causes?</p><p class="a">(1) No PV exists that satisfies the requested size/access mode, and no StorageClass is available/default to dynamically provision one. (2) The StorageClass referenced doesn't exist or its provisioner is misconfigured.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">8.</span>Write the command to check the status of a PVC.</p><p class="a"><code>kubectl get pvc</code> — look at the STATUS column (<code>Bound</code> = success, <code>Pending</code> = not yet satisfied).</p></div>
+          <div class="qa"><p class="q"><span class="qnum">9.</span>What happens to data on a Pod's volume when the Pod is deleted and recreated, if it uses a PVC?</p><p class="a">Data persists — the PVC (and its underlying PV/data) is a separate object from the Pod's lifecycle; a new Pod referencing the same PVC picks up right where the old one left off.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">10.</span>What happens to data in a container that does NOT use a volume, when the Pod restarts?</p><p class="a">It's lost — the container filesystem is ephemeral and recreated fresh on every container start unless backed by a mounted volume.</p></div>
+        </div>
+      </details>
+
+      <details class="qa-group">
+        <summary>StatefulSet basics <span class="count">10 questions</span></summary>
+        <div class="qa-body">
+          <div class="qa"><p class="q"><span class="qnum">11.</span>What is a StatefulSet used for?</p><p class="a">Managing stateful applications (databases, queues) that need stable network identity and stable per-replica storage across restarts — e.g., each replica of a database cluster needs to always come back as "the same member."</p></div>
+          <div class="qa"><p class="q"><span class="qnum">12.</span>How do StatefulSet Pod names differ from Deployment Pod names?</p><p class="a">StatefulSet Pods get predictable, ordinal names like <code>web-0</code>, <code>web-1</code>, <code>web-2</code> (stable across restarts), while Deployment Pods get random suffixes like <code>web-7d9f8c9-x2kdp</code> (a new name every time they're recreated).</p></div>
+          <div class="qa"><p class="q"><span class="qnum">13.</span>What is <code>volumeClaimTemplates</code> in a StatefulSet?</p><p class="a">A template Kubernetes uses to automatically create one unique PVC per replica (e.g., <code>www-web-0</code>, <code>www-web-1</code>), so each Pod gets its own dedicated, persistent storage that follows it across rescheduling.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">14.</span>Scenario — you delete Pod <code>web-1</code> from a StatefulSet. Does its PVC get deleted too?</p><p class="a">No — PVCs created via <code>volumeClaimTemplates</code> are NOT deleted automatically when a Pod is deleted; the replacement Pod <code>web-1</code> reattaches to the same existing PVC and its data.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">15.</span>What order does a StatefulSet create and delete its Pods in?</p><p class="a">In strict ordinal sequence — <code>web-0</code> first, then <code>web-1</code>, then <code>web-2</code>, etc. Deletion (scale-down) happens in reverse order, highest ordinal first — important for apps with leader/follower startup dependencies.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">16.</span>Why does a StatefulSet require a headless Service (<code>clusterIP: None</code>)?</p><p class="a">To give each Pod its own stable, individually resolvable DNS name (<code>web-0.web-headless</code>, <code>web-1.web-headless</code>, ...) instead of one load-balanced virtual IP — necessary when clients need to talk to a specific replica (e.g., the primary database node).</p></div>
+          <div class="qa"><p class="q"><span class="qnum">17.</span>Write the DNS name format for an individual StatefulSet Pod behind a headless Service.</p><p class="a"><code>&lt;pod-name&gt;.&lt;headless-service-name&gt;.&lt;namespace&gt;.svc.cluster.local</code> — e.g., <code>web-0.web-headless.default.svc.cluster.local</code>.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">18.</span>Scenario — you scale a StatefulSet from 3 to 5 replicas. What new PVCs get created?</p><p class="a">Two new PVCs (<code>www-web-3</code>, <code>www-web-4</code>), matching the volumeClaimTemplate — each new replica gets fresh, empty storage of its own since it's a new ordinal, not a reused one.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">19.</span>Scenario — you scale a StatefulSet down from 5 to 3, then back up to 5. Does <code>web-3</code> come back with its old data?</p><p class="a">Yes — scaling down doesn't delete the PVC, so scaling back up reattaches <code>web-3</code> to its still-existing PVC and its previous data.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">20.</span>How do you manually delete the leftover PVCs after permanently removing a StatefulSet?</p><p class="a"><code>kubectl delete pvc -l app=&lt;label&gt;</code> or explicitly by name — Kubernetes intentionally never auto-deletes StatefulSet PVCs, treating data loss as something that must be explicit.</p></div>
+        </div>
+      </details>
+
+      <details class="qa-group">
+        <summary>Reclaim policy &amp; dynamic provisioning <span class="count">10 questions</span></summary>
+        <div class="qa-body">
+          <div class="qa"><p class="q"><span class="qnum">21.</span>What's the <code>reclaimPolicy</code> on a PersistentVolume and its two common values?</p><p class="a">Controls what happens to the underlying storage when its PVC is deleted: <code>Delete</code> (the PV and underlying storage are deleted too — common default for dynamically provisioned volumes) or <code>Retain</code> (the PV and data survive for manual admin recovery/cleanup).</p></div>
+          <div class="qa"><p class="q"><span class="qnum">22.</span>Scenario — you need a database's data to survive even if someone accidentally deletes its PVC. What reclaimPolicy should the PV use?</p><p class="a"><code>Retain</code> — ensures the underlying storage isn't wiped automatically; an admin must manually clean it up, adding a safety buffer against accidental data loss.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">23.</span>What is dynamic provisioning?</p><p class="a">The process where creating a PVC that references a StorageClass automatically triggers creation of a new matching PV (and underlying storage) on demand, instead of requiring an admin to pre-create PVs manually.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">24.</span>Write the command to see what StorageClasses are available in your cluster.</p><p class="a"><code>kubectl get storageclass</code> (or <code>kubectl get sc</code>)</p></div>
+          <div class="qa"><p class="q"><span class="qnum">25.</span>Scenario — <code>kubectl get pvc</code> shows <code>Pending</code> and <code>kubectl describe pvc</code> mentions "no persistent volumes available for this claim." What's the fix?</p><p class="a">Either apply a StorageClass that supports dynamic provisioning (Minikube has one enabled by default named <code>standard</code>) or manually create a PV that matches the requested size/access mode.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">26.</span>What does "storage" mean in <code>resources.requests.storage: 1Gi</code> on a PVC?</p><p class="a">The minimum capacity being requested — Kubernetes binds to a PV with at least that much capacity (it may bind to a larger one if no exact match exists, depending on the provisioner).</p></div>
+          <div class="qa"><p class="q"><span class="qnum">27.</span>Can two different Pods share the same PVC simultaneously?</p><p class="a">Only if the access mode allows it — <code>ReadWriteOnce</code> restricts writable mounting to one Node at a time (multiple Pods on that Node can share it); true multi-Pod-multi-Node sharing needs <code>ReadWriteMany</code>-capable storage.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">28.</span>Scenario — your StatefulSet-based database Pod <code>web-0</code> is stuck in <code>Pending</code> after a Node failure. What might be wrong?</p><p class="a">Its PVC may be bound to a PV backed by storage physically tied to the failed Node (common with local/hostPath volumes) — the Pod can't reschedule elsewhere until the Node returns or the storage is portable (a cloud/network-attached volume, not local disk).</p></div>
+          <div class="qa"><p class="q"><span class="qnum">29.</span>What is the practical downside of using <code>hostPath</code> volumes for real workloads?</p><p class="a">Data is tied to a specific Node's local disk — if the Pod gets rescheduled to a different Node, it won't see the same data; unsuitable for anything requiring durability across rescheduling.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">30.</span>Write the command to inspect which PV a given PVC is bound to.</p><p class="a"><code>kubectl get pvc &lt;name&gt; -o jsonpath='{.spec.volumeName}'</code> or simply <code>kubectl describe pvc &lt;name&gt;</code> (shows the Volume field).</p></div>
+        </div>
+      </details>
+
+      <details class="qa-group">
+        <summary>Scaling &amp; storage classes <span class="count">10 questions</span></summary>
+        <div class="qa-body">
+          <div class="qa"><p class="q"><span class="qnum">31.</span>Scenario — you need to resize a PVC from 1Gi to 5Gi. Is this possible, and how?</p><p class="a">Yes, if the StorageClass has <code>allowVolumeExpansion: true</code> — edit the PVC's <code>spec.resources.requests.storage</code> to the new size and apply; the underlying volume is expanded (a Pod restart may be required for the filesystem to see the new size, depending on the storage driver).</p></div>
+          <div class="qa"><p class="q"><span class="qnum">32.</span>What is the relationship between a StatefulSet and a Deployment in terms of when to choose each?</p><p class="a">Use a Deployment for stateless apps where any replica is interchangeable (e.g., web frontends). Use a StatefulSet when replicas are NOT interchangeable — each needs its own persistent identity/data (e.g., databases, message brokers with per-node state).</p></div>
+          <div class="qa"><p class="q"><span class="qnum">33.</span>Scenario — you accidentally used a Deployment (not a StatefulSet) for a 3-node database cluster. What breaks?</p><p class="a">Pod names/IPs change unpredictably on every restart, and by default all replicas would share or fight over storage (or each get ephemeral storage) — database clustering logic that depends on stable peer addresses and per-node data will likely fail or corrupt state.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">34.</span>What does <code>kubectl get pv</code> show that helps you understand cluster storage state?</p><p class="a">Each PV's capacity, access mode, reclaim policy, STATUS (<code>Available</code>, <code>Bound</code>, <code>Released</code>, <code>Failed</code>), and which PVC (if any) currently claims it.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">35.</span>What does a PV status of <code>Released</code> mean?</p><p class="a">Its bound PVC was deleted, but (with <code>Retain</code> policy) the PV and its data still exist and are not yet available for a new claim until an admin manually reclaims/cleans it.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">36.</span>Scenario — a developer asks "why can't I just use emptyDir for my database's data?" What's the answer?</p><p class="a"><code>emptyDir</code> is tied to the Pod's lifetime — deleted permanently when the Pod is removed (not just restarted-in-place). A database needs storage that survives Pod deletion/rescheduling, which only a PV/PVC provides.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">37.</span>What is <code>emptyDir</code> actually useful for, then?</p><p class="a">Temporary scratch space shared between containers in the same Pod (e.g., a cache, or a shared directory between a main app and a sidecar) where losing the data on Pod deletion is acceptable.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">38.</span>Write the command to delete a PVC.</p><p class="a"><code>kubectl delete pvc &lt;name&gt;</code> — note this may also delete the underlying PV/data if its reclaimPolicy is <code>Delete</code>.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">39.</span>Scenario — you run <code>kubectl delete pvc my-pvc</code> while a Pod is still using it. What happens?</p><p class="a">The PVC is marked for deletion (Terminating) but is protected from actually being removed until no Pod still references it, thanks to PVC protection finalizers — you must delete/detach the consuming Pod first.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">40.</span>How does a StatefulSet handle a rolling update differently from a Deployment by default?</p><p class="a">It updates Pods in reverse ordinal order, one at a time (highest number first), waiting for each to become Ready before moving to the next — preserving ordering guarantees that stateful apps often depend on.</p></div>
+        </div>
+      </details>
+
+      <details class="qa-group">
+        <summary>Scenario-based <span class="count">10 questions</span></summary>
+        <div class="qa-body">
+          <div class="qa"><p class="q"><span class="qnum">41.</span>What is <code>podManagementPolicy: Parallel</code> on a StatefulSet?</p><p class="a">Overrides the default strict ordered creation/deletion, letting all Pods launch/terminate simultaneously — useful when your stateful app doesn't actually require strict startup ordering and you want faster scaling.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">42.</span>Scenario — after deleting a StatefulSet with <code>kubectl delete statefulset web</code>, do the Pods and PVCs disappear immediately?</p><p class="a">The StatefulSet's Pods are deleted, but the PVCs created via volumeClaimTemplates remain untouched — this is intentional, protecting data from accidental deletion of the controller object.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">43.</span>What field guarantees a StatefulSet Pod always gets matched to the same PVC across restarts?</p><p class="a">The naming convention <code>&lt;volumeClaimTemplate-name&gt;-&lt;statefulset-name&gt;-&lt;ordinal&gt;</code> (e.g., <code>www-web-0</code>) — Kubernetes deterministically re-associates that exact PVC to the Pod with the matching ordinal every time.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">44.</span>How would you verify that a StatefulSet's persistent storage actually survives a Pod deletion (practical test)?</p><p class="a">Write a unique file into the volume via <code>kubectl exec</code>, delete the Pod, wait for it to be recreated, then <code>kubectl exec</code> again to confirm the file is still there.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">45.</span>What is the main reason StatefulSets are more complex to operate than Deployments?</p><p class="a">They involve managing real persistent data and ordering guarantees — scaling down, deleting, or migrating a StatefulSet risks real data loss/corruption if PVC cleanup and ordering aren't handled carefully, unlike stateless Deployment Pods which are fully disposable.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">46.</span>Scenario — you need a shared configuration file readable (not writable) by many Pods across different Nodes. Is a PVC the right tool?</p><p class="a">Only if the StorageClass supports <code>ReadOnlyMany</code>/<code>ReadWriteMany</code> (e.g., NFS-backed); otherwise a ConfigMap (Day 3) is usually the simpler, more appropriate tool for shared read-only config rather than a PV/PVC.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">47.</span>What command lets you watch StatefulSet Pods come up in real time to observe ordering?</p><p class="a"><code>kubectl get pods -w</code> (the <code>-w</code>/watch flag streams live updates as Pods progress through creation).</p></div>
+          <div class="qa"><p class="q"><span class="qnum">48.</span>Scenario — <code>web-0</code> is stuck <code>Pending</code> because its PVC can't bind, and you notice <code>web-1</code>/<code>web-2</code> haven't even been created yet. Why?</p><p class="a">StatefulSets create Pods strictly in order and wait for each to become Ready before starting the next — since <code>web-0</code> never becomes Ready, <code>web-1</code> and <code>web-2</code> are intentionally blocked until it does.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">49.</span>Why is understanding PV/PVC essential even though beginners often skip storage topics?</p><p class="a">Almost every real-world app eventually needs a database or persistent state, and misunderstanding volume lifecycle is one of the most common causes of "I lost my data after a redeploy" incidents in production.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">50.</span>What's the single most important mental model to take from today?</p><p class="a">Storage (PV/PVC) and compute (Pod) have independent lifecycles — a Pod is disposable and gets recreated constantly, but its PVC-backed data is not, as long as you never explicitly delete the PVC.</p></div>
+        </div>
+      </details>
+    </div>
+  </section>
+
+  <!-- ============================================================ DAY 5 ============================================================ -->
+  <section class="day" id="day5">
+    <div class="day-tag"><span class="day-num">DAY 5 · 3H</span></div>
+    <h2 class="display">Ingress, Namespaces &amp; RBAC</h2>
+    <div class="day-meta">Goal: route HTTP traffic to many apps through one entry point, and control who can do what, where.</div>
+
+    <h3 class="subhead"><span class="tag tag-concept">Core Concepts</span></h3>
+    <div class="concept">
+      <ul>
+        <li><strong>Ingress</strong> — an L7 (HTTP/HTTPS) routing layer that exposes multiple Services under one external entry point, routing by hostname and/or URL path.</li>
+        <li><strong>Ingress Controller</strong> — the actual component (e.g., NGINX Ingress Controller) that implements Ingress rules; Ingress objects do nothing without one running.</li>
+        <li><strong>Namespace</strong> — a virtual cluster/partition within a physical cluster, isolating resource names and enabling per-team/per-environment scoping.</li>
+        <li><strong>Role &amp; RoleBinding</strong> — RBAC primitives defining "who can do what" within a namespace (Role = permissions, RoleBinding = grants those permissions to a user/group/ServiceAccount).</li>
+        <li><strong>ClusterRole &amp; ClusterRoleBinding</strong> — the cluster-wide equivalents, for permissions spanning all namespaces or on cluster-scoped resources.</li>
+      </ul>
+    </div>
+
+    <h3 class="subhead"><span class="tag tag-practice">Hands-On Examples</span></h3>
+    <div class="example">
+      <p class="exlabel">Example 1 — enable Ingress on Minikube and deploy a rule</p>
+      <pre class="mono">minikube addons enable ingress</pre>
+      <pre class="mono" style="margin-top:12px;">apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: nginx-ingress
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /
+spec:
+  rules:
+  - host: myapp.local
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: nginx-service
+            port:
+              number: 80</pre>
+      <pre class="mono" style="margin-top:12px;">kubectl apply -f ingress.yaml
+echo "$(minikube ip) myapp.local" | sudo tee -a /etc/hosts
+curl myapp.local</pre>
+    </div>
+    <div class="example">
+      <p class="exlabel">Example 2 — namespaces</p>
+      <pre class="mono">kubectl create namespace dev
+kubectl create namespace prod
+kubectl apply -f deployment.yaml -n dev
+kubectl get pods -n dev
+kubectl config set-context --current --namespace=dev</pre>
+    </div>
+    <div class="example">
+      <p class="exlabel">Example 3 — RBAC: Role + RoleBinding restricting a user to read-only Pods in dev</p>
+      <pre class="mono">apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  namespace: dev
+  name: pod-reader
+rules:
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: read-pods-binding
+  namespace: dev
+subjects:
+- kind: ServiceAccount
+  name: dev-viewer
+  namespace: dev
+roleRef:
+  kind: Role
+  name: pod-reader
+  apiGroup: rbac.authorization.k8s.io</pre>
+      <pre class="mono" style="margin-top:12px;">kubectl create serviceaccount dev-viewer -n dev
+kubectl apply -f role.yaml
+kubectl auth can-i list pods --as=system:serviceaccount:dev:dev-viewer -n dev
+kubectl auth can-i delete pods --as=system:serviceaccount:dev:dev-viewer -n dev</pre>
+    </div>
+
+    <h3 class="subhead"><span class="tag tag-project">Project</span> Namespaced Multi-Environment App with Ingress</h3>
+    <div class="projectbox">
+      <p>Create <code class="mono">dev</code> and <code class="mono">prod</code> namespaces, deploy the same app Deployment+Service into both, expose the <code class="mono">prod</code> one via Ingress at <code class="mono">myapp.local</code>, and create a restricted ServiceAccount that can only read (not modify/delete) Pods in <code class="mono">dev</code> — verify restrictions with <code class="mono">kubectl auth can-i</code>.</p>
+    </div>
+
+    <h3 class="subhead"><span class="tag tag-resource">Free Resources</span></h3>
+    <div class="resources">
+      <div class="res-card"><div class="k">Docs</div><div class="t"><a href="https://kubernetes.io/docs/concepts/services-networking/ingress/">Kubernetes Docs: Ingress</a></div><p class="d">Official reference for Ingress rules and behavior.</p></div>
+      <div class="res-card"><div class="k">Docs</div><div class="t"><a href="https://kubernetes.io/docs/concepts/services-networking/ingress-controllers/">Kubernetes Docs: Ingress Controllers</a></div><p class="d">Why an Ingress object alone does nothing.</p></div>
+      <div class="res-card"><div class="k">Docs</div><div class="t"><a href="https://kubernetes.io/docs/concepts/overview/working-with-objects/namespaces/">Kubernetes Docs: Namespaces</a></div><p class="d">Official reference for namespace scoping.</p></div>
+      <div class="res-card"><div class="k">Docs</div><div class="t"><a href="https://kubernetes.io/docs/reference/access-control/rbac/">Kubernetes Docs: RBAC</a></div><p class="d">Official reference for Roles, Bindings, and verbs.</p></div>
+      <div class="res-card"><div class="k">Tutorial</div><div class="t"><a href="https://kubernetes.io/docs/tasks/access-application-cluster/ingress-minikube/">Minikube Ingress Addon Tutorial</a></div><p class="d">Official step-by-step guide, mirrors today's project.</p></div>
+    </div>
+
+    <h3 class="subhead"><span class="tag tag-interview">Top 50 Q&amp;A</span> Ingress, Namespaces &amp; RBAC</h3>
+    <div class="qa-groups">
+      <details class="qa-group">
+        <summary>Ingress fundamentals <span class="count">10 questions</span></summary>
+        <div class="qa-body">
+          <div class="qa"><p class="q"><span class="qnum">1.</span>What problem does Ingress solve that Services alone don't?</p><p class="a">Without Ingress, exposing many HTTP apps externally means many NodePort/LoadBalancer Services (many IPs/ports). Ingress lets one entry point route by hostname/path to many backend Services, using standard HTTP semantics like host-based and path-based routing.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">2.</span>Does creating an Ingress object alone expose anything?</p><p class="a">No — an Ingress resource is just a routing rule. It requires an Ingress Controller (like NGINX Ingress Controller) running in the cluster to actually watch and implement those rules.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">3.</span>What is an Ingress Controller?</p><p class="a">The actual software (usually a Pod/Deployment, e.g., NGINX-based) that watches Ingress objects and configures a reverse proxy/load balancer accordingly to route real traffic.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">4.</span>Write the command to enable the Ingress Controller addon on Minikube.</p><p class="a"><code>minikube addons enable ingress</code></p></div>
+          <div class="qa"><p class="q"><span class="qnum">5.</span>What is <code>pathType: Prefix</code> vs <code>pathType: Exact</code> in an Ingress rule?</p><p class="a"><code>Prefix</code> matches the given path and everything under it (e.g., <code>/api</code> matches <code>/api/users</code>). <code>Exact</code> matches only that literal path with no sub-paths.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">6.</span>Scenario — you apply an Ingress but <code>curl myapp.local</code> gives "could not resolve host." What's missing?</p><p class="a">DNS resolution for <code>myapp.local</code> isn't configured — on Minikube you must add an entry mapping <code>myapp.local</code> to <code>$(minikube ip)</code> in your local <code>/etc/hosts</code> file (there's no real DNS server involved in this local setup).</p></div>
+          <div class="qa"><p class="q"><span class="qnum">7.</span>How does host-based routing work in Ingress?</p><p class="a">Multiple <code>rules</code> entries each specify a different <code>host</code> (e.g., <code>api.myapp.local</code>, <code>web.myapp.local</code>) — the Ingress Controller inspects the incoming HTTP <code>Host</code> header and routes to the matching rule's backend Service.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">8.</span>How does path-based routing work in Ingress?</p><p class="a">Within a single host's rules, multiple <code>paths</code> entries route different URL prefixes (e.g., <code>/api</code> → api-service, <code>/</code> → web-service) to different backend Services under the same domain.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">9.</span>Scenario — your Ingress rule targets a Service on port 80, but the Service itself has no matching Pods. What happens when you curl?</p><p class="a">The Ingress Controller returns an error (often a 502 Bad Gateway) since it successfully routes to the Service but finds no healthy backend Endpoints to actually forward the request to.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">10.</span>How does TLS/HTTPS termination work with Ingress?</p><p class="a">You reference a <code>kubernetes.io/tls</code>-type Secret (containing <code>tls.crt</code>/<code>tls.key</code>) in the Ingress's <code>spec.tls</code> section — the Ingress Controller terminates HTTPS at that layer and forwards plain HTTP internally to your Service.</p></div>
+        </div>
+      </details>
+
+      <details class="qa-group">
+        <summary>Namespaces <span class="count">10 questions</span></summary>
+        <div class="qa-body">
+          <div class="qa"><p class="q"><span class="qnum">11.</span>Write the command to list all Ingress objects in the current namespace.</p><p class="a"><code>kubectl get ingress</code></p></div>
+          <div class="qa"><p class="q"><span class="qnum">12.</span>What is a Namespace?</p><p class="a">A way to logically partition a single physical cluster into multiple virtual clusters — most object names only need to be unique within a namespace, not across the whole cluster.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">13.</span>Write the command to create a namespace.</p><p class="a"><code>kubectl create namespace &lt;name&gt;</code></p></div>
+          <div class="qa"><p class="q"><span class="qnum">14.</span>Write the command to list all Pods in a specific namespace.</p><p class="a"><code>kubectl get pods -n &lt;namespace&gt;</code></p></div>
+          <div class="qa"><p class="q"><span class="qnum">15.</span>Write the command to list Pods across ALL namespaces.</p><p class="a"><code>kubectl get pods --all-namespaces</code> (or the shorthand <code>-A</code>)</p></div>
+          <div class="qa"><p class="q"><span class="qnum">16.</span>Scenario — you <code>kubectl apply -f deployment.yaml</code> with no <code>-n</code> flag or namespace in the YAML. Where does it end up?</p><p class="a">In whatever namespace your current kubectl context is set to (<code>default</code> unless you've changed it) — check with <code>kubectl config view --minify | grep namespace</code>.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">17.</span>Write the command to permanently switch your default working namespace for future kubectl commands.</p><p class="a"><code>kubectl config set-context --current --namespace=&lt;name&gt;</code></p></div>
+          <div class="qa"><p class="q"><span class="qnum">18.</span>What are the four default namespaces every cluster starts with?</p><p class="a"><code>default</code> (unlabeled user resources go here), <code>kube-system</code> (Kubernetes system components), <code>kube-public</code> (readable by all, even unauthenticated users), and <code>kube-node-lease</code> (node heartbeat/lease objects).</p></div>
+          <div class="qa"><p class="q"><span class="qnum">19.</span>Scenario — you have identically-named Deployments <code>api</code> in namespaces <code>dev</code> and <code>prod</code>. Is that a conflict?</p><p class="a">No — namespaces provide name isolation; <code>api</code> in <code>dev</code> and <code>api</code> in <code>prod</code> are completely independent objects that happen to share a name.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">20.</span>Are all Kubernetes objects namespaced?</p><p class="a">No — some are cluster-scoped (Nodes, PersistentVolumes, ClusterRoles, Namespaces themselves), meaning they exist once cluster-wide and aren't tied to any single namespace.</p></div>
+        </div>
+      </details>
+
+      <details class="qa-group">
+        <summary>RBAC basics <span class="count">10 questions</span></summary>
+        <div class="qa-body">
+          <div class="qa"><p class="q"><span class="qnum">21.</span>Write the command to check if an object type is namespaced or cluster-scoped.</p><p class="a"><code>kubectl api-resources</code> — includes a NAMESPACED column (true/false) for every resource type.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">22.</span>What is RBAC and what does it stand for?</p><p class="a">Role-Based Access Control — the mechanism controlling which users/service accounts can perform which actions (verbs) on which resources, based on assigned roles.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">23.</span>What is a Role in RBAC?</p><p class="a">A namespaced object defining a set of permissions (verbs like get/list/create/delete on resources like pods/deployments), scoped to a single namespace.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">24.</span>What is a ClusterRole and how does it differ from a Role?</p><p class="a">Same structure as a Role (permissions/verbs/resources) but cluster-scoped — usable either for cluster-wide resources (like Nodes) or, via a RoleBinding, granted within just one specific namespace too.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">25.</span>What is a RoleBinding?</p><p class="a">Grants the permissions defined in a Role (or ClusterRole) to specific subjects (users, groups, or ServiceAccounts) — within the RoleBinding's own namespace.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">26.</span>What is a ClusterRoleBinding?</p><p class="a">Grants a ClusterRole's permissions to subjects across the ENTIRE cluster, all namespaces at once — used sparingly, for genuinely cluster-wide access needs (e.g., cluster admins).</p></div>
+          <div class="qa"><p class="q"><span class="qnum">27.</span>Scenario — you bind a ClusterRole via a RoleBinding (not a ClusterRoleBinding) in namespace <code>dev</code>. What's the effect?</p><p class="a">The subject gets the ClusterRole's permissions, but only within the <code>dev</code> namespace — a common, useful pattern for reusing a predefined ClusterRole's permission set without granting cluster-wide access.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">28.</span>What is a ServiceAccount and how does it differ from a regular user?</p><p class="a">An identity for processes/Pods running inside the cluster (not humans) — Pods authenticate to the API server as a ServiceAccount, which can be bound to Roles just like a human user.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">29.</span>Write the command to test whether a specific ServiceAccount can perform an action.</p><p class="a"><code>kubectl auth can-i &lt;verb&gt; &lt;resource&gt; --as=system:serviceaccount:&lt;namespace&gt;:&lt;sa-name&gt; -n &lt;namespace&gt;</code> — e.g., <code>kubectl auth can-i delete pods --as=system:serviceaccount:dev:dev-viewer -n dev</code>.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">30.</span>Scenario — <code>kubectl auth can-i delete pods --as=system:serviceaccount:dev:dev-viewer -n dev</code> returns "no." What does that confirm?</p><p class="a">The RBAC Role bound to that ServiceAccount doesn't include <code>delete</code> in its verbs list for pods — exactly the least-privilege restriction you intended when only granting <code>get</code>/<code>list</code>/<code>watch</code>.</p></div>
+        </div>
+      </details>
+
+      <details class="qa-group">
+        <summary>RBAC verbs &amp; service accounts <span class="count">10 questions</span></summary>
+        <div class="qa-body">
+          <div class="qa"><p class="q"><span class="qnum">31.</span>What are the common RBAC verbs?</p><p class="a"><code>get</code>, <code>list</code>, <code>watch</code> (read operations), <code>create</code>, <code>update</code>, <code>patch</code>, <code>delete</code> (write operations) — you compose exactly the verbs a Role needs, following least-privilege.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">32.</span>What does the empty string <code>""</code> mean in a Role's <code>apiGroups</code> field?</p><p class="a">It refers to the "core" API group — resources like Pods, Services, ConfigMaps, Secrets, Namespaces that don't belong to a named group (unlike, e.g., <code>apps</code> for Deployments/StatefulSets).</p></div>
+          <div class="qa"><p class="q"><span class="qnum">33.</span>Scenario — your Role's <code>rules</code> lists <code>resources: ["pods"]</code> but you also need permission on <code>pods/log</code> (to view logs). What's needed?</p><p class="a">Add a separate/additional entry for <code>resources: ["pods/log"]</code> — subresources like logs, exec, and status are permissioned independently from the parent resource.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">34.</span>What's the principle of "least privilege" and why does it matter in RBAC design?</p><p class="a">Grant only the exact permissions a user/ServiceAccount needs to do its job, nothing more — minimizing blast radius if credentials are compromised or a bug causes unintended API calls.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">35.</span>Write the command to view all Roles in a namespace.</p><p class="a"><code>kubectl get roles -n &lt;namespace&gt;</code></p></div>
+          <div class="qa"><p class="q"><span class="qnum">36.</span>Write the command to view all RoleBindings in a namespace.</p><p class="a"><code>kubectl get rolebindings -n &lt;namespace&gt;</code></p></div>
+          <div class="qa"><p class="q"><span class="qnum">37.</span>Scenario — a Pod's application code needs to call the Kubernetes API to list other Pods (e.g., a monitoring tool). What's the standard setup?</p><p class="a">Create a dedicated ServiceAccount, a Role granting the needed verbs (e.g., <code>get</code>/<code>list</code> on <code>pods</code>), and a RoleBinding connecting them — then reference that ServiceAccount in the Pod's <code>spec.serviceAccountName</code>.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">38.</span>What ServiceAccount does a Pod use if you don't specify one?</p><p class="a">The <code>default</code> ServiceAccount for that namespace, which by default has minimal/no meaningful permissions beyond basic API discovery in most clusters.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">39.</span>Scenario — you want to delete an entire environment cleanly, including all Deployments, Services, ConfigMaps, etc. inside it. What's the single command?</p><p class="a"><code>kubectl delete namespace &lt;name&gt;</code> — deletes the namespace and cascades deletion to every object within it.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">40.</span>Why is deleting a namespace considered risky and worth double-checking before running?</p><p class="a">It's irreversible and recursively destroys everything inside — every Deployment, Service, Secret, PVC, etc. in that namespace, with no built-in "are you sure" beyond kubectl's own confirmation-less default.</p></div>
+        </div>
+      </details>
+
+      <details class="qa-group">
+        <summary>Scenario-based <span class="count">10 questions</span></summary>
+        <div class="qa-body">
+          <div class="qa"><p class="q"><span class="qnum">41.</span>What is a NetworkPolicy (brief context, related to namespaces) and does Minikube's default CNI support it?</p><p class="a">An object that restricts which Pods can talk to which other Pods/namespaces at the network level (a firewall for Pod traffic) — not all CNI plugins enforce it, and Minikube's default driver may not without enabling a compatible network add-on.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">42.</span>Scenario — you're granted a ClusterRoleBinding making you <code>cluster-admin</code>. What can you do?</p><p class="a">Essentially anything, in any namespace and on cluster-scoped resources — the most powerful built-in ClusterRole, so it should be granted extremely sparingly (equivalent to root/superuser).</p></div>
+          <div class="qa"><p class="q"><span class="qnum">43.</span>What does <code>kubectl get clusterrolebinding</code> show, and why should a beginner review it periodically?</p><p class="a">All cluster-wide permission grants — reviewing it helps catch overly broad access (e.g., accidentally binding <code>cluster-admin</code> to a service account) that violates least-privilege.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">44.</span>Scenario — two teams share one cluster and you want to prevent Team A from even seeing Team B's resources by default. What combination achieves this?</p><p class="a">Separate namespaces per team (<code>team-a</code>, <code>team-b</code>) plus RBAC Roles/RoleBindings scoping each team's users to only their own namespace — without RBAC, namespaces alone don't enforce access control, only naming/resource isolation.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">45.</span>Is namespace isolation alone (without RBAC) a security boundary?</p><p class="a">No — namespaces separate object names and allow resource quotas, but without RBAC restricting API access, any authenticated user could still <code>kubectl get pods -n &lt;other-namespace&gt;</code> and see/act on other teams' resources.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">46.</span>Write the command to create an Ingress imperatively without a YAML file (for a quick test).</p><p class="a"><code>kubectl create ingress test-ingress --rule="myapp.local/=nginx-service:80"</code></p></div>
+          <div class="qa"><p class="q"><span class="qnum">47.</span>Scenario — your Ingress works for <code>/</code> but returns 404 for <code>/api/users</code> even though you defined a <code>/api</code> path rule. What's a likely cause?</p><p class="a">The backend Service/app expects the full path <code>/api/users</code> but the Ingress rewrite-target annotation is stripping the prefix incorrectly (or vice versa) — check the <code>nginx.ingress.kubernetes.io/rewrite-target</code> annotation and ensure it matches what your app actually expects to receive.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">48.</span>What is the relationship between Ingress and Services — does Ingress replace Services?</p><p class="a">No — Ingress routes traffic TO Services (never directly to Pods); you still need a ClusterIP Service per app behind the Ingress, which then handles the final Pod-level load balancing.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">49.</span>Scenario — you want <code>api.myapp.local</code> and <code>web.myapp.local</code> to both work over HTTPS with different certificates. How does Ingress support this?</p><p class="a">Define multiple entries in <code>spec.tls</code>, each specifying its own <code>hosts</code> list and a distinct <code>secretName</code> referencing the appropriate TLS Secret for that specific host (SNI-based multi-cert termination).</p></div>
+          <div class="qa"><p class="q"><span class="qnum">50.</span>What's the single biggest RBAC mistake beginners make, and how do you avoid it?</p><p class="a">Granting <code>cluster-admin</code> (or overly broad ClusterRoles) to ServiceAccounts/users out of convenience instead of writing a narrowly-scoped Role — always start from the minimum verbs/resources actually needed and expand only when a real, observed need arises.</p></div>
+        </div>
+      </details>
+    </div>
+  </section>
+
+  <!-- ============================================================ DAY 6 ============================================================ -->
+  <section class="day" id="day6">
+    <div class="day-tag"><span class="day-num">DAY 6 · 3H</span></div>
+    <h2 class="display">Troubleshooting, Logging &amp; Capstone</h2>
+    <div class="day-meta">Goal: tie every prior day together into one repeatable debugging workflow, then prove it on a broken cluster.</div>
+
+    <h3 class="subhead"><span class="tag tag-concept">Core Concepts</span></h3>
+    <div class="concept">
+      <ul>
+        <li><strong>The debugging funnel</strong> — <code class="mono">get</code> (spot the symptom) → <code class="mono">describe</code> (read Events) → <code class="mono">logs</code> (see app output) → <code class="mono">exec</code> (inspect from inside) — the standard order of operations for any Kubernetes issue.</li>
+        <li><strong>Common failure states</strong> — Pending, ImagePullBackOff, CrashLoopBackOff, OOMKilled, Error, each with a distinct root-cause category.</li>
+        <li><strong>Resource requests/limits and quotas</strong> — how misconfigured or exhausted CPU/memory causes scheduling failures and throttling/kills.</li>
+        <li><strong>Log aggregation basics</strong> — why per-Pod <code class="mono">kubectl logs</code> doesn't scale, and the role of centralized logging (conceptually, without deploying a full stack).</li>
+        <li><strong>Health probes as the root of most self-healing</strong> — tying readiness/liveness probes (seen Day 1) back into why Kubernetes takes the actions it does during failures.</li>
+      </ul>
+    </div>
+
+    <h3 class="subhead"><span class="tag tag-practice">Hands-On Examples</span></h3>
+    <div class="example">
+      <p class="exlabel">Example 1 — the debugging funnel in practice</p>
+      <pre class="mono">kubectl get pods                       # 1. spot the symptom (status, restarts)
+kubectl describe pod &lt;name&gt;            # 2. read Events at the bottom
+kubectl logs &lt;name&gt; --previous         # 3. see what the crashed process printed
+kubectl exec -it &lt;name&gt; -- sh          # 4. poke around live (env vars, files, connectivity)</pre>
+    </div>
+    <div class="example">
+      <p class="exlabel">Example 2 — deliberately break things to practice diagnosis (broken-pod.yaml — bad image tag on purpose)</p>
+      <pre class="mono">apiVersion: v1
+kind: Pod
+metadata:
+  name: broken-pod
+spec:
+  containers:
+  - name: app
+    image: nginx:this-tag-does-not-exist</pre>
+      <pre class="mono" style="margin-top:12px;">kubectl apply -f broken-pod.yaml
+kubectl get pods            # ImagePullBackOff
+kubectl describe pod broken-pod   # read the exact pull error in Events</pre>
+    </div>
+    <div class="example">
+      <p class="exlabel">Example 3 — resource limits causing OOMKill</p>
+      <pre class="mono">apiVersion: v1
+kind: Pod
+metadata:
+  name: oom-demo
+spec:
+  containers:
+  - name: hog
+    image: polinux/stress
+    resources:
+      limits:
+        memory: "50Mi"
+    command: ["stress"]
+    args: ["--vm", "1", "--vm-bytes", "150M", "--vm-hang", "1"]</pre>
+      <pre class="mono" style="margin-top:12px;">kubectl apply -f oom-demo.yaml
+kubectl get pods -w         # watch it get OOMKilled and restart
+kubectl describe pod oom-demo   # confirm "Reason: OOMKilled"</pre>
+    </div>
+
+    <h3 class="subhead"><span class="tag tag-project">Project (Capstone)</span> Break It, Then Fix It</h3>
+    <div class="projectbox">
+      <p>Deploy three intentionally broken manifests (bad image tag, wrong <code class="mono">targetPort</code> on a Service, memory limit too low for the app) into a <code class="mono">troubleshoot</code> namespace. Using only <code class="mono">kubectl get</code>, <code class="mono">describe</code>, <code class="mono">logs</code>, and <code class="mono">exec</code>, diagnose and fix all three without looking at the "answer" (the deliberate misconfiguration) until you've formed a hypothesis from the tool output alone. This exercises everything from Days 1–5 end-to-end.</p>
+    </div>
+
+    <h3 class="subhead"><span class="tag tag-resource">Free Resources</span></h3>
+    <div class="resources">
+      <div class="res-card"><div class="k">Docs</div><div class="t"><a href="https://kubernetes.io/docs/tasks/debug/debug-application/">Troubleshoot Applications</a></div><p class="d">Official reference for application-level debugging.</p></div>
+      <div class="res-card"><div class="k">Docs</div><div class="t"><a href="https://kubernetes.io/docs/tasks/debug/debug-application/debug-running-pod/">Debug Running Pods</a></div><p class="d">Official task guide for live Pod inspection.</p></div>
+      <div class="res-card"><div class="k">Docs</div><div class="t"><a href="https://kubernetes.io/docs/tasks/debug/debug-application/determine-reason-pod-failure/">Determine the Reason for Pod Failure</a></div><p class="d">Official guide covering exit codes and failure states.</p></div>
+      <div class="res-card"><div class="k">Docs</div><div class="t"><a href="https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/">Resource Management for Pods and Containers</a></div><p class="d">Official reference for requests, limits, and quotas.</p></div>
+      <div class="res-card"><div class="k">Interactive</div><div class="t"><a href="https://kubernetes.io/docs/tutorials/kubernetes-basics/">Kubernetes Basics Interactive Tutorial</a></div><p class="d">Worth revisiting now that all 6 days' concepts click together.</p></div>
+    </div>
+
+    <h3 class="subhead"><span class="tag tag-interview">Top 50 Q&amp;A</span> Troubleshooting &amp; Logging</h3>
+    <div class="qa-groups">
+      <details class="qa-group">
+        <summary>Debugging funnel &amp; common failures <span class="count">10 questions</span></summary>
+        <div class="qa-body">
+          <div class="qa"><p class="q"><span class="qnum">1.</span>What is the recommended order of commands when debugging any Kubernetes issue?</p><p class="a"><code>kubectl get</code> (spot which object/status is wrong) → <code>kubectl describe</code> (read the Events log for the reason) → <code>kubectl logs</code> (see what the application itself reported) → <code>kubectl exec</code> (interactively inspect from inside if still unclear).</p></div>
+          <div class="qa"><p class="q"><span class="qnum">2.</span>Why check <code>kubectl describe</code> before <code>kubectl logs</code>?</p><p class="a"><code>describe</code>'s Events section often reveals infrastructure-level problems (scheduling failures, image pull errors, OOMKills) that happen BEFORE your application code even runs — <code>logs</code> only shows output from a container that actually started.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">3.</span>Scenario — <code>kubectl get pods</code> shows STATUS <code>Pending</code> for over 5 minutes. What's your very next command?</p><p class="a"><code>kubectl describe pod &lt;name&gt;</code> — check the Events section for "FailedScheduling" and its stated reason (insufficient resources, unmatched node selector, unbound PVC, etc.).</p></div>
+          <div class="qa"><p class="q"><span class="qnum">4.</span>What are the three most common causes of a Pod stuck in <code>Pending</code>?</p><p class="a">(1) Insufficient CPU/memory on any Node to satisfy the Pod's resource requests. (2) A nodeSelector/affinity rule no Node satisfies. (3) A PersistentVolumeClaim that can't bind (no matching PV, no StorageClass).</p></div>
+          <div class="qa"><p class="q"><span class="qnum">5.</span>Scenario — <code>kubectl get pods</code> shows <code>CrashLoopBackOff</code> with restart count climbing. What command reveals why the previous attempt failed?</p><p class="a"><code>kubectl logs &lt;name&gt; --previous</code> — shows the log output from the last crashed instance of the container, since the current instance's logs may not have printed the error yet (or is in a fresh backoff wait).</p></div>
+          <div class="qa"><p class="q"><span class="qnum">6.</span>What does <code>ImagePullBackOff</code> mean, distinct from <code>ErrImagePull</code>?</p><p class="a"><code>ErrImagePull</code> is the immediate first failed pull attempt; <code>ImagePullBackOff</code> is Kubernetes waiting with exponential backoff before retrying after repeated failures — both point to the same underlying image-pull problem.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">7.</span>Write the three most common root causes of <code>ImagePullBackOff</code>.</p><p class="a">(1) Typo in image name or tag. (2) Image genuinely doesn't exist in that registry. (3) Missing/incorrect registry credentials (<code>imagePullSecrets</code>) for a private repository.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">8.</span>Scenario — <code>kubectl describe pod</code> shows <code>Reason: OOMKilled</code> under a container's Last State. What's the direct cause and two possible fixes?</p><p class="a">The container exceeded its <code>resources.limits.memory</code>. Fixes: (1) raise the memory limit if the workload legitimately needs more, or (2) investigate/fix a memory leak in the app if the limit is already reasonable.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">9.</span>What does the Pod-level status <code>Error</code> (as opposed to CrashLoopBackOff) typically indicate?</p><p class="a">The container ran and exited with a non-zero code but hasn't yet been restarted enough times to be classified as crash-looping, or <code>restartPolicy: Never</code> is set — check <code>kubectl logs</code> for the actual application error.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">10.</span>Write the command to view logs from a Pod's previous (crashed) instance.</p><p class="a"><code>kubectl logs &lt;pod-name&gt; --previous</code></p></div>
+        </div>
+      </details>
+
+      <details class="qa-group">
+        <summary>Logs &amp; exit codes <span class="count">10 questions</span></summary>
+        <div class="qa-body">
+          <div class="qa"><p class="q"><span class="qnum">11.</span>Write the command to stream logs live as they're produced.</p><p class="a"><code>kubectl logs -f &lt;pod-name&gt;</code></p></div>
+          <div class="qa"><p class="q"><span class="qnum">12.</span>Scenario — you need logs from all 3 replicas of a Deployment at once, not just one Pod. What's a practical approach with just kubectl?</p><p class="a"><code>kubectl logs -l app=&lt;label&gt; --all-containers --prefix</code> (label selector across matching Pods, prefixing each line with its source Pod) — for anything beyond ad-hoc debugging, a centralized log aggregator (e.g., shipping logs to Loki/ELK) is the real production answer.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">13.</span>Why doesn't <code>kubectl logs</code> scale well as a primary debugging tool in production?</p><p class="a">Pods are ephemeral — once deleted, their logs are gone unless captured elsewhere; and manually checking logs pod-by-pod across many replicas/nodes doesn't scale, which is why centralized log aggregation (shipping stdout/stderr off-node) is standard practice.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">14.</span>What is the conceptual role of a log aggregation stack (e.g., ELK, Loki) that raw <code>kubectl logs</code> doesn't provide?</p><p class="a">Persistent storage of logs beyond a Pod's lifetime, searching/filtering across all Pods/Nodes at once, and alerting on log patterns — kubectl only gives you a live, per-Pod, no-history view.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">15.</span>Scenario — your app writes logs to a file inside the container instead of stdout/stderr. Why is this a problem in Kubernetes?</p><p class="a"><code>kubectl logs</code> and any node-level log-shipping agent only capture a container's stdout/stderr streams by convention — logs written only to an internal file are invisible to standard Kubernetes tooling unless you add extra volume-mounting/sidecar complexity.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">16.</span>Write the command to check a container's exit code after it crashed.</p><p class="a"><code>kubectl describe pod &lt;name&gt;</code> — look under the container's "Last State: Terminated" section for the <code>Exit Code</code> and <code>Reason</code> fields.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">17.</span>What does exit code 137 typically indicate?</p><p class="a">The container was killed via SIGKILL — very often from being OOMKilled (128 + signal 9 = 137), though it can also result from other external kill signals.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">18.</span>What does exit code 1 (generic) tell you, and what should you check next?</p><p class="a">Just that the application exited with a general error — you must check <code>kubectl logs</code> (or <code>--previous</code>) for the actual application-level error message, since the exit code alone rarely explains the specific cause.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">19.</span>Scenario — a Pod is <code>Running</code> and <code>1/1 Ready</code>, but users report the app is unreachable. Where do you look first?</p><p class="a">The Service layer — <code>kubectl get endpoints &lt;svc&gt;</code> to confirm the Pod is actually registered as a backend, and <code>kubectl describe svc</code> to confirm selector/port correctness (the Pod itself may be healthy while its Service routing is misconfigured).</p></div>
+          <div class="qa"><p class="q"><span class="qnum">20.</span>Write the command to check resource requests/limits currently defined on a running Pod.</p><p class="a"><code>kubectl describe pod &lt;name&gt;</code> — shows each container's Requests/Limits under the "Containers" section.</p></div>
+        </div>
+      </details>
+
+      <details class="qa-group">
+        <summary>Resources &amp; quotas <span class="count">10 questions</span></summary>
+        <div class="qa-body">
+          <div class="qa"><p class="q"><span class="qnum">21.</span>Scenario — many Pods across the namespace are <code>Pending</code> and <code>kubectl describe pod</code> says "Insufficient cpu." What's the systemic fix, beyond that one Pod?</p><p class="a">Either add more Node capacity to the cluster, reduce the CPU requests on Deployments if they're over-provisioned relative to actual usage, or review/adjust any ResourceQuota capping the namespace.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">22.</span>What is a ResourceQuota (brief, ties resource requests to namespaces)?</p><p class="a">A namespace-level object capping total resource consumption (CPU, memory, object counts) across all Pods in that namespace — prevents one team/namespace from exhausting shared cluster capacity.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">23.</span>Scenario — a Pod that used to schedule fine now stays <code>Pending</code> and <code>describe</code> shows "exceeded quota." What changed?</p><p class="a">The namespace likely has (or recently had lowered) a ResourceQuota, and either this Pod's request or the sum of existing Pods' requests now exceeds the allowed limit — check <code>kubectl describe resourcequota -n &lt;namespace&gt;</code>.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">24.</span>Write the command to get a one-line summary of resource usage per Pod (requires metrics-server).</p><p class="a"><code>kubectl top pods</code> (and <code>kubectl top nodes</code> for Node-level) — requires the metrics-server addon; on Minikube: <code>minikube addons enable metrics-server</code>.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">25.</span>Scenario — <code>kubectl top pods</code> returns an error about metrics not being available. What's the fix on Minikube?</p><p class="a"><code>minikube addons enable metrics-server</code> — metrics-server isn't enabled by default and is required for <code>kubectl top</code> to function.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">26.</span>What does a rising restart count combined with <code>Running</code> status (not CrashLoopBackOff) suggest?</p><p class="a">The container is crashing occasionally but not frequently/consistently enough to trigger the CrashLoopBackOff label yet — still worth investigating via <code>kubectl logs --previous</code> before it worsens.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">27.</span>Scenario — you fix a bug and update the Deployment's image, but <code>kubectl get pods</code> still shows old Pods running. What might be wrong?</p><p class="a">You may have used the same image tag (e.g., <code>:latest</code>) without Kubernetes detecting a "change" to trigger a rollout, or <code>imagePullPolicy</code> is set to <code>IfNotPresent</code> and the Node already has a cached (stale) copy of that tag — best practice is unique, immutable tags per build.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">28.</span>Write the command to force a rollout restart even without changing the image tag.</p><p class="a"><code>kubectl rollout restart deployment/&lt;name&gt;</code> — creates new Pods (picking up any updated ConfigMap/Secret refs or forcing a fresh image pull) without requiring a manifest change.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">29.</span>Scenario — <code>kubectl describe pod</code> shows readiness probe failures repeatedly, but the container itself never restarts. Why not?</p><p class="a">Readiness failures only remove the Pod from Service Endpoints (traffic routing) — they do NOT restart the container; only liveness probe failures (or crashes) trigger a restart.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">30.</span>What field lets you tune how quickly a probe considers a container failed vs. still starting up?</p><p class="a"><code>initialDelaySeconds</code> (grace period before the first check), <code>periodSeconds</code> (check frequency), and <code>failureThreshold</code> (consecutive failures before acting) — misconfigured values are a very common source of false-positive restarts/removals.</p></div>
+        </div>
+      </details>
+
+      <details class="qa-group">
+        <summary>Probes &amp; rollout issues <span class="count">10 questions</span></summary>
+        <div class="qa-body">
+          <div class="qa"><p class="q"><span class="qnum">31.</span>Scenario — a slow-starting app (30s boot time) gets killed by its liveness probe before it ever finishes starting. What's the fix?</p><p class="a">Increase <code>initialDelaySeconds</code> past the app's typical startup time, or (better, in modern Kubernetes) add a <code>startupProbe</code> that suppresses liveness checks until startup is confirmed complete.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">32.</span>What is a <code>startupProbe</code> and why is it useful for legacy/slow apps?</p><p class="a">A probe that runs only during container startup — while it hasn't succeeded, liveness/readiness probes are disabled, preventing premature kills of slow-starting applications without permanently loosening liveness timing for steady-state operation.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">33.</span>Scenario — you <code>kubectl exec</code> into a container to run <code>curl localhost:8080/health</code> and it fails, but the app "works" per external users. What does this tell you?</p><p class="a">The failure is likely upstream (DNS/Service/Ingress layer) rather than the app itself — the fact that a direct in-container check succeeds/fails is the cleanest way to isolate "is it the app or is it the network path to it."</p></div>
+          <div class="qa"><p class="q"><span class="qnum">34.</span>Write the command to check events across an entire namespace, not just one Pod.</p><p class="a"><code>kubectl get events -n &lt;namespace&gt; --sort-by='.lastTimestamp'</code> — useful for seeing a chronological feed of everything (scheduling, pulls, probe failures) happening namespace-wide.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">35.</span>Scenario — <code>kubectl get events</code> shows a burst of "BackOff" and "Unhealthy" events shortly after a deploy. What's the likely story those events are telling?</p><p class="a">New Pods are failing their health checks repeatedly right after rollout — check <code>kubectl logs</code> on the new Pods for a startup error and confirm the probe configuration/timing actually fits the new version's behavior.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">36.</span>What is the difference in troubleshooting approach between a Pod-level problem and a Service-level problem?</p><p class="a">Pod-level: focus on <code>describe</code>/<code>logs</code>/<code>exec</code> on the specific Pod. Service-level: focus on <code>describe svc</code>, <code>get endpoints</code>, and verifying label/selector/port alignment — a perfectly healthy Pod can still be unreachable due to a Service misconfiguration.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">37.</span>Scenario — you suspect a NetworkPolicy (or firewall-like rule) is silently blocking traffic between two Pods that both look healthy. How would you test this in isolation?</p><p class="a"><code>kubectl exec</code> into the source Pod and try a direct raw connection test (<code>curl</code>, <code>wget</code>, or <code>nc</code>) to the destination Pod's IP/port — bypassing the Service layer to isolate whether it's a network-policy/connectivity issue versus a Service-configuration issue.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">38.</span>What's the value of intentionally breaking things (like today's capstone) as a learning method?</p><p class="a">Real production incidents rarely announce their cause — practicing pattern recognition on deliberately-injected common failures (bad image, bad port, tight memory limit) builds the instinct to recognize the same symptoms quickly under real pressure.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">39.</span>Scenario — after fixing a Service's wrong <code>targetPort</code>, do you need to delete/recreate the Pods for connectivity to be restored?</p><p class="a">No — Services route based on live label-matched Endpoints; fixing the Service's <code>targetPort</code> and re-applying takes effect immediately without touching the underlying Pods at all.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">40.</span>What is the fastest way to confirm "is my problem the Pod, the Service, or the Ingress" when a user reports "the site is down"?</p><p class="a">Test from the inside out: <code>kubectl exec</code> into a Pod and confirm the app responds locally → curl the ClusterIP Service from another Pod → curl through the Ingress's external URL — the layer where it first stops working is where the problem lives.</p></div>
+        </div>
+      </details>
+
+      <details class="qa-group">
+        <summary>Scenario-based &amp; capstone wrap-up <span class="count">10 questions</span></summary>
+        <div class="qa-body">
+          <div class="qa"><p class="q"><span class="qnum">41.</span>Scenario — a ConfigMap change was applied, but the app still behaves with old settings after a Pod restart. What's a step often forgotten?</p><p class="a">Confirming the Pod is actually reading from that ConfigMap (correct name/key referenced) and that you restarted the right Deployment/namespace — also double-check you didn't edit a same-named ConfigMap in the wrong namespace.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">42.</span>What information does <code>kubectl get pod &lt;name&gt; -o yaml</code> give you that <code>describe</code> sometimes doesn't make obvious?</p><p class="a">The full, exact live spec/status as stored by the API server — useful for spotting subtle misconfigurations (wrong image string, missing field, unexpected default) that <code>describe</code>'s human-formatted summary might gloss over.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">43.</span>Scenario — <code>kubectl apply -f file.yaml</code> succeeds with no errors, but nothing changes in the cluster. What should you check?</p><p class="a">Confirm you're applying to the intended namespace/context (<code>kubectl config current-context</code>, and any <code>-n</code> flag or <code>metadata.namespace</code> in the file) — a very common "silent" mistake is applying successfully to the wrong namespace or cluster.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">44.</span>Write the command to check which cluster/context your kubectl commands are currently targeting.</p><p class="a"><code>kubectl config current-context</code> (and <code>kubectl config get-contexts</code> to see all available ones).</p></div>
+          <div class="qa"><p class="q"><span class="qnum">45.</span>Scenario — everything you <code>kubectl apply</code> seems to vanish or not show up in <code>kubectl get</code>. What's a likely root cause worth checking first?</p><p class="a">You're switching between multiple contexts/clusters (e.g., Minikube vs. a cloud cluster) without realizing it — always verify <code>kubectl config current-context</code> matches where you expect to be working.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">46.</span>What is the value of labeling all objects in a project consistently (e.g., <code>app</code>, <code>env</code>, <code>team</code>) for troubleshooting?</p><p class="a">Enables fast, precise filtering during an incident — <code>kubectl get pods -l app=checkout,env=prod</code> narrows a large cluster down to exactly the relevant objects instantly, instead of scrolling through everything.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">47.</span>Scenario — you've fixed the bad image tag, wrong targetPort, and memory limit in today's capstone. What single command across all three fixes confirms success end-to-end?</p><p class="a"><code>kubectl get pods -n troubleshoot -o wide</code> showing all Pods <code>Running</code>/<code>Ready</code>, combined with a successful curl through the Service/Ingress confirming actual traffic reaches the app — status alone isn't proof; a real request completing is.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">48.</span>What's the difference between treating symptoms and finding root cause in Kubernetes troubleshooting?</p><p class="a">E.g., repeatedly deleting a CrashLoopBackOff Pod "fixes" the symptom for a few seconds but the same crash recurs — the root cause (bad config, insufficient resources, app bug) must be found via logs/describe and actually corrected, not worked around by restarting.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">49.</span>Having completed all 6 days, what are the areas you can now troubleshoot and operate independently?</p><p class="a">Pods/Deployments (workload basics), Services/networking (connectivity), ConfigMaps/Secrets (configuration), StatefulSets/PVs (persistent state), Ingress (external HTTP routing), Namespaces/RBAC (isolation &amp; access control), and the troubleshooting workflow tying all of them together.</p></div>
+          <div class="qa"><p class="q"><span class="qnum">50.</span>What's the recommended next step after this 20-hour roadmap, staying within the 80/20 principle?</p><p class="a">Rebuild a small real app (e.g., a to-do API + database) end-to-end using everything from Days 1–6 in one cohesive manifest set — repetition on a real project cements these fundamentals far more than consuming additional new topics before this base is solid.</p></div>
+        </div>
+      </details>
+    </div>
+  </section>
+
+  <h3 class="subhead" style="margin-top:60px;">Summary Schedule</h3>
+  <div class="tblwrap">
+    <table class="cmp">
+      <thead><tr><th>Day</th><th>Hours</th><th>Topic</th><th>Project</th></tr></thead>
+      <tbody>
+        <tr><td>1</td><td>4h</td><td>Pods &amp; Deployments</td><td>Deploy, scale, and roll back an nginx Deployment</td></tr>
+        <tr><td>2</td><td>4h</td><td>Services &amp; Networking</td><td>Expose the app internally (ClusterIP) and externally (NodePort)</td></tr>
+        <tr><td>3</td><td>3h</td><td>ConfigMaps &amp; Secrets</td><td>Multi-container Pod reading config/secret data</td></tr>
+        <tr><td>4</td><td>3h</td><td>StatefulSets &amp; Persistent Volumes</td><td>3-replica StatefulSet with per-Pod persistent storage</td></tr>
+        <tr><td>5</td><td>3h</td><td>Ingress, Namespaces &amp; RBAC</td><td>Multi-namespace app with Ingress and a restricted ServiceAccount</td></tr>
+        <tr><td>6</td><td>3h</td><td>Troubleshooting &amp; Logging</td><td>Capstone: diagnose and fix 3 intentionally broken manifests</td></tr>
+        <tr><td><strong>Total</strong></td><td><strong>20h</strong></td><td></td><td></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <footer class="end">
+    Six days, twenty hours, no operators or CRDs required: deploy (Pods/Deployments), expose (Services), configure (ConfigMaps/Secrets), persist (StatefulSets/PVs), route (Ingress), secure (Namespaces/RBAC), and debug (the troubleshooting funnel). That's the 20% of Kubernetes that makes you functional on 80% of real work — everything else is detail you can look up once this foundation is solid.
+  </footer>
+
+</main>
+</div>
+</body>
+</html>

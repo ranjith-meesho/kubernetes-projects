@@ -1,0 +1,235 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Topic 23: Storage — Kubernetes Expert Course</title>
+<link rel="stylesheet" href="styles.css">
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+</head>
+<body>
+
+<header class="course-header">
+  <div class="kicker">Topic 23 of 70</div>
+  <h1>Storage</h1>
+  <div class="subtitle">The big picture: how volumes, PV, PVC, StorageClass, and CSI fit together to give Pods durable, portable storage.</div>
+</header>
+
+<nav class="topic-nav">
+  <a href="22-ingress.html">&larr; Ingress</a>
+  <a href="index.html">Course Index</a>
+  <a href="24-pv.html">PersistentVolume &rarr;</a>
+</nav>
+
+<h2 id="explanation">Explanation</h2>
+<p>Containers are ephemeral by design — a Pod's writable layer disappears the moment the container restarts. Kubernetes' <strong>volume</strong> abstraction exists to decouple storage lifetime from container lifetime. The simplest volumes are tied to the Pod: <code>emptyDir</code> is a scratch directory that lives as long as the Pod does (useful for caches or sidecar-to-main-container file sharing, but wiped on Pod deletion), and <code>hostPath</code> mounts a path from the node's own filesystem (useful for node-level agents, dangerous for anything else because it ties a Pod to one specific node and gives it access to the host).</p>
+<p>Real applications — databases, message queues, anything stateful — need storage that outlives the Pod and can follow it if it's rescheduled elsewhere. That's what the <strong>PersistentVolume (PV) / PersistentVolumeClaim (PVC)</strong> pair provides: a PV represents an actual piece of storage (an EBS volume, a GCE PD, an NFS share, a Ceph RBD image), and a PVC is a namespaced request for storage that gets bound to a matching PV. Pods never reference storage directly — they reference a PVC, which is the layer of indirection that lets storage be provisioned, resized, or swapped without touching Pod specs.</p>
+<p><strong>StorageClass</strong> removes the last manual step: instead of a cluster admin pre-creating PVs, a StorageClass names a provisioner (a cloud disk API, a CSI driver) and parameters (disk type, filesystem, encryption), and PVs are created on demand the moment a PVC asks for one. This is "dynamic provisioning," and it's the default in virtually every real cluster today — static PV creation is now mostly reserved for pre-existing storage you need to import.</p>
+<p>Underneath all of this sits the <strong>Container Storage Interface (CSI)</strong> — a standard gRPC contract between Kubernetes and any storage backend. Before CSI, every storage vendor's integration had to live in Kubernetes' own binary tree ("in-tree" volume plugins), which meant a driver bug required a Kubernetes release to fix. CSI moved all of that logic out-of-tree into independently versioned driver Pods, which is why almost every cloud and storage vendor now ships a CSI driver instead of relying on legacy in-tree plugins.</p>
+<p>Together the stack reads top-down: <em>Pod</em> mounts a <em>PVC</em>, the PVC is bound to a <em>PV</em>, the PV was created (statically or dynamically via a <em>StorageClass</em>) by a <em>CSI driver</em>, and the CSI driver talks to the real storage system (EBS, Ceph, Portworx, etc.). Each of the next four topics dives into one layer of this stack.</p>
+
+<h2 id="internal-working">Internal Working / Interactions</h2>
+<ul>
+<li><strong>kubelet</strong> — mounts the final volume into the Pod's container filesystem at Pod startup, calling out to CSI node plugins for CSI-backed volumes.</li>
+<li><strong>PV controller (kube-controller-manager)</strong> — binds PVCs to PVs and enforces reclaim policy on release.</li>
+<li><strong>External provisioner (CSI sidecar)</strong> — watches unbound PVCs referencing a StorageClass and calls the CSI driver to create backing storage.</li>
+<li><strong>Cloud/storage backend</strong> — the actual disk/share/API that the CSI driver provisions and attaches.</li>
+</ul>
+
+<h2 id="architecture-diagram">Architecture Diagram</h2>
+<pre class="mermaid">
+flowchart TD
+  Pod[Pod spec.volumes] -->|references| PVC[PersistentVolumeClaim]
+  PVC -->|bound to| PV[PersistentVolume]
+  SC[StorageClass] -->|provisioner + params| PV
+  PVC -->|storageClassName| SC
+  PV -->|backed by| CSI[CSI Driver]
+  CSI -->|provisions| Backend[(Cloud Disk / NFS / Ceph)]
+  kubelet[kubelet] -->|NodeStageVolume / NodePublishVolume| CSI
+  Pod -.->|mounted by| kubelet
+</pre>
+
+<h2 id="code-example">Code Example</h2>
+<pre><code># emptyDir — ephemeral, Pod-lifetime-only scratch space (no PV/PVC involved)
+apiVersion: v1
+kind: Pod
+metadata:
+  name: cache-demo
+spec:
+  containers:
+  - name: app
+    image: nginx:1.27
+    volumeMounts:
+    - name: scratch
+      mountPath: /cache             # writable scratch dir shared across containers in this Pod
+  volumes:
+  - name: scratch
+    emptyDir:
+      sizeLimit: 1Gi                # optional cap to stop it filling the node disk
+
+---
+# Pod consuming durable storage via a PVC (dynamic provisioning end-to-end)
+apiVersion: v1
+kind: Pod
+metadata:
+  name: db-demo
+spec:
+  containers:
+  - name: postgres
+    image: postgres:16
+    volumeMounts:
+    - name: data
+      mountPath: /var/lib/postgresql/data   # durable data directory
+  volumes:
+  - name: data
+    persistentVolumeClaim:
+      claimName: db-data-pvc                # indirection: Pod never touches PV/StorageClass directly
+</code></pre>
+
+<h2 id="kubectl-commands">kubectl Commands</h2>
+<pre><code>kubectl get pv                         # list all PersistentVolumes cluster-wide
+kubectl get pvc -A                     # list all PersistentVolumeClaims
+kubectl get storageclass               # list available StorageClasses / provisioners
+kubectl get csidrivers                 # list installed CSI drivers
+kubectl describe pod db-demo           # check volume mount events, mount failures
+kubectl get volumeattachments           # see which PVs are attached to which nodes
+kubectl exec db-demo -- df -h /var/lib/postgresql/data  # verify the volume is actually mounted
+</code></pre>
+
+<h2 id="best-practices">Best Practices &amp; Common Pitfalls</h2>
+<div class="grid-2">
+<div class="callout good">
+<strong>Do</strong>
+<ul>
+<li>Prefer dynamic provisioning (StorageClass) over hand-created PVs in every environment.</li>
+<li>Use <code>emptyDir</code> only for genuinely disposable data.</li>
+<li>Set <code>sizeLimit</code> on <code>emptyDir</code> to protect node disk pressure.</li>
+<li>Treat CSI driver version/compatibility as a first-class upgrade dependency.</li>
+</ul>
+</div>
+<div class="callout warn">
+<strong>Pitfalls</strong>
+<ul>
+<li>Using <code>hostPath</code> for anything beyond node-local agents — it breaks Pod portability and is a security risk.</li>
+<li>Assuming storage "just resizes" — many backends need explicit PVC resize support enabled.</li>
+<li>Forgetting that deleting a PVC can delete the underlying disk depending on reclaim policy.</li>
+<li>Mixing zones: a PV provisioned in one AZ can't be mounted by a Pod scheduled in another.</li>
+</ul>
+</div>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="interview-questions">50 Interview Questions</h2>
+
+<details class="qa"><summary>1. Why does Kubernetes have both ephemeral volumes (emptyDir, hostPath) and persistent storage (PV/PVC) as separate concepts?</summary>
+<div class="qa-body"><strong>Short answer:</strong> They solve different problems — ephemeral volumes exist for the lifetime of a Pod for scratch/shared data, while PV/PVC exist for data that must outlive and follow the workload across reschedules.
+<br><strong>Detailed explanation:</strong> Not every volume need is "durable data." Caches, sidecar hand-off files, and temp scratch space are naturally throwaway and shouldn't carry the weight (or cost) of provisioning real disks. Persistent storage exists specifically for the subset of workloads — databases, queues, anything stateful — where losing data on Pod deletion is unacceptable.
+<br><strong>Production example:</strong> A build-cache sidecar pattern uses <code>emptyDir</code> to share compiled artifacts between an init container and the main container, while the Postgres Pod next to it uses a PVC so a rescheduled Pod reattaches to the same data.
+<br><strong>Common mistake:</strong> Reaching for a PVC by default even when the data is genuinely disposable, adding unnecessary provisioning overhead and cost.</div></details>
+
+<details class="qa"><summary>2. What is the key architectural reason Pods reference a PVC instead of a PV directly?</summary>
+<div class="qa-body"><strong>Short answer:</strong> The PVC is a layer of indirection that decouples the Pod spec from the actual storage implementation, so storage can be provisioned, resized, or swapped without touching the Pod.
+<br><strong>Detailed explanation:</strong> A PVC is just a namespaced request for storage with size/access-mode requirements; it gets bound to whatever PV satisfies it, whether that PV was hand-created or dynamically provisioned. Because the Pod only knows the PVC's name, the underlying disk type or backend can change without any Pod spec edit.
+<br><strong>Production example:</strong> Migrating a stateful workload from one cloud disk type to another can be done by rebinding the PVC to a new PV, without editing every Deployment/StatefulSet that mounts it.
+<br><strong>Common mistake:</strong> Hardcoding storage-backend-specific volume fields directly in Pod specs instead of going through a PVC, which defeats the portability the abstraction provides.</div></details>
+
+<details class="qa"><summary>3. How does StorageClass turn PV creation from a manual admin task into "dynamic provisioning"?</summary>
+<div class="qa-body"><strong>Short answer:</strong> A StorageClass names a provisioner and parameters; when a PVC references it, a PV is created on demand instead of an admin pre-creating one.
+<br><strong>Detailed explanation:</strong> Without StorageClass, a cluster admin must manually create PVs ahead of time and hope their size/type matches future PVC requests. With StorageClass, the external provisioner watches for unbound PVCs and calls the CSI driver to create matching storage automatically, the moment it's requested.
+<br><strong>Production example:</strong> A new namespace's PVC referencing an <code>ssd-encrypted</code> StorageClass gets a brand-new encrypted EBS volume provisioned within seconds, with no admin involvement.
+<br><strong>Common mistake:</strong> Continuing to manually pre-create PVs "just in case" in clusters that already have dynamic provisioning configured, adding operational toil for no benefit.</div></details>
+
+<details class="qa"><summary>4. What problem did CSI (Container Storage Interface) solve that in-tree volume plugins did not?</summary>
+<div class="qa-body"><strong>Short answer:</strong> CSI moved storage-vendor integration code out of Kubernetes' own binary tree into independently versioned driver Pods, so driver fixes no longer require a Kubernetes release.
+<br><strong>Detailed explanation:</strong> Before CSI, every storage backend's logic lived inside kubelet/kube-controller-manager itself ("in-tree"). A bug in one vendor's plugin could only be fixed by shipping a new Kubernetes version. CSI defines a standard gRPC contract so any vendor can ship, version, and patch their driver independently of the Kubernetes release cycle.
+<br><strong>Production example:</strong> An EBS CSI driver security patch can be rolled out by upgrading the driver DaemonSet/Deployment alone, with zero Kubernetes control-plane upgrade required.
+<br><strong>Common mistake:</strong> Assuming an old in-tree plugin reference (e.g. <code>kubernetes.io/aws-ebs</code>) still applies on modern clusters where it's deprecated in favor of the CSI equivalent.</div></details>
+
+<details class="qa"><summary>5. Walk through the full top-down flow from Pod to backend storage.</summary>
+<div class="qa-body"><strong>Short answer:</strong> Pod mounts a PVC, the PVC is bound to a PV, the PV is created (statically or via a StorageClass) by a CSI driver, and the CSI driver talks to the real storage system.
+<br><strong>Detailed explanation:</strong> Each layer only knows about the one below it: the Pod knows a PVC name, the PVC knows a StorageClass name (or is bound directly to a pre-existing PV), the PV knows a CSI driver identity and volume handle, and only the CSI driver knows the storage backend's actual API (EBS, Ceph, Portworx, etc.).
+<br><strong>Production example:</strong> Tracing a mount failure means walking this chain in order: check Pod events, then PVC status, then PV status, then CSI driver Pod logs, then the cloud backend's own console/API.
+<br><strong>Common mistake:</strong> Jumping straight to cloud-provider logs when troubleshooting, skipping the intermediate PVC/PV binding status that often reveals the real failure point.</div></details>
+
+<details class="qa"><summary>6. What's the practical difference between emptyDir and hostPath, and why is hostPath considered risky?</summary>
+<div class="qa-body"><strong>Short answer:</strong> emptyDir is a Pod-scoped scratch directory on whatever node the Pod lands on; hostPath mounts an actual path from the node's filesystem, tying the Pod to that specific node and exposing host-level access.
+<br><strong>Detailed explanation:</strong> emptyDir's contents are wiped when the Pod is deleted and never persist across reschedules — it's genuinely ephemeral. hostPath instead reads/writes real files on the node, meaning a rescheduled Pod on a different node sees a completely different (or missing) directory, and a compromised container can potentially reach sensitive host files.
+<br><strong>Production example:</strong> A legitimate hostPath use is a node-level log-shipping DaemonSet reading <code>/var/log</code> on each node; using hostPath for a stateless web app's cache would break the moment the Pod is rescheduled to another node.
+<br><strong>Common mistake:</strong> Using hostPath as a shortcut for "persistent storage" instead of a PVC, which silently breaks Pod portability and creates a security exposure.</div></details>
+
+<details class="qa"><summary>7. Why does the internal-working diagram show the kubelet calling out to CSI node plugins during mount, rather than mounting the volume itself?</summary>
+<div class="qa-body"><strong>Short answer:</strong> kubelet doesn't know how to talk to every storage backend, so for CSI-backed volumes it delegates the actual mount operations (NodeStageVolume/NodePublishVolume) to the CSI driver's node plugin.
+<br><strong>Detailed explanation:</strong> kubelet's job is to orchestrate Pod lifecycle generically; the storage-specific logic of attaching a disk, formatting/staging it, and bind-mounting it into the container's filesystem is delegated via the standard CSI gRPC calls, keeping kubelet decoupled from any specific backend.
+<br><strong>Production example:</strong> A stuck Pod in <code>ContainerCreating</code> due to a volume mount issue is usually diagnosed by checking the CSI node plugin Pod's logs on that node, not kubelet logs alone.
+<br><strong>Common mistake:</strong> Debugging volume mount failures purely from <code>kubectl describe pod</code> events without also checking the CSI driver's own logs, missing the actual root cause.</div></details>
+
+<details class="qa"><summary>8. What is the role of the PV controller inside kube-controller-manager, and why does reclaim policy matter?</summary>
+<div class="qa-body"><strong>Short answer:</strong> The PV controller binds PVCs to matching PVs and, when a PVC is released, enforces the PV's reclaim policy (Retain, Delete, or Recycle) on what happens to the underlying storage.
+<br><strong>Detailed explanation:</strong> Binding is a matching process based on size, access modes, and StorageClass; once bound, the PV controller also watches for PVC deletion and acts according to reclaim policy — either keeping the disk around (Retain), deleting it entirely (Delete, common with dynamic provisioning), or the now-deprecated Recycle.
+<br><strong>Production example:</strong> A PVC accidentally deleted for a dynamically-provisioned PV with reclaim policy <code>Delete</code> results in the underlying cloud disk being destroyed immediately — no soft-delete window.
+<br><strong>Common mistake:</strong> Assuming deleting a PVC is a safe, reversible operation without first checking the bound PV's reclaim policy.</div></details>
+
+<details class="qa"><summary>9. Why can't a Pod in one availability zone mount a PV that was provisioned in another zone?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Most cloud block storage (EBS, GCE PD, etc.) is zone-local, so a PV backed by a disk in zone A physically cannot be attached to a node running in zone B.
+<br><strong>Detailed explanation:</strong> Dynamic provisioning typically happens without zone awareness unless the StorageClass or scheduler constraints account for topology; if the Pod later gets scheduled to a node in a different zone than the disk, the volume attach step fails outright.
+<br><strong>Production example:</strong> A StatefulSet Pod rescheduled after a node drain lands in a different zone than its PV and gets stuck in <code>ContainerCreating</code> with a volume attach error until manually rescheduled back to a compatible zone.
+<br><strong>Common mistake:</strong> Not using topology-aware provisioning (<code>volumeBindingMode: WaitForFirstConsumer</code>) or zone-aware scheduling, so the disk and Pod end up mismatched.</div></details>
+
+<details class="qa"><summary>10. Why is "storage just resizes" a dangerous assumption in production?</summary>
+<div class="qa-body"><strong>Short answer:</strong> PVC resize (volume expansion) is an opt-in capability that depends on the StorageClass having <code>allowVolumeExpansion: true</code> and the CSI driver supporting it — it isn't automatic for every backend.
+<br><strong>Detailed explanation:</strong> Even when supported, expanding a PVC's requested size doesn't always immediately reflect in the filesystem; depending on the driver, a Pod restart or an online filesystem-resize step may be required to actually make the extra space usable inside the container.
+<br><strong>Production example:</strong> A team edits a PVC's <code>spec.resources.requests.storage</code> expecting more space immediately, but the underlying StorageClass has expansion disabled, so the request is rejected or silently ignored.
+<br><strong>Common mistake:</strong> Treating volume resize as a universal, always-available operation rather than checking the specific StorageClass/CSI driver's capabilities first.</div></details>
+
+<details class="qa"><summary>11–50. Additional rapid-fire questions</summary>
+<div class="qa-body">
+<strong>11.</strong> What does <code>emptyDir.sizeLimit</code> protect against? — Prevents an unbounded scratch volume from filling up the node's disk and causing disk-pressure evictions.<br>
+<strong>12.</strong> Is emptyDir data shared between containers in the same Pod? — Yes, all containers in the Pod can mount and share the same emptyDir volume.<br>
+<strong>13.</strong> What happens to an emptyDir's contents when a container crashes and restarts? — They survive container restarts, but are wiped entirely when the Pod itself is deleted.<br>
+<strong>14.</strong> Is a PersistentVolume a namespaced object? — No, PV is cluster-scoped; PVC is namespaced.<br>
+<strong>15.</strong> What access modes can a PVC request? — ReadWriteOnce, ReadOnlyMany, ReadWriteMany (and ReadWriteOncePod on newer clusters).<br>
+<strong>16.</strong> What binds a PVC to a specific PV? — The PV controller matches based on requested size, access modes, and StorageClass, then sets the binding.<br>
+<strong>17.</strong> Can a PVC remain unbound indefinitely? — Yes, if no PV/provisioner can satisfy its request, it stays in <code>Pending</code> status.<br>
+<strong>18.</strong> What field on a PVC selects which StorageClass provisions it? — <code>spec.storageClassName</code>.<br>
+<strong>19.</strong> What happens if a PVC omits <code>storageClassName</code> entirely? — It uses the cluster's default StorageClass if one is marked default, otherwise it may stay unbound.<br>
+<strong>20.</strong> What two main components make up a typical CSI driver deployment? — A controller plugin (provisioning/attaching) and a node plugin (mounting on each node), often as sidecars alongside the driver container.<br>
+<strong>21.</strong> What is the external-provisioner sidecar's job? — Watches unbound PVCs referencing its StorageClass and calls the CSI driver's CreateVolume RPC.<br>
+<strong>22.</strong> What is the external-attacher sidecar's job? — Calls the CSI driver's ControllerPublishVolume RPC to attach a provisioned volume to the target node.<br>
+<strong>23.</strong> Why are CSI sidecars separate containers rather than built into the driver? — They implement common, standardized Kubernetes-watching logic so each vendor's driver only needs to implement the storage-specific gRPC calls.<br>
+<strong>24.</strong> What does <code>kubectl get csidrivers</code> show? — The CSI drivers currently registered with the cluster.<br>
+<strong>25.</strong> What does <code>kubectl get volumeattachments</code> tell you? — Which PVs (volumes) are currently attached to which nodes.<br>
+<strong>26.</strong> Why might a Pod using a PVC get stuck in ContainerCreating specifically at the mount step? — The CSI node plugin failed to stage/publish the volume, often due to attach failure, zone mismatch, or permissions.<br>
+<strong>27.</strong> What's a fast way to check if a volume is actually mounted inside a running container? — <code>kubectl exec <pod> -- df -h <mountPath></code>.<br>
+<strong>28.</strong> Why is dynamic provisioning considered the default in virtually every real cluster today? — It removes manual PV pre-creation, scales with demand automatically, and matches how cloud storage APIs already work.<br>
+<strong>29.</strong> When would you still use static PV creation instead of dynamic provisioning? — When importing pre-existing storage (e.g. an existing NFS share or disk snapshot) that must be referenced as-is.<br>
+<strong>30.</strong> What's the risk of hostPath giving a container access to the underlying node? — A compromised or misconfigured container could read/write sensitive host files outside the intended sandbox.<br>
+<strong>31.</strong> Why does hostPath tie a Pod to a specific node? — Because it references the node's local filesystem directly, the same data won't exist if the Pod is scheduled elsewhere.<br>
+<strong>32.</strong> What StorageClass parameter controls provisioning timing relative to Pod scheduling? — <code>volumeBindingMode: WaitForFirstConsumer</code>, which delays provisioning until a Pod using the PVC is scheduled.<br>
+<strong>33.</strong> Why does WaitForFirstConsumer help avoid zone-mismatch issues? — It provisions the volume in the same zone the Pod actually gets scheduled to, instead of guessing ahead of time.<br>
+<strong>34.</strong> What's the difference between reclaim policy Retain and Delete? — Retain keeps the underlying disk (and data) after the PVC is released; Delete destroys it automatically.<br>
+<strong>35.</strong> Why is Recycle reclaim policy considered deprecated? — It was a rudimentary generic scrub-and-reuse mechanism, superseded by dynamic provisioning which just creates fresh volumes instead.<br>
+<strong>36.</strong> What does the PV's <code>spec.csi.driver</code> field identify? — Which CSI driver is responsible for operations on that PV.<br>
+<strong>37.</strong> Can a single Pod mix ephemeral and persistent volumes? — Yes, a Pod spec can declare an emptyDir volume and a PVC-backed volume side by side for different mount paths.<br>
+<strong>38.</strong> Why is CSI described as a "gRPC contract" specifically? — Kubernetes and the storage driver communicate over a defined set of gRPC services (Identity, Controller, Node) rather than a Kubernetes-specific in-tree API.<br>
+<strong>39.</strong> What's a sign that a CSI driver version is incompatible with the cluster's Kubernetes version? — Volume operations failing with RPC errors or the driver Pod crash-looping after a Kubernetes upgrade, per the driver's compatibility matrix.<br>
+<strong>40.</strong> Why treat CSI driver upgrades as a first-class dependency in cluster upgrade planning? — Because all persistent storage operations depend on it; an incompatible driver can break provisioning/mounting cluster-wide.<br>
+<strong>41.</strong> What's a quick command to see all StorageClasses and their default status? — <code>kubectl get storageclass</code> (the default one is annotated in its output).<br>
+<strong>42.</strong> Why might two StorageClasses point to the same CSI provisioner? — To offer different parameters (e.g. disk type, encryption, filesystem) from the same underlying driver.<br>
+<strong>43.</strong> What's a common reason a PVC stays Pending with a dynamic StorageClass configured? — The provisioner/CSI driver Pod is down, misconfigured, or lacks cloud IAM permissions to create the disk.<br>
+<strong>44.</strong> Why is emptyDir a poor choice for anything requiring durability guarantees? — Its entire contents are lost on Pod deletion, with no backing persistent disk at all.<br>
+<strong>45.</strong> How does the PV/PVC model support portability across environments (e.g. dev vs prod)? — The Pod spec stays identical; only the StorageClass/backend referenced by the PVC changes per environment.<br>
+<strong>46.</strong> What's the purpose of <code>kubectl describe pod</code> when troubleshooting storage? — Surfaces volume mount events and scheduling/attach failures directly tied to that Pod.<br>
+<strong>47.</strong> Why does the architecture diagram show StorageClass pointing to PV rather than PVC pointing to PV directly for dynamic cases? — The StorageClass supplies the provisioner and parameters used to create the PV; the PVC then gets bound to that resulting PV.<br>
+<strong>48.</strong> What's a real risk of granting overly broad hostPath access on a shared multi-tenant cluster? — One tenant's Pod could read or tamper with another workload's files or node-level secrets on the same node.<br>
+<strong>49.</strong> Why does CSI separate "Controller" and "Node" plugin responsibilities? — Controller-side operations (create/attach) can run centrally, while Node-side operations (mount/stage) must run on the specific node where the Pod lands.<br>
+<strong>50.</strong> If a stateful workload's data must survive even a full node loss, which storage choice is correct — emptyDir, hostPath, or PVC-backed PV? — A PVC-backed PV on a network-attached backend (e.g. EBS, Ceph), since it exists independently of any single node's lifecycle.
+</div></details>
+
+<footer class="course-footer">Next: Topic 24 — PersistentVolume (lifecycle, reclaim policies, static vs dynamic provisioning).</footer>
+
+<script>
+  mermaid.initialize({ startOnLoad: true, theme: 'dark' });
+</script>
+
+</body>
+</html>

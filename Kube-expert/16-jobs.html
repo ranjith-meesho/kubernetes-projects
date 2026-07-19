@@ -1,0 +1,268 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Topic 16: Jobs — Kubernetes Expert Course</title>
+<link rel="stylesheet" href="styles.css">
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+</head>
+<body>
+
+<header class="course-header">
+  <div class="kicker">Topic 16 of 70</div>
+  <h1>Jobs</h1>
+  <div class="subtitle">Run-to-completion workloads — batch processing with retries, completions, and parallelism, instead of long-running Pods.</div>
+</header>
+
+<nav class="topic-nav">
+  <a href="15-daemonsets.html">&larr; DaemonSets</a>
+  <a href="index.html">Course Index</a>
+  <a href="17-cronjobs.html">CronJobs &rarr;</a>
+</nav>
+
+<h2 id="explanation">Explanation</h2>
+<p>A <strong>Job</strong> manages Pods that are expected to <strong>run to completion</strong> and then stop, rather
+than run forever. Deployments and ReplicaSets are built around the opposite assumption — a Pod exiting is treated as
+a failure to be restarted indefinitely. Batch work (data migrations, report generation, one-off scripts, ML training
+runs, database backups) is fundamentally different: success means the container exits with code 0 and should
+<em>not</em> be restarted, while a non-zero exit should be retried up to a bounded limit, not forever.</p>
+
+<p>Kubernetes needs a distinct object for this because the semantics of "done" don't exist for Deployments at all —
+a Deployment has no concept of success/failure, only "Pod exists and is Ready or not." A Job tracks
+<strong>completions</strong>: how many Pods must exit successfully before the Job itself is considered Done, and
+<strong>parallelism</strong>: how many Pods may run concurrently while working toward that completion count. This
+lets a single Job describe anything from "run this once" (completions=1) to "process this queue with 10 workers
+until 100 successful completions" (completions=100, parallelism=10).</p>
+
+<p>Failure handling is bounded by <code>backoffLimit</code> — the number of retries allowed before the Job gives up
+and marks itself Failed, with exponential backoff between attempts. This prevents a permanently broken batch task
+from consuming cluster resources in an infinite crash loop, which is exactly what would happen if you tried to run
+the same workload under a Deployment.</p>
+
+<p>Job Pods must use <code>restartPolicy: OnFailure</code> or <code>restartPolicy: Never</code> — never
+<code>Always</code> (the Pod-level default), because <code>Always</code> would fight with the Job controller's own
+retry/completion bookkeeping. With <code>OnFailure</code>, a failed container restarts in place within the same Pod;
+with <code>Never</code>, a failed Pod is left as-is and the Job controller creates an entirely new Pod for the retry
+— the latter is preferred when you want failed-attempt logs/state preserved for debugging.</p>
+
+<p>Jobs are the foundation CronJobs build on (a CronJob is simply a Job template plus a schedule), and are also used
+directly for one-off operational tasks: schema migrations before a Deployment rollout, bulk backfills, or
+Helm/Argo Rollouts "pre-install hooks."</p>
+
+<h2 id="internal-working">Internal Working / Interactions</h2>
+<ul>
+  <li><strong>Job controller</strong> (in kube-controller-manager) — watches Job objects, creates Pods up to
+  <code>parallelism</code>, counts successful completions, retries failures up to <code>backoffLimit</code>, and
+  marks the Job Complete or Failed.</li>
+  <li><strong>API Server / etcd</strong> — Job spec/status and every Pod it creates are ordinary watched/persisted
+  objects, same as any controller.</li>
+  <li><strong>Pod restartPolicy</strong> — enforced by kubelet locally; determines whether a failed container
+  restarts in place (OnFailure) or the Pod is left terminal and the Job controller creates a fresh replacement Pod (Never).</li>
+  <li><strong>Scheduler</strong> — schedules each Job Pod exactly like any other Pod; no special-casing for batch workloads.</li>
+  <li><strong>TTL controller</strong> (if <code>ttlSecondsAfterFinished</code> is set) — automatically deletes the
+  Job (and its Pods) some time after completion to avoid clutter.</li>
+</ul>
+
+<h2 id="architecture-diagram">Architecture Diagram</h2>
+<pre class="mermaid">
+flowchart TB
+    J["Job: report-generator\ncompletions: 5\nparallelism: 2\nbackoffLimit: 3"]
+    J -->|running concurrently, up to parallelism| P1["Pod 1 (running)"]
+    J -->|running concurrently, up to parallelism| P2["Pod 2 (running)"]
+    P1 -->|exits 0| C1["Completion 1/5"]
+    P2 -->|exits 1, retried| P2r["Pod 2 retry (attempt 2/3)"]
+    P2r -->|exits 0| C2["Completion 2/5"]
+    C2 -.->|controller starts next Pod| P3["Pod 3"]
+</pre>
+
+<pre class="mermaid">
+stateDiagram-v2
+    [*] --> Active: Job created
+    Active --> Active: Pod succeeds, completions < target
+    Active --> Active: Pod fails, retries < backoffLimit
+    Active --> Complete: completions == target
+    Active --> Failed: retries exhausted (backoffLimit reached)
+    Complete --> [*]
+    Failed --> [*]
+</pre>
+
+<h2 id="code-example">Code Example</h2>
+<pre><code>apiVersion: batch/v1
+kind: Job
+metadata:
+  name: report-generator
+spec:
+  completions: 5              # Total successful Pod completions needed for the Job to be Done.
+  parallelism: 2              # Max Pods running at once while working toward `completions`.
+  backoffLimit: 3             # Give up (mark Failed) after 3 failed attempts.
+  activeDeadlineSeconds: 600   # Hard wall-clock timeout for the whole Job, regardless of retries.
+  ttlSecondsAfterFinished: 3600  # Auto-delete Job + Pods 1 hour after finishing (keeps cluster tidy).
+  template:
+    spec:
+      restartPolicy: OnFailure   # REQUIRED for Jobs: Never or OnFailure, never "Always".
+      containers:
+        - name: report
+          image: registry.internal/report-generator:1.2
+          command: ["python", "generate_report.py"]
+          resources:
+            requests: { cpu: "500m", memory: "512Mi" }
+            limits:   { cpu: "1",    memory: "1Gi" }
+</code></pre>
+
+<h2 id="kubectl-commands">kubectl Commands</h2>
+<pre><code># Create a Job directly from an image (quick ad-hoc task)
+kubectl create job manual-run --image=busybox -- echo "hello"
+
+# List Jobs and their completion status
+kubectl get jobs
+
+# Show detailed status, conditions, and retry events
+kubectl describe job report-generator
+
+# Follow logs of a Job's Pod(s)
+kubectl logs -l job-name=report-generator --all-containers -f
+
+# Delete a Job and its Pods (needed before re-running with the same name)
+kubectl delete job report-generator
+
+# Watch active/succeeded/failed Pod counts live
+kubectl get pods -l job-name=report-generator -w
+</code></pre>
+
+<h2 id="best-practices">Best Practices &amp; Common Pitfalls</h2>
+<div class="grid-2">
+<div>
+<h4>Best Practices</h4>
+<ul>
+  <li>Always set <code>activeDeadlineSeconds</code> to bound total runtime regardless of retry count.</li>
+  <li>Use <code>ttlSecondsAfterFinished</code> to auto-clean completed Jobs instead of accumulating them forever.</li>
+  <li>Make the workload idempotent — retries mean the same unit of work may execute more than once.</li>
+  <li>Use <code>restartPolicy: Never</code> when you want each failed attempt's logs preserved as a separate Pod for debugging.</li>
+</ul>
+</div>
+<div>
+<h4>Pitfalls</h4>
+<ul>
+  <li>Setting <code>restartPolicy: Always</code>, which is rejected/nonsensical for Job Pods.</li>
+  <li>Forgetting <code>backoffLimit</code> defaults to 6 — a broken task retries 6 times with growing backoff before you notice.</li>
+  <li>Reusing a Job name after it completed without deleting it first — the API Server rejects the immutable-selector conflict.</li>
+  <li>Not accounting for at-least-once execution semantics, leading to duplicate side effects (double-charging, double-emailing) on retries.</li>
+</ul>
+</div>
+</div>
+
+<h2 id="interview-questions">50 Interview Questions</h2>
+
+<details class="qa"><summary>1. Why do Deployments treat a Pod exiting as a failure while Jobs don't?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Deployments assume a Pod should run forever; Jobs are built around the opposite assumption — success means the container exits with code 0 and should not restart.
+<br><strong>Detailed explanation:</strong> A Job tracks a fundamentally different lifecycle than a Deployment — completions rather than continuous availability — so the same "Pod exited" event means success under a Job and failure under a Deployment.
+<br><strong>Production example:</strong> A database backup script running under a Job exits 0 when finished and is correctly never restarted; the same script under a Deployment would be endlessly relaunched.
+<br><strong>Common mistake:</strong> Running a one-off batch script under a Deployment and being confused why it keeps restarting after finishing successfully.</div></details>
+
+<details class="qa"><summary>2. What's the difference between completions and parallelism on a Job?</summary>
+<div class="qa-body"><strong>Short answer:</strong> completions is the total number of successful Pod exits needed for the Job to be Done; parallelism is how many Pods may run concurrently while working toward that total.
+<br><strong>Detailed explanation:</strong> This lets one Job spec describe anything from "run once" (completions=1) to "process a queue with 10 concurrent workers until 100 successes" (completions=100, parallelism=10).
+<br><strong>Production example:</strong> A report-generator Job with completions=5, parallelism=2 always has at most 2 Pods running at once, launching a new one as each prior one succeeds, until 5 total successes are reached.
+<br><strong>Common mistake:</strong> Setting parallelism higher than completions and being surprised extra concurrent Pods simply aren't created beyond what's needed.</div></details>
+
+<details class="qa"><summary>3. Why must Job Pods use restartPolicy: OnFailure or Never, never Always?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Always would fight with the Job controller's own retry/completion bookkeeping, since kubelet would keep restarting the container regardless of the Job's tracked attempt count.
+<br><strong>Detailed explanation:</strong> The Job controller needs to own retry semantics (bounded by backoffLimit) at the Pod level, not have kubelet independently and indefinitely restarting containers underneath it.
+<br><strong>Production example:</strong> Setting restartPolicy: Always on a Job spec causes the API Server to reject it as invalid — this is enforced, not just discouraged.
+<br><strong>Common mistake:</strong> Copy-pasting a Deployment's Pod template (which often omits restartPolicy, defaulting to Always) directly into a Job spec.</div></details>
+
+<details class="qa"><summary>4. What's the practical difference between restartPolicy: OnFailure and Never for a Job?</summary>
+<div class="qa-body"><strong>Short answer:</strong> OnFailure restarts the failed container in place within the same Pod; Never leaves the failed Pod as-is and the Job controller creates an entirely new Pod for the retry.
+<br><strong>Detailed explanation:</strong> Never preserves each failed attempt's logs and final state as a separate Pod object, which is valuable for debugging exactly what happened on each retry; OnFailure is more resource-efficient but overwrites in-place.
+<br><strong>Production example:</strong> A flaky data-migration Job set to Never leaves 3 failed Pod objects behind after 3 retries, each independently inspectable via <code>kubectl logs</code>.
+<br><strong>Common mistake:</strong> Using OnFailure for a task where preserving each failure's distinct logs matters for post-incident debugging.</div></details>
+
+<details class="qa"><summary>5. Why does backoffLimit exist, and what happens when it's exhausted?</summary>
+<div class="qa-body"><strong>Short answer:</strong> It bounds the number of retries before the Job gives up and marks itself Failed, with exponential backoff between attempts.
+<br><strong>Detailed explanation:</strong> Without this bound, a permanently broken batch task (bad config, unreachable dependency) would retry forever, consuming cluster resources in an infinite crash loop — exactly what would happen running the same workload under a Deployment.
+<br><strong>Production example:</strong> A Job with a typo'd database hostname exhausts its default backoffLimit of 6 within minutes and is marked Failed rather than looping indefinitely.
+<br><strong>Common mistake:</strong> Forgetting backoffLimit defaults to 6, not noticing a broken task quietly retried 6 times with growing delays before failing.</div></details>
+
+<details class="qa"><summary>6. Why is idempotency important for Job workloads specifically?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Retries mean the same unit of work may execute more than once — Jobs only guarantee at-least-once execution, not exactly-once.
+<br><strong>Detailed explanation:</strong> Any side effect performed by a Job Pod (charging a customer, sending an email, writing a file) can happen multiple times across retries unless the workload itself is designed to detect and skip already-completed work.
+<br><strong>Production example:</strong> A billing Job that isn't idempotent could double-charge a customer if its Pod is retried after a transient network failure right after the charge succeeded but before the Job recorded success.
+<br><strong>Common mistake:</strong> Assuming Kubernetes guarantees exactly-once semantics for Job completions — it does not.</div></details>
+
+<details class="qa"><summary>7. What does activeDeadlineSeconds bound, and how does it differ from backoffLimit?</summary>
+<div class="qa-body"><strong>Short answer:</strong> It's a hard wall-clock timeout for the entire Job regardless of retry count, while backoffLimit bounds the number of retry attempts.
+<br><strong>Detailed explanation:</strong> A Job could stay within its backoffLimit but still run for an unacceptably long total time (e.g. many slow retries); activeDeadlineSeconds catches that case by terminating the whole Job once the wall-clock limit is hit.
+<br><strong>Production example:</strong> <code>activeDeadlineSeconds: 600</code> forcibly ends a report-generator Job after 10 minutes total, even if it hasn't exhausted its backoffLimit yet.
+<br><strong>Common mistake:</strong> Setting only backoffLimit and assuming that alone bounds total Job runtime — it doesn't, since backoff delays grow between attempts.</div></details>
+
+<details class="qa"><summary>8. Why is ttlSecondsAfterFinished useful, and what does it clean up?</summary>
+<div class="qa-body"><strong>Short answer:</strong> It auto-deletes the Job object (and its Pods) some time after completion, preventing clutter from accumulating completed Jobs.
+<br><strong>Detailed explanation:</strong> Without it, every completed Job stays in etcd indefinitely unless manually deleted, which adds up fast for frequently-run batch tasks and wastes storage/watch overhead.
+<br><strong>Production example:</strong> <code>ttlSecondsAfterFinished: 3600</code> keeps a completed report-generator Job around for an hour (enough time to check logs) before it's automatically garbage collected.
+<br><strong>Common mistake:</strong> Not setting it at all, letting hundreds of completed Job objects pile up over months of routine batch runs.</div></details>
+
+<details class="qa"><summary>9. Why can't you simply re-run a Job by reapplying the same manifest after it completes?</summary>
+<div class="qa-body"><strong>Short answer:</strong> The API Server rejects reusing the same Job name while the old completed Job object still exists — you must delete it first.
+<br><strong>Detailed explanation:</strong> Job objects (and their generated Pod selectors) aren't designed for in-place restart the way a CronJob's generated Jobs are — each Job name is meant to represent one run's lifecycle from start to finish.
+<br><strong>Production example:</strong> Re-triggering a manually created <code>report-generator</code> Job for a second run requires <code>kubectl delete job report-generator</code> before reapplying the manifest.
+<br><strong>Common mistake:</strong> Trying to kubectl apply the same Job manifest twice to "rerun" it and hitting an immutable-field conflict error.</div></details>
+
+<details class="qa"><summary>10. How do Jobs relate to CronJobs architecturally?</summary>
+<div class="qa-body"><strong>Short answer:</strong> A CronJob is simply a Job template plus a time-based schedule — it creates ordinary Job objects on each tick, and Job semantics (completions, parallelism, backoffLimit) apply identically.
+<br><strong>Detailed explanation:</strong> This means everything you learn about a standalone Job — retry bounds, idempotency requirements, restartPolicy rules — carries over unchanged to every Job a CronJob generates; the CronJob layer only adds scheduling and concurrency-policy logic on top.
+<br><strong>Production example:</strong> A nightly-backup CronJob's generated Job still needs its own backoffLimit and activeDeadlineSeconds set correctly, exactly as a manually created Job would.
+<br><strong>Common mistake:</strong> Assuming a CronJob has fundamentally different failure/retry semantics from a plain Job — it doesn't; it just automates Job creation on a timer.</div></details>
+
+<details class="qa"><summary>11–50. Additional rapid-fire questions</summary>
+<div class="qa-body">
+<strong>11.</strong> What API group/version is Job under? — <code>batch/v1</code>.<br>
+<strong>12.</strong> What's the default value of backoffLimit? — 6.<br>
+<strong>13.</strong> What's the default value of parallelism if unset? — 1 (sequential, one Pod at a time).<br>
+<strong>14.</strong> What's the default value of completions if unset? — 1 — a single successful Pod completion finishes the Job.<br>
+<strong>15.</strong> How do you create a quick ad-hoc Job without a YAML file? — <code>kubectl create job &lt;name&gt; --image=&lt;image&gt; -- &lt;command&gt;</code>.<br>
+<strong>16.</strong> What label does the Job controller add to its Pods for log/selection purposes? — <code>job-name</code>, matching the Job's own name.<br>
+<strong>17.</strong> How do you follow logs across all Pods of a Job? — <code>kubectl logs -l job-name=&lt;name&gt; --all-containers -f</code>.<br>
+<strong>18.</strong> What happens if you delete a Job while it's still Active? — Its Pods are also deleted (cascading), terminating in-progress work immediately.<br>
+<strong>19.</strong> Is Job namespaced or cluster-scoped? — Namespaced.<br>
+<strong>20.</strong> Does the Scheduler treat Job Pods any differently from other Pods? — No — normal filter/score scheduling applies with no batch-specific special-casing.<br>
+<strong>21.</strong> What's the purpose of the TTL controller for Jobs? — Deletes the Job (and its Pods) automatically once ttlSecondsAfterFinished elapses after completion.<br>
+<strong>22.</strong> Can a Job's Pod template include multiple containers? — Yes, same as any Pod spec — but the Job only tracks completion based on the Pod's overall phase, not per-container exit codes individually (unless using specific completion modes).<br>
+<strong>23.</strong> What's completionMode: Indexed used for? — Gives each Pod in a parallel Job a fixed completion index (0..N-1), useful for partitioned/sharded batch work.<br>
+<strong>24.</strong> Why would Indexed completion mode matter for a data-processing Job? — Each worker Pod can use its index to deterministically process a specific shard/partition of the input data.<br>
+<strong>25.</strong> What happens to a Job's status when completions is reached? — It transitions to Complete, and no further Pods are created.<br>
+<strong>26.</strong> What field tracks a Job's succeeded Pod count? — <code>status.succeeded</code>.<br>
+<strong>27.</strong> What field tracks a Job's failed Pod count? — <code>status.failed</code>.<br>
+<strong>28.</strong> Can you pause a running Job the way you can pause a Deployment rollout? — Yes, indirectly — set <code>spec.suspend: true</code>, which stops creating new Pods without deleting existing ones or the Job object.<br>
+<strong>29.</strong> What's a real use of spec.suspend on a Job? — Temporarily halting a batch task during a maintenance window without losing its configuration/history.<br>
+<strong>30.</strong> Does a Job support rolling updates like a Deployment? — No — Jobs run to completion once; there's no concept of updating a "live" Job's template mid-run.<br>
+<strong>31.</strong> How would you change a Job's image after creation? — You can't update most fields on a running Job — you'd delete and recreate it (or let a CronJob generate the next run with a new template).<br>
+<strong>32.</strong> What's the risk of not setting resource requests on a batch Job? — The Scheduler can't place it predictably alongside other workloads, and it may starve or be starved by co-located Pods.<br>
+<strong>33.</strong> Why might a Job's Pods fail to schedule at all? — Insufficient cluster capacity for its resource requests — they'll stay Pending, counting against the Job's overall progress/timeout.<br>
+<strong>34.</strong> What's a common pattern for pre-deployment schema migrations? — Running a one-off Job (completions=1) before triggering the actual Deployment rollout, often as a Helm/Argo pre-install/pre-upgrade hook.<br>
+<strong>35.</strong> Why is a Job well-suited as a Helm pre-install hook? — Its run-to-completion semantics map naturally onto "do this setup step once, then proceed" — unlike a long-running Deployment.<br>
+<strong>36.</strong> What happens if a Job's Pod is OOMKilled? — Counted as a failure, retried according to restartPolicy/backoffLimit like any other failure mode.<br>
+<strong>37.</strong> Can multiple Jobs share the same selector/labels safely? — Not recommended — the Job controller manages Pods it created via ownerReferences, and overlapping labels risk the same adoption confusion seen with ReplicaSets.<br>
+<strong>38.</strong> What's the effect of setting parallelism higher than available cluster capacity? — Only as many Pods as can actually schedule run concurrently; the rest queue as Pending until capacity frees up.<br>
+<strong>39.</strong> How do you check why a specific retry attempt of a Job failed? — <code>kubectl describe job</code> for events plus <code>kubectl logs</code> on the specific failed Pod (especially useful with restartPolicy: Never).<br>
+<strong>40.</strong> What's a good default activeDeadlineSeconds strategy? — Set it generously above expected worst-case runtime, but always set something — an unbounded Job can hang indefinitely on a stuck dependency.<br>
+<strong>41.</strong> Does a Job guarantee Pods run on different nodes? — No — no anti-affinity is applied by default; all parallel Pods could land on the same node unless you add constraints.<br>
+<strong>42.</strong> What's the interaction between a Job and PodDisruptionBudgets? — Job Pods aren't typically covered by PDBs since they're expected to be transient — voluntary disruption protection matters far less for run-to-completion workloads.<br>
+<strong>43.</strong> Can a Job reference a ConfigMap/Secret the same way any Pod can? — Yes — identical volume/env-var mechanisms as any workload type.<br>
+<strong>44.</strong> What's a subtle gotcha with parallelism and shared external resources (e.g. a queue)? — Concurrent workers must coordinate themselves (e.g. via the queue's own locking) — the Job controller provides no built-in mutual exclusion between parallel Pods.<br>
+<strong>45.</strong> How does exponential backoff behave between Job retries? — Delay roughly doubles per retry (10s, 20s, 40s...) up to a cap, spacing out repeated failures instead of hammering immediately.<br>
+<strong>46.</strong> What happens if the node running a Job's Pod fails mid-execution? — The Pod is rescheduled elsewhere and the attempt is generally counted toward retries, depending on how far execution had progressed.<br>
+<strong>47.</strong> Why is "at-least-once, not exactly-once" a common interview trap? — Candidates often assume Kubernetes guarantees a task runs exactly once — it doesn't, and workload design must account for that.<br>
+<strong>48.</strong> What's the purpose of labels like batch.kubernetes.io/job-name on Pods? — Standardized labeling (alongside the plain job-name label in some versions) so tooling can reliably select a Job's Pods.<br>
+<strong>49.</strong> Can a Job's Pods be part of a Service for internal communication? — Uncommon and not typical — Jobs are meant to run to completion, not serve ongoing traffic that a Service would route to.<br>
+<strong>50.</strong> What's the first thing to check when a Job shows Failed with 0 completions? — <code>kubectl describe job</code> for the failure reason (BackoffLimitExceeded, DeadlineExceeded) and the last failed Pod's logs/events.
+</div></details>
+
+<footer class="course-footer">Next: Topic 17 — CronJobs, which schedule Jobs to run on a recurring time-based schedule.</footer>
+
+<script>
+  mermaid.initialize({ startOnLoad: true, theme: 'dark' });
+</script>
+
+</body>
+</html>

@@ -1,0 +1,301 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Topic 64: Disaster Recovery — Kubernetes Expert Course</title>
+<link rel="stylesheet" href="styles.css">
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+</head>
+<body>
+
+<header class="course-header">
+  <div class="kicker">Topic 64 of 70</div>
+  <h1>Disaster Recovery</h1>
+  <div class="subtitle">Turning backups into a rehearsed plan: RTO/RPO targets, multi-region strategy, and a runbook a tired on-call engineer can follow.</div>
+</header>
+
+<nav class="topic-nav">
+  <a href="63-backup-restore.html">&larr; Backup &amp; Restore</a>
+  <a href="index.html">Course Index</a>
+  <a href="65-cluster-upgrade.html">Cluster Upgrade &rarr;</a>
+</nav>
+
+<h2 id="explanation">Explanation</h2>
+<p>Disaster Recovery (DR) is what backups become once you attach two numbers to them and rehearse the process: RTO
+and RPO. <strong>RPO (Recovery Point Objective)</strong> is how much data you can afford to lose, measured in time —
+if your RPO is 15 minutes, your backup/replication cadence must never leave a gap wider than that. <strong>RTO
+(Recovery Time Objective)</strong> is how long you can afford to be down before service is restored — if your RTO is
+30 minutes, your entire failover procedure, from detection to traffic serving again, must fit inside that window.
+These two numbers should come from the business, not from engineering convenience, and they directly dictate your
+architecture: a 5-minute RTO effectively forces an active-active multi-region setup, because no cold-start recovery
+process — however well-scripted — reliably completes that fast under real incident stress.</p>
+
+<p>In Kubernetes terms, DR strategies sit on a spectrum. <strong>Backup &amp; restore</strong> (the cheapest, slowest)
+means you keep etcd snapshots and Velero backups and, on disaster, stand up a brand-new cluster and restore into it —
+RTO measured in hours, RPO bounded by your backup interval. <strong>Pilot light</strong> means a minimal standby
+cluster already exists in a second region with core infrastructure (networking, IAM, cluster itself) pre-provisioned
+but scaled to near-zero, and you scale it up and restore data on failover — faster RTO, still not instant.
+<strong>Warm standby</strong> keeps a scaled-down but fully running replica environment continuously synced (e.g. via
+database replication and continuous Velero/GitOps sync), so failover is mostly a traffic cutover plus a scale-up.
+<strong>Active-active / multi-region</strong> runs full production traffic in two or more regions simultaneously with
+data replicated continuously (or fully partitioned by geography) — highest cost and complexity, but sub-minute RTO
+and near-zero RPO.</p>
+
+<p>Crucially, Kubernetes itself is rarely the actual bottleneck in DR — cluster manifests can be reapplied from Git in
+minutes via GitOps. The hard part is almost always <strong>stateful data</strong>: databases, message queues, object
+stores. Your Kubernetes DR plan is only as good as your data replication strategy (cross-region RDS/Cloud SQL
+replicas, Kafka MirrorMaker, cross-region S3 replication) — designing the cluster failover without designing the
+data failover is designing half a plan.</p>
+
+<p>A DR plan that lives only in a document is not a DR plan — it's a wish. The only reliable way to know your RTO/RPO
+numbers are real is to run scheduled <strong>game days</strong>: actually fail over a non-critical (or, eventually,
+a critical) service to the DR region, time every step, and fix whatever breaks. Untested DR runbooks reliably fail
+in production because the failure that triggers DR is usually not the one anyone rehearsed for — DNS TTLs that
+didn't actually expire, IAM roles that don't exist in the second region, a Terraform state file nobody can find.</p>
+
+<p>A good runbook is written for the 3 AM version of your on-call engineer: numbered steps, exact commands, explicit
+decision points ("if X, go to step 7; if Y, escalate to Y"), and a clearly named incident commander role. It should
+assume no memory of the underlying architecture and no time to read documentation — every ambiguity in a runbook is
+a minute added to your real-world RTO.</p>
+
+<h2 id="internal-working">Internal Working / Interactions</h2>
+<ul>
+  <li><strong>Detection:</strong> monitoring/alerting (Prometheus + Alertmanager, cloud health checks) declares the
+  primary region/cluster down and pages the incident commander.</li>
+  <li><strong>Decision:</strong> incident commander confirms it's a real regional/cluster failure (not a transient
+  blip) and formally invokes the DR runbook — this human checkpoint prevents flapping/false failovers.</li>
+  <li><strong>Data cutover:</strong> promote the DR-region database replica to primary; confirm replication lag was
+  within RPO at time of failure.</li>
+  <li><strong>Cluster/app bring-up:</strong> GitOps controller (ArgoCD/Flux) already tracking the DR cluster
+  reconciles it to the latest manifests, or Velero restores from the last backup if it wasn't already warm.</li>
+  <li><strong>Traffic cutover:</strong> DNS (with a pre-lowered TTL) or global load balancer shifts traffic to the DR
+  region; health checks confirm the new region is actually serving correctly before full cutover.</li>
+  <li><strong>Post-incident:</strong> once primary region recovers, a deliberate fail-back procedure (not a rushed
+  one) restores original topology.</li>
+</ul>
+
+<h2 id="architecture-diagram">Architecture Diagram</h2>
+<pre class="mermaid">
+flowchart LR
+  subgraph Primary["Primary Region (us-east-1)"]
+    P1[EKS Cluster]
+    PDB[(Primary DB)]
+    P1 --- PDB
+  end
+  subgraph DR["DR Region (us-west-2) - warm standby"]
+    D1[EKS Cluster<br/>scaled down]
+    DDB[(Replica DB)]
+    D1 --- DDB
+  end
+
+  PDB -- continuous async replication --> DDB
+  GitOps[GitOps Repo] -.-> P1
+  GitOps -.-> D1
+
+  GLB[Global Load Balancer / DNS]
+  GLB -- normal traffic --> P1
+  GLB -. failover .-> D1
+
+  Alert[Monitoring / Alertmanager] -- detects outage --> IC[Incident Commander]
+  IC -- invoke runbook --> Promote[Promote DR DB to primary]
+  Promote --> ScaleUp[Scale up DR cluster workloads]
+  ScaleUp --> Cutover[Cut DNS/GLB to DR region]
+</pre>
+
+<h2 id="code-example">Code Example</h2>
+<pre><code>#############################################
+# 1. Runbook excerpt (as executable-ish steps)
+#############################################
+# STEP 1 - Confirm primary region outage (not a false alarm)
+kubectl --context=primary cluster-info                 # expect timeout/error
+curl -sf https://primary.example.com/healthz || echo "PRIMARY CONFIRMED DOWN"
+
+# STEP 2 - Promote DR database replica (RDS example)
+aws rds promote-read-replica \
+  --db-instance-identifier orders-db-dr-replica \      # turns the standby into a writable primary
+  --region us-west-2
+
+# STEP 3 - Point DR cluster's app config at the newly-promoted DB
+kubectl --context=dr -n orders set env deployment/orders-api \
+  DB_HOST=orders-db-dr-replica.us-west-2.rds.amazonaws.com
+
+# STEP 4 - Scale DR workloads from warm-standby size to full production size
+kubectl --context=dr -n orders scale deployment/orders-api --replicas=20
+
+# STEP 5 - Cut traffic over via Route53 weighted/failover record
+aws route53 change-resource-record-sets \
+  --hosted-zone-id ZONEID \
+  --change-batch file://failover-to-dr.json           # flips weight from primary to DR region
+
+# STEP 6 - Verify DR is serving correctly before declaring recovery complete
+curl -sf https://api.example.com/healthz
+
+---
+# 2. Route53 failover record (declarative form referenced above)
+{
+  "Comment": "Fail over orders-api to DR region",
+  "Changes": [{
+    "Action": "UPSERT",
+    "ResourceRecordSet": {
+      "Name": "api.example.com",
+      "Type": "A",
+      "SetIdentifier": "dr-region",
+      "Failover": "PRIMARY",              # promote DR record to primary role
+      "TTL": 30,                          # low TTL, pre-set well before any incident
+      "ResourceRecords": [{ "Value": "203.0.113.10" }]
+    }
+  }]
+}
+</code></pre>
+
+<h2 id="kubectl-cli-commands">kubectl / CLI Commands</h2>
+<pre><code># Confirm current context / verify you're targeting the right cluster during DR
+kubectl config get-contexts
+kubectl config use-context dr-cluster
+
+# Check GitOps sync status on the DR cluster (should already be tracking latest manifests)
+argocd app list
+argocd app sync orders-api --grpc-web
+
+# Force a restore from the last Velero backup if DR cluster wasn't kept warm
+velero restore create --from-backup orders-ns-nightly-20260719
+
+# Verify replica lag before trusting an RPO number during a real incident
+kubectl --context=primary -n orders exec -it orders-db-0 -- psql -c "SELECT now() - pg_last_xact_replay_timestamp();"
+
+# Scale DR workloads up as part of cutover
+kubectl --context=dr -n orders scale deployment/orders-api --replicas=20
+
+# Watch rollout status to confirm DR pods are actually healthy, not just created
+kubectl --context=dr -n orders rollout status deployment/orders-api
+</code></pre>
+
+<h2 id="best-practices">Best Practices &amp; Common Pitfalls</h2>
+<div class="grid-2">
+  <div class="lab-card">
+    <h4>Best Practices</h4>
+    <ul>
+      <li>Get RTO/RPO numbers from the business first — let them drive architecture, not the reverse.</li>
+      <li>Run scheduled game days that actually fail over a real (low-risk) service end to end.</li>
+      <li>Pre-lower DNS TTLs well before an incident, not during one.</li>
+      <li>Write runbooks as numbered, unambiguous steps with named decision points and an incident commander role.</li>
+      <li>Design data replication (databases, queues, object storage) as carefully as cluster failover.</li>
+    </ul>
+  </div>
+  <div class="lab-card">
+    <h4>Common Pitfalls</h4>
+    <ul>
+      <li>Treating "we have backups" as equivalent to "we have a DR plan."</li>
+      <li>Never rehearsing failover, so the runbook fails on assumptions nobody checked.</li>
+      <li>Forgetting IAM roles, secrets, and Terraform state need to exist and work in the DR region too.</li>
+      <li>DNS TTLs left high, silently adding minutes to real-world RTO during cutover.</li>
+      <li>No clearly defined fail-back procedure, causing a rushed, error-prone return to primary.</li>
+    </ul>
+  </div>
+</div>
+
+<h2 id="interview-questions">50 Interview Questions</h2>
+
+<details class="qa"><summary>1. What are RTO and RPO, and why must they come from the business rather than engineering?</summary>
+<div class="qa-body"><strong>Short answer:</strong> RPO is how much data loss (in time) is acceptable; RTO is how long the service can be down. They must come from the business because they directly dictate architecture cost.
+<br><strong>Detail:</strong> A 5-minute RTO effectively forces active-active multi-region, since no cold-start recovery process reliably completes that fast under real incident stress — that's an architecture decision with real cost, not an engineering nicety.
+<br><strong>Production example:</strong> A payments team with a 15-minute RPO requirement must ensure database replication lag never exceeds that gap, which directly constrains their replication technology choice.
+<br><strong>Common mistake:</strong> Engineering picking RTO/RPO numbers unilaterally without validating them against what the business can actually tolerate financially/reputationally.</div></details>
+
+<details class="qa"><summary>2. What are the four points on the DR strategy spectrum, from cheapest to most expensive?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Backup &amp; restore, pilot light, warm standby, and active-active/multi-region.
+<br><strong>Detail:</strong> Each step trades cost/complexity for faster RTO/RPO: backup-restore has RTO in hours; pilot light pre-provisions core infra but scales near-zero; warm standby keeps a synced scaled-down replica; active-active runs full production traffic in two-plus regions simultaneously.
+<br><strong>Production example:</strong> A non-critical internal tool might use backup-restore DR, while a checkout service might justify warm standby or active-active given revenue impact of downtime.
+<br><strong>Common mistake:</strong> Choosing active-active for every service regardless of criticality, needlessly multiplying cost and operational complexity.</div></details>
+
+<details class="qa"><summary>3. Why is Kubernetes itself rarely the actual bottleneck in a DR event?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Cluster manifests can be reapplied from Git in minutes via GitOps — the hard part is almost always stateful data (databases, queues, object stores).
+<br><strong>Detail:</strong> Designing cluster failover without designing data failover (cross-region DB replicas, Kafka MirrorMaker, cross-region S3 replication) is designing only half a DR plan.
+<br><strong>Production example:</strong> An ArgoCD-tracked DR cluster can reconcile to the latest manifests almost instantly, but the failover is only meaningful once the promoted database replica has usable, current data.
+<br><strong>Common mistake:</strong> Treating "our manifests are in Git" as equivalent to having solved DR, while data replication is left as an afterthought.</div></details>
+
+<details class="qa"><summary>4. Why are DR game days considered mandatory rather than optional?</summary>
+<div class="qa-body"><strong>Short answer:</strong> A DR plan that lives only in a document is a wish, not a plan — untested runbooks reliably fail on assumptions nobody checked (expired DNS TTLs, missing IAM roles in the DR region, lost Terraform state).
+<br><strong>Detail:</strong> The failure that triggers a real DR event is usually not the one anyone rehearsed for, so game days surface these gaps before a real incident does.
+<br><strong>Production example:</strong> A scheduled game day fails over a non-critical service end to end, timing every step, and fixes discovered issues before repeating with more critical services.
+<br><strong>Common mistake:</strong> Writing a detailed runbook once and never actually executing it against a real (even if low-risk) failover.</div></details>
+
+<details class="qa"><summary>5. What makes a DR runbook usable by "the 3 AM version" of an on-call engineer?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Numbered steps, exact commands, explicit decision points, and a clearly named incident commander role — assuming no memory of the architecture and no time to read docs.
+<br><strong>Detail:</strong> Every ambiguity in a runbook is a minute added to real-world RTO, so vague guidance like "check if the database looks healthy" must be replaced with an exact command and expected output.
+<br><strong>Production example:</strong> A runbook step reads exactly: <code>curl -sf https://primary.example.com/healthz || echo "PRIMARY CONFIRMED DOWN"</code>, not "verify the primary is actually down."
+<br><strong>Common mistake:</strong> Writing runbooks assuming the reader has the same context as the author, which fails precisely when a less-familiar engineer is on call.</div></details>
+
+<details class="qa"><summary>6. Why does the incident commander role exist as a human checkpoint before invoking failover?</summary>
+<div class="qa-body"><strong>Short answer:</strong> To confirm it's a real regional/cluster failure, not a transient blip, before triggering a potentially disruptive failover.
+<br><strong>Detail:</strong> Automating failover fully without a human confirmation step risks flapping — failing over and back repeatedly on transient network issues, which is often worse than a brief real outage.
+<br><strong>Production example:</strong> Monitoring pages the incident commander, who confirms via multiple signals (not just one alert) before formally invoking the DR runbook.
+<br><strong>Common mistake:</strong> Fully automating regional failover without any human-in-the-loop checkpoint, causing false-positive failovers during normal network jitter.</div></details>
+
+<details class="qa"><summary>7. Why must DNS TTLs be pre-lowered well before an incident, not during one?</summary>
+<div class="qa-body"><strong>Short answer:</strong> A high TTL set at incident time still takes as long as the old TTL to propagate — you can't retroactively speed up caches that already have the old value.
+<br><strong>Detail:</strong> Every minute of un-expired TTL is a minute of users still hitting the failed primary region, directly and silently inflating your real-world RTO.
+<br><strong>Production example:</strong> A Route53 failover record is configured with a 30-second TTL as a standing configuration, not something set only when an incident starts.
+<br><strong>Common mistake:</strong> Leaving production DNS TTLs at defaults (often minutes to hours) and only noticing the cost during a real failover.</div></details>
+
+<details class="qa"><summary>8. Why is a fail-back procedure just as important to design as the failover procedure?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Without a deliberate fail-back plan, returning to the primary region becomes rushed and error-prone once it recovers, risking a second incident right after resolving the first.
+<br><strong>Detail:</strong> Fail-back involves its own data reconciliation (which region has the authoritative latest data?) and cutover sequencing that deserves the same rigor as the original failover.
+<br><strong>Production example:</strong> After primary region recovery, the team runs a scheduled, deliberate fail-back window rather than immediately flipping DNS back the moment the primary looks healthy.
+<br><strong>Common mistake:</strong> Treating DR as "done" once failover succeeds, then improvising fail-back under time pressure with no rehearsed steps.</div></details>
+
+<details class="qa"><summary>9–50. Additional rapid-fire questions</summary>
+<div class="qa-body">
+<strong>9.</strong> What DR tier best fits a service where downtime directly costs significant revenue every minute? — Active-active/multi-region, given its sub-minute RTO and near-zero RPO.<br>
+<strong>10.</strong> Why is "pilot light" faster than pure backup-restore but not instant? — Core infrastructure (networking, IAM, cluster) is pre-provisioned, avoiding cold-start time, but data/scale-up still takes real time.<br>
+<strong>11.</strong> What's the role of a GitOps controller (ArgoCD/Flux) in a DR cutover? — It reconciles the DR cluster to the latest tracked manifests automatically, removing manual manifest reapplication from the critical path.<br>
+<strong>12.</strong> Why check database replication lag before trusting your RPO number during an incident? — Actual lag at the moment of failure — not your target RPO — determines real data loss; you must verify, not assume.<br>
+<strong>13.</strong> What AWS command promotes a read replica to a standalone writable primary? — <code>aws rds promote-read-replica</code>.<br>
+<strong>14.</strong> Why use a global load balancer or Route53 failover record instead of manual DNS edits during a real incident? — Pre-configured failover mechanisms execute faster and more reliably than ad-hoc manual changes under incident pressure.<br>
+<strong>15.</strong> What's the purpose of scaling DR workloads up as part of cutover rather than running them at full size continuously? — Cost control in warm-standby designs — full-size DR capacity is only needed once failover actually happens.<br>
+<strong>16.</strong> Why verify DR is serving correctly before declaring recovery complete? — A cutover that "completed" technically but serves errors is not actually a recovered service — health verification is the real completion signal.<br>
+<strong>17.</strong> What's a common DR failure mode involving IAM? — IAM roles/policies that exist in the primary region but were never replicated/created in the DR region.<br>
+<strong>18.</strong> Why is a missing/inaccessible Terraform state file a realistic DR-day failure? — If infrastructure-as-code state lives only in the primary region's backend, rebuilding DR infrastructure can be blocked exactly when you need it most.<br>
+<strong>19.</strong> What's the difference between RTO and MTTR in this context? — RTO is a target/requirement; MTTR (mean time to recovery) is the measured actual outcome — game days compare the two.<br>
+<strong>20.</strong> Why should DR runbooks include explicit "if X, go to step N; if Y, escalate" decision points? — Removes ambiguity and judgment calls under stress, which is where untrained improvisation causes costly delays.<br>
+<strong>21.</strong> What's the first step in most DR runbooks, before any failover action? — Confirming the outage is real (not a false alarm) via an independent health check against the primary.<br>
+<strong>22.</strong> Why does Kafka MirrorMaker matter to a Kubernetes-based DR plan? — It replicates message queue state cross-region, covering a stateful dependency that cluster manifest reapplication alone cannot address.<br>
+<strong>23.</strong> What's a good cadence for running DR game days? — Regular and scheduled (not "whenever we get to it"), often quarterly or per major architecture change, to catch drift before a real incident.<br>
+<strong>24.</strong> Why does active-active require the most careful data-conflict design? — Writes can happen simultaneously in multiple regions, requiring conflict resolution or geographic partitioning strategies that warm standby/pilot light don't need.<br>
+<strong>25.</strong> What's the risk of never testing the specific DR runbook step that scales up workloads? — Untested scale-up may hit quota limits, missing node capacity, or autoscaler misconfiguration exactly when you need capacity fastest.<br>
+<strong>26.</strong> Why should a DR plan name specific roles (incident commander) rather than "whoever's available"? — Clear ownership prevents delay and confusion during a high-stress event where every minute counts toward RTO.<br>
+<strong>27.</strong> What's a realistic RTO for a backup-and-restore DR strategy? — Hours — bounded by cluster stand-up time, Velero/etcd restore time, and DNS propagation.<br>
+<strong>28.</strong> Why can't Kubernetes manifests alone guarantee DR readiness? — They describe desired application state, but say nothing about whether the underlying data (databases, queues) is actually replicated and current.<br>
+<strong>29.</strong> What's the purpose of `argocd app sync` during a DR cutover? — Forces immediate reconciliation of the DR cluster to the latest manifests rather than waiting for the normal sync interval.<br>
+<strong>30.</strong> Why should DR plans specify exact commands rather than general guidance? — Precision removes decision-making burden during an incident, directly reducing real-world RTO.<br>
+<strong>31.</strong> What's the danger of DR game days only ever targeting non-critical services? — You never actually validate the runbook steps and dependencies that matter most for your highest-value services.<br>
+<strong>32.</strong> Why is "we have backups" not the same as "we have a DR plan"? — Backups address data recovery; a DR plan additionally requires rehearsed procedures, RTO/RPO targets, and cross-region infrastructure readiness.<br>
+<strong>33.</strong> What's a Global Load Balancer's role versus Route53 failover records? — Both redirect traffic on failover; a GLB can do this with health-check-driven automatic routing, while Route53 failover records are a DNS-layer mechanism achieving similar effect.<br>
+<strong>34.</strong> Why must replication lag be checked with an actual query, not assumed from documentation? — Real lag varies with load and network conditions at the moment of failure — only a live check confirms your RPO promise held.<br>
+<strong>35.</strong> What's the operational cost difference between pilot light and warm standby? — Warm standby keeps a running, continuously synced replica environment (higher steady-state cost); pilot light keeps only core infra pre-provisioned at near-zero scale.<br>
+<strong>36.</strong> Why should the DR cutover verification step use the same health check the incident detection used? — Consistency confirms the specific failure mode is actually resolved, not just that "something" responds.<br>
+<strong>37.</strong> What's a realistic reason a DR plan might specify multiple decision points rather than one linear script? — Real incidents branch (partial outage vs full outage, data loss vs no data loss) and a linear runbook can't cover every branch without explicit checkpoints.<br>
+<strong>38.</strong> Why does this topic emphasize that the business, not engineers, should set RTO/RPO? — Because the tradeoffs (cost, complexity) required to hit aggressive numbers are business decisions with real budget implications.<br>
+<strong>39.</strong> What's the risk of skipping a formal fail-back rehearsal? — The return-to-primary step, done under less pressure but with less rehearsal, can itself introduce a new incident.<br>
+<strong>40.</strong> Why is "the failure nobody rehearsed for" the realistic DR failure mode? — Runbooks are written against anticipated scenarios; real incidents often combine unexpected factors (expired secrets, missing region-specific config) nobody explicitly tested.<br>
+<strong>41.</strong> What's a good way to validate IAM readiness in a DR region ahead of time? — Periodically deploy/test a workload in the DR region using its IAM roles, not just assume Terraform "should" have created them correctly.<br>
+<strong>42.</strong> Why should you scale DR workloads up before or during traffic cutover, not after? — Cutting traffic to under-provisioned DR capacity causes a second outage immediately after "recovering" from the first.<br>
+<strong>43.</strong> What's the value of timing every step during a game day? — It converts a hoped-for RTO into a measured, evidence-based number you can actually report to the business.<br>
+<strong>44.</strong> Why is "detection" listed as a distinct step separate from "decision" in the DR flow? — Detection is automated/monitoring-driven; decision requires human judgment to avoid over-triggering failover on noise.<br>
+<strong>45.</strong> What's a common mistake when writing the "verify DR is healthy" step of a runbook? — Checking only that pods are Running, not that the actual user-facing health endpoint returns success.<br>
+<strong>46.</strong> Why does this topic pair DR planning tightly with the earlier Backup & Restore topic? — DR is what backups become once you attach RTO/RPO numbers and rehearse the recovery process — one builds directly on the other.<br>
+<strong>47.</strong> What's the tradeoff of choosing active-active over warm standby? — Highest cost and complexity (data conflict handling, doubled infra) in exchange for the best possible RTO/RPO.<br>
+<strong>48.</strong> Why might a company deliberately choose backup-and-restore DR for some services despite having active-active capability for others? — Cost/complexity should match each service's actual business criticality, not be applied uniformly regardless of impact.<br>
+<strong>49.</strong> What's the first command an on-call engineer should run when a DR runbook says "confirm primary region outage"? — An independent health check against the primary (e.g. <code>curl</code> to its health endpoint), not trusting a single alert alone.<br>
+<strong>50.</strong> What's the overall theme this topic drives home about DR plans? — A DR plan is only real once it's rehearsed end to end with measured timings — otherwise it's an untested assumption masquerading as a plan.
+</div></details>
+
+<footer class="course-footer">Continue to Topic 65: Cluster Upgrade.</footer>
+
+<script>
+  mermaid.initialize({ startOnLoad: true, theme: 'dark' });
+</script>
+
+</body>
+</html>

@@ -1,0 +1,297 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Topic 63: Backup &amp; Restore — Kubernetes Expert Course</title>
+<link rel="stylesheet" href="styles.css">
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+</head>
+<body>
+
+<header class="course-header">
+  <div class="kicker">Topic 63 of 70</div>
+  <h1>Backup &amp; Restore</h1>
+  <div class="subtitle">Protecting cluster state (etcd) and application state (PVs, manifests) so recovery is a procedure, not a prayer.</div>
+</header>
+
+<nav class="topic-nav">
+  <a href="62-high-availability.html">&larr; High Availability</a>
+  <a href="index.html">Course Index</a>
+  <a href="64-disaster-recovery.html">Disaster Recovery &rarr;</a>
+</nav>
+
+<h2 id="explanation">Explanation</h2>
+<p>Kubernetes backup has two entirely separate layers, and conflating them is the most common mistake teams make.
+The first layer is <strong>cluster state</strong> — everything the control plane knows about: every Deployment,
+Secret, ConfigMap, RBAC rule, CRD, and their metadata, all of which lives in <strong>etcd</strong>. The second layer
+is <strong>application state</strong> — the actual data your workloads produced: rows in a database backed by a
+PersistentVolume, files on disk, object storage contents. A full etcd snapshot will restore every Kubernetes object
+definition perfectly, but it will <em>not</em> back up the bytes sitting inside your PersistentVolumes — those live
+on the underlying storage system (EBS, PD, Azure Disk, Ceph, etc.) and need their own backup path.</p>
+
+<p>etcd backup is done via <code>etcdctl snapshot save</code>, which takes a point-in-time consistent snapshot of the
+entire keyspace by streaming it over the client API — no need to stop etcd. Restoring is the more delicate half:
+<code>etcdctl snapshot restore</code> doesn't restore in place, it builds a brand-new data directory from the
+snapshot, which you then point a (re-initialized) etcd member at. In practice this means restoring etcd is
+effectively "stand up a fresh single-node etcd from the snapshot, then re-join or re-cluster it" — you cannot simply
+overwrite a running member's data directory.</p>
+
+<p>For application-level backup, the de-facto open-source tool is <strong>Velero</strong>. Velero backs up
+Kubernetes object manifests (like a targeted, on-demand etcd export scoped to a namespace or label selector) AND
+triggers your cloud provider's native volume snapshot API (EBS snapshots, GCE PD snapshots, Azure Disk snapshots) for
+any PVs attached to the backed-up pods, storing everything in an object-storage bucket (S3/GCS/Azure Blob). Restore
+recreates the manifests and re-provisions volumes from the snapshots — critically, this works cross-cluster, which
+etcd snapshots do not (an etcd snapshot restore only makes sense onto the same cluster/topology it came from).</p>
+
+<p>The operational reasoning that matters: etcd backups protect you against <strong>control-plane corruption or
+loss</strong> (a bad upgrade wipes etcd, a fat-fingered <code>kubectl delete namespace kube-system</code>, a failed
+etcd member replacement gone wrong). Velero-style backups protect you against <strong>application-level disasters</strong>
+(accidental <code>kubectl delete pvc</code>, a bad migration corrupting a database, needing to clone a namespace into
+a new cluster for testing, or actual disaster recovery to a different region/cluster). Most production incidents
+that actually happen are the latter — someone deletes the wrong namespace — which is exactly why Velero (namespace
+and label-selector-scoped, restorable to any cluster) tends to be exercised far more often than a full etcd restore.</p>
+
+<p>A backup strategy without a <em>tested restore</em> is not a backup strategy. The single highest-value practice
+here is scheduling a recurring, automated restore-to-scratch-cluster drill and treating any failure as a
+production incident — because the worst time to discover your etcd snapshot is corrupt, or your Velero bucket
+credentials expired, is during an actual outage.</p>
+
+<h2 id="internal-working">Internal Working / Interactions</h2>
+<ul>
+  <li><strong>etcdctl snapshot save</strong> streams a consistent point-in-time copy of the whole keyspace over the
+  client gRPC API; it does not require quorum loss or downtime.</li>
+  <li><strong>etcdctl snapshot restore</strong> writes a new on-disk data directory + cluster metadata; the resulting
+  member starts as a fresh single-node cluster which the other control-plane nodes must then be re-pointed at.</li>
+  <li><strong>Velero server</strong> runs as an in-cluster Deployment; on a scheduled or manual backup trigger it
+  calls the Kubernetes API to export object manifests and calls the cloud provider's volume-snapshot API via a
+  VolumeSnapshotLocation plugin.</li>
+  <li><strong>Velero restore</strong> replays manifests (respecting namespace/label filters and remapping if needed)
+  and creates new PVCs bound to volumes restored from the cloud snapshots.</li>
+  <li><strong>Object storage (S3/GCS/Azure Blob)</strong> is the durable backing store for both the manifest data and
+  the snapshot metadata Velero manages — treat this bucket itself as needing cross-region replication.</li>
+</ul>
+
+<h2 id="architecture-diagram">Architecture Diagram</h2>
+<pre class="mermaid">
+sequenceDiagram
+  participant Cron as Backup CronJob/Schedule
+  participant Etcd as etcd cluster
+  participant Velero as Velero server
+  participant Cloud as Cloud Volume API
+  participant S3 as Object Storage (S3/GCS)
+
+  Cron->>Etcd: etcdctl snapshot save
+  Etcd-->>Cron: snapshot.db (point-in-time)
+  Cron->>S3: upload snapshot.db
+
+  Velero->>Velero: scheduled Backup CR triggers
+  Velero->>Cloud: export object manifests (Deployments, PVCs, Secrets...)
+  Velero->>Cloud: request volume snapshot per PV
+  Cloud-->>Velero: snapshot ID
+  Velero->>S3: store manifests + snapshot metadata
+
+  Note over Etcd,S3: Restore path (DR event)
+  S3-->>Etcd: snapshot restore -> new data-dir -> re-cluster
+  S3-->>Velero: velero restore create -> recreate manifests + volumes from Cloud snapshots
+</pre>
+
+<h2 id="code-example">Code Example</h2>
+<pre><code>#############################################
+# 1. etcd snapshot backup and restore
+#############################################
+# Take a consistent snapshot (run on a control-plane / etcd host)
+ETCDCTL_API=3 etcdctl snapshot save /backup/etcd-snapshot-$(date +%F).db \
+  --endpoints=https://127.0.0.1:2379 \
+  --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+  --cert=/etc/kubernetes/pki/etcd/server.crt \
+  --key=/etc/kubernetes/pki/etcd/server.key
+
+# Verify snapshot integrity before trusting it
+ETCDCTL_API=3 etcdctl snapshot status /backup/etcd-snapshot-2026-07-19.db -w table
+
+# Restore into a NEW data directory (never overwrite a live member's data-dir)
+ETCDCTL_API=3 etcdctl snapshot restore /backup/etcd-snapshot-2026-07-19.db \
+  --data-dir /var/lib/etcd-restored \      # fresh directory for the restored member
+  --name etcd-restored-1 \
+  --initial-cluster "etcd-restored-1=https://10.0.0.11:2380" \
+  --initial-advertise-peer-urls https://10.0.0.11:2380
+# Then update the static pod manifest / etcd unit to point --data-dir at the restored path
+# and restart kubelet/etcd so the API server picks up the recovered state.
+
+---
+# 2. Velero — install, back up, and restore a namespace (AWS example)
+velero install \
+  --provider aws \
+  --plugins velero/velero-plugin-for-aws:v1.9.0 \
+  --bucket my-cluster-velero-backups \             # S3 bucket holding manifests + snapshot metadata
+  --backup-location-config region=us-east-1 \
+  --snapshot-location-config region=us-east-1 \
+  --secret-file ./credentials-velero
+
+# On-demand backup of one namespace, including PV snapshots
+velero backup create checkout-ns-backup \
+  --include-namespaces checkout \
+  --snapshot-volumes=true
+
+# Schedule nightly backups (cron syntax) with 30-day retention
+velero schedule create nightly-checkout \
+  --schedule="0 2 * * *" \
+  --include-namespaces checkout \
+  --ttl 720h0m0s
+
+# Restore into the same or a different cluster
+velero restore create --from-backup checkout-ns-backup
+</code></pre>
+
+<h2 id="kubectl-cli-commands">kubectl / CLI Commands</h2>
+<pre><code># Confirm which etcd endpoint / certs are in use on a kubeadm cluster
+cat /etc/kubernetes/manifests/etcd.yaml | grep -A5 command
+
+# List and inspect Velero backups
+velero backup get
+velero backup describe checkout-ns-backup --details
+
+# Check restore progress and any warnings/errors
+velero restore describe <restore-name>
+velero restore logs <restore-name>
+
+# List all PVCs/PVs to confirm what needs volume-level backup coverage
+kubectl get pvc -A
+kubectl get pv
+
+# Dry-run check of what a Velero backup would include
+velero backup create --include-namespaces checkout --dry-run -o yaml
+
+# Verify etcd cluster health right before/after a restore operation
+etcdctl endpoint health --cluster
+</code></pre>
+
+<h2 id="best-practices">Best Practices &amp; Common Pitfalls</h2>
+<div class="grid-2">
+  <div class="lab-card">
+    <h4>Best Practices</h4>
+    <ul>
+      <li>Automate etcd snapshots on a schedule and ship them off-node immediately (S3/GCS, not local disk).</li>
+      <li>Run Velero for namespace/application-level backup in addition to etcd snapshots — they cover different failure modes.</li>
+      <li>Encrypt backups at rest and restrict bucket access via least-privilege IAM.</li>
+      <li>Regularly restore into a scratch cluster to prove backups actually work.</li>
+      <li>Version and retain multiple snapshot generations, not just the latest one.</li>
+    </ul>
+  </div>
+  <div class="lab-card">
+    <h4>Common Pitfalls</h4>
+    <ul>
+      <li>Assuming an etcd snapshot backs up PersistentVolume data — it does not.</li>
+      <li>Storing etcd snapshots on the same node/disk that could fail alongside the cluster.</li>
+      <li>Never testing restore, only backup — discovering a corrupt snapshot during a real outage.</li>
+      <li>Forgetting Secrets/CRDs are namespaced objects too and need explicit inclusion in Velero backup scope.</li>
+      <li>Restoring an etcd snapshot in place over a live member's data directory instead of a fresh one.</li>
+    </ul>
+  </div>
+</div>
+
+<h2 id="interview-questions">50 Interview Questions</h2>
+
+<details class="qa"><summary>1. What are the two entirely separate layers of Kubernetes backup, and why does conflating them cause incidents?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Cluster state (everything in etcd — object definitions, Secrets, RBAC) and application state (the actual bytes in PersistentVolumes).
+<br><strong>Detail:</strong> An etcd snapshot restores every object definition perfectly but never touches the data sitting on EBS/PD/Azure Disk — teams who only take etcd snapshots discover this gap during a real PVC-deletion incident.
+<br><strong>Production example:</strong> Restoring etcd after a bad upgrade brings back a Deployment's spec instantly, but if the underlying PV was also deleted, the database rows inside it are gone unless backed up separately via Velero + volume snapshots.
+<br><strong>Common mistake:</strong> Assuming "we back up etcd" means the whole cluster's data is protected.</div></details>
+
+<details class="qa"><summary>2. How does <code>etcdctl snapshot save</code> take a consistent backup without stopping etcd?</summary>
+<div class="qa-body"><strong>Short answer:</strong> It streams a point-in-time consistent copy of the entire keyspace over the client gRPC API while etcd keeps serving reads/writes.
+<br><strong>Detail:</strong> No quorum loss or downtime is required — it's a live, non-disruptive snapshot mechanism, which is why it can be safely automated on a schedule.
+<br><strong>Production example:</strong> A CronJob runs <code>etcdctl snapshot save</code> nightly and immediately uploads the resulting <code>.db</code> file to S3.
+<br><strong>Common mistake:</strong> Believing a snapshot requires a maintenance window — it doesn't, and delaying automation because of that assumption leaves gaps in RPO coverage.</div></details>
+
+<details class="qa"><summary>3. Why can't you restore an etcd snapshot "in place" over a live member's data directory?</summary>
+<div class="qa-body"><strong>Short answer:</strong> <code>etcdctl snapshot restore</code> builds a brand-new data directory and cluster metadata from scratch — it doesn't merge into or overwrite an existing running member.
+<br><strong>Detail:</strong> The practical restore flow is: stand up a fresh single-node etcd from the snapshot, point the static pod manifest at the new data directory, then re-cluster/re-join the other control-plane nodes to it.
+<br><strong>Production example:</strong> After a corrupted etcd cluster, the restore procedure creates <code>/var/lib/etcd-restored</code> as a new directory rather than touching <code>/var/lib/etcd</code> directly.
+<br><strong>Common mistake:</strong> Attempting to restore directly into a live member's existing data directory, which fails or corrupts cluster metadata.</div></details>
+
+<details class="qa"><summary>4. What does Velero actually back up, and how is that different from an etcd snapshot?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Velero backs up Kubernetes object manifests scoped to a namespace/label selector, plus triggers the cloud provider's native volume-snapshot API for attached PVs.
+<br><strong>Detail:</strong> Unlike a full etcd snapshot (all-or-nothing, same-cluster restore only), Velero is targeted and cross-cluster-restorable, because it works through the API and cloud snapshot APIs rather than etcd's raw keyspace.
+<br><strong>Production example:</strong> <code>velero backup create checkout-ns-backup --include-namespaces checkout --snapshot-volumes=true</code> captures both manifests and PV data for one namespace only.
+<br><strong>Common mistake:</strong> Trying to use an etcd snapshot to migrate one namespace to a new cluster — Velero is the right tool for that, not etcd.</div></details>
+
+<details class="qa"><summary>5. Why do most production incidents get resolved via Velero restore rather than a full etcd restore?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Most real incidents are application-level (accidental <code>kubectl delete pvc</code>, a bad migration, needing to clone a namespace) rather than control-plane corruption.
+<br><strong>Detail:</strong> Velero's namespace/label-selector scoping and cross-cluster restore make it the natural tool for these everyday disasters, while a full etcd restore is reserved for genuine control-plane loss.
+<br><strong>Production example:</strong> An engineer deletes the wrong namespace in production; the fix is <code>velero restore create --from-backup</code> for that namespace, not a cluster-wide etcd restore.
+<br><strong>Common mistake:</strong> Treating etcd snapshots as the primary recovery tool for application-level mistakes, when Velero is scoped and faster for that exact scenario.</div></details>
+
+<details class="qa"><summary>6. What's the difference in how PV data is protected by Velero versus by an etcd snapshot?</summary>
+<div class="qa-body"><strong>Short answer:</strong> etcd never touches PV data at all; Velero calls the cloud provider's native volume-snapshot API (EBS/GCE PD/Azure Disk snapshots) via a VolumeSnapshotLocation plugin.
+<br><strong>Detail:</strong> Velero restore recreates the PVC manifests and re-provisions volumes from those cloud snapshots — the actual snapshot mechanism is the cloud platform's, not Kubernetes'.
+<br><strong>Production example:</strong> A Velero backup with <code>--snapshot-volumes=true</code> triggers an EBS snapshot for every PV attached to Pods in the included namespace.
+<br><strong>Common mistake:</strong> Running Velero backups without confirming a VolumeSnapshotLocation is properly configured — manifests get backed up but volume data silently doesn't.</div></details>
+
+<details class="qa"><summary>7. Why is "a backup strategy without a tested restore" considered not a backup strategy at all?</summary>
+<div class="qa-body"><strong>Short answer:</strong> An unverified backup could be corrupt, incomplete, or unrestorable, and you only find out during a real outage — the worst possible time.
+<br><strong>Detail:</strong> The highest-value practice is a recurring, automated restore-to-scratch-cluster drill, treating any failure (expired bucket credentials, corrupt snapshot) as a production incident in its own right.
+<br><strong>Production example:</strong> A monthly job restores the latest Velero backup and etcd snapshot into an isolated scratch cluster and alerts if either restore fails.
+<br><strong>Common mistake:</strong> Verifying only that the backup job "completed successfully," never actually attempting a restore.</div></details>
+
+<details class="qa"><summary>8. Why should etcd snapshots and Velero backups be stored off-node immediately?</summary>
+<div class="qa-body"><strong>Short answer:</strong> A backup stored on the same node/disk that could fail alongside the cluster provides no real protection.
+<br><strong>Detail:</strong> Shipping snapshots to S3/GCS/Azure Blob (with its own durability and ideally cross-region replication) decouples backup survival from the failure you're trying to protect against.
+<br><strong>Production example:</strong> The etcd snapshot CronJob writes to local disk only as a staging step, then immediately uploads to an S3 bucket before the job completes.
+<br><strong>Common mistake:</strong> Leaving snapshots on the control-plane node's local disk "temporarily," which becomes permanent and defeats the point of backing up at all.</div></details>
+
+<details class="qa"><summary>9–50. Additional rapid-fire questions</summary>
+<div class="qa-body">
+<strong>9.</strong> What command verifies an etcd snapshot's integrity before trusting it? — <code>etcdctl snapshot status &lt;file&gt; -w table</code>.<br>
+<strong>10.</strong> Does an etcd snapshot include Secrets? — Yes, in whatever form they're stored in etcd (plaintext unless encryption-at-rest is configured).<br>
+<strong>11.</strong> Does Velero back up CRDs and Secrets by default? — Only within the included namespace/label scope you specify — they must be explicitly covered, not assumed.<br>
+<strong>12.</strong> What's the risk of restoring an etcd snapshot from a different cluster? — Cluster-specific metadata (member IDs, peer URLs) won't match, unlike Velero which is designed to be cross-cluster-restorable.<br>
+<strong>13.</strong> Why does Velero require a VolumeSnapshotLocation plugin per cloud provider? — Because the actual snapshot mechanism is the cloud's native API (EBS, PD, Azure Disk), not something Kubernetes/Velero implements itself.<br>
+<strong>14.</strong> What's a `velero schedule` and why use it over manual `velero backup create`? — It automates recurring backups on a cron expression with retention (TTL), removing reliance on someone remembering to back up manually.<br>
+<strong>15.</strong> What does <code>--ttl 720h0m0s</code> control in a Velero schedule? — Retention period for each backup generation (30 days here) before it's eligible for garbage collection.<br>
+<strong>16.</strong> Why should you retain multiple etcd snapshot generations, not just the latest? — The latest snapshot could itself be a snapshot of an already-corrupted state; older generations give you a fallback.<br>
+<strong>17.</strong> What's the operational meaning of "etcd backup protects against control-plane loss, Velero protects against application-level disasters"? — They cover different failure domains and are complementary, not redundant.<br>
+<strong>18.</strong> How do you check what a Velero backup would include without actually running it? — <code>velero backup create ... --dry-run -o yaml</code>.<br>
+<strong>19.</strong> What's the first command to run after a Velero restore to check for problems? — <code>velero restore describe &lt;restore-name&gt;</code>, followed by <code>velero restore logs</code>.<br>
+<strong>20.</strong> Why must backup bucket credentials be tested regularly, not just configured once? — Expired/rotated credentials silently break backup jobs until someone needs to restore and discovers the failure.<br>
+<strong>21.</strong> What's a realistic RPO if etcd snapshots run every 4 hours? — Up to 4 hours of control-plane object changes could be lost in a worst-case restore.<br>
+<strong>22.</strong> Does restoring an etcd snapshot restart running Pods? — No — Pods are managed by kubelet/controllers reconciling against whatever state is now in etcd; existing running containers aren't directly touched by the restore itself.<br>
+<strong>23.</strong> Why encrypt backups at rest in the object storage bucket? — Backups contain the same sensitive data (Secrets, config) as the live cluster and are an equally valuable attack target.<br>
+<strong>24.</strong> What IAM principle should govern access to the backup bucket? — Least privilege — restrict who/what can read or delete backup objects, since deleting backups is itself a disaster vector.<br>
+<strong>25.</strong> What's the difference between backing up a StatefulSet's manifest and backing up its data? — The manifest (via etcd/Velero) restores the StatefulSet's desired state; the actual database files need PV-level snapshot coverage separately.<br>
+<strong>26.</strong> Why is namespace-scoped Velero backup preferable to whole-cluster backup in many workflows? — Faster, more targeted restores and lower blast radius when only one team's data needs recovery.<br>
+<strong>27.</strong> What happens if you restore a Velero backup into a cluster with different StorageClass names? — The restore can fail or misbind PVCs unless you configure Velero's resource remapping for storage classes.<br>
+<strong>28.</strong> Why is testing restore into a *different* cluster valuable, not just the same one? — It validates the cross-cluster DR use case and catches assumptions baked into cluster-specific configuration.<br>
+<strong>29.</strong> What's the risk of only ever testing restore in a low-traffic staging environment? — Restore time and volume snapshot provisioning time can scale with data size — production-scale restores may reveal much longer RTOs.<br>
+<strong>30.</strong> Why does <code>etcdctl snapshot save</code> not require etcd downtime, unlike some traditional DB backup tools? — It streams from the existing running process over the API rather than requiring a stop-the-world file copy.<br>
+<strong>31.</strong> What's a common cause of a corrupt etcd snapshot going unnoticed? — Never running <code>etcdctl snapshot status</code> or an actual restore test against it.<br>
+<strong>32.</strong> How does Velero decide which volumes to snapshot? — Based on PVs attached to Pods matched by the backup's namespace/label selector, when <code>--snapshot-volumes=true</code>.<br>
+<strong>33.</strong> Why should Secrets/CRDs be explicitly verified as included in Velero's backup scope? — They're namespaced objects like any other and can be silently excluded by an overly narrow label selector.<br>
+<strong>34.</strong> What's the operational cost of skipping automated snapshot upload to S3/GCS? — A local-only snapshot is vulnerable to the exact node/disk failure that might trigger the need to restore it.<br>
+<strong>35.</strong> Why is "point-in-time consistent" an important property of an etcd snapshot? — It guarantees the restored state reflects a single coherent moment, not a mix of before/after states from concurrent writes.<br>
+<strong>36.</strong> What's the relationship between Velero and GitOps for DR? — GitOps (Argo CD/Flux) can reapply manifests from source control quickly, but Velero is still needed to restore PV data and any state not tracked in Git.<br>
+<strong>37.</strong> Why does restoring etcd typically require re-clustering the other control-plane nodes? — The restored member starts as a fresh single-node cluster with new metadata; existing peers must be re-pointed or rejoined to it.<br>
+<strong>38.</strong> What's a good cadence for restore-drill exercises? — Regularly enough (e.g. monthly) that credential rotation, snapshot format changes, or tooling drift get caught before a real incident.<br>
+<strong>39.</strong> Why treat a failed restore drill as a production incident? — Because it reveals your actual recovery capability is broken right now, not hypothetically — the same urgency as a live outage.<br>
+<strong>40.</strong> What's the danger of relying solely on cloud-provider automatic disk snapshots without Velero? — You lose the coordinated manifest+volume restore workflow and cross-cluster restore capability Velero provides.<br>
+<strong>41.</strong> How do you confirm etcd cluster health immediately before/after a restore? — <code>etcdctl endpoint health --cluster</code>.<br>
+<strong>42.</strong> What's the purpose of versioning/retaining multiple snapshot generations rather than overwriting the latest? — Protects against restoring a snapshot that itself captured an already-corrupted or compromised state.<br>
+<strong>43.</strong> Why is an etcd snapshot restore considered "the more delicate half" of etcd backup/restore? — Because save is a simple live streaming operation, while restore requires careful data-directory and re-clustering steps that are easy to get wrong under pressure.<br>
+<strong>44.</strong> What's a practical reason to keep etcd snapshot and Velero backup schedules independent rather than coupled? — They protect different layers on different natural cadences — control-plane changes are often less frequent than application data changes.<br>
+<strong>45.</strong> How would you migrate a namespace to a new cluster using these tools? — Velero backup of the namespace, then <code>velero restore create --from-backup</code> targeting the new cluster — not an etcd snapshot.<br>
+<strong>46.</strong> What's a red flag when reviewing a team's backup setup? — Snapshots exist and run on schedule, but nobody can produce evidence of a successful restore test in the last few months.<br>
+<strong>47.</strong> Why does Velero's manifest export resemble "a targeted etcd export"? — Conceptually it captures the same kind of object definitions etcd stores, just scoped and via the API rather than the raw datastore.<br>
+<strong>48.</strong> What should you check before assuming a Velero restore is fully successful? — <code>velero restore describe --details</code> for partial failures/warnings, not just that the command exited without error.<br>
+<strong>49.</strong> Why is bucket replication (cross-region) itself part of a serious backup strategy? — The bucket holding your backups is a single point of failure too — losing it defeats the purpose of backing up at all.<br>
+<strong>50.</strong> What's the single highest-value practice this topic emphasizes above all others? — Scheduling and treating regular restore-to-scratch-cluster drills as mandatory, not optional.
+</div></details>
+
+<footer class="course-footer">Continue to Topic 64: Disaster Recovery.</footer>
+
+<script>
+  mermaid.initialize({ startOnLoad: true, theme: 'dark' });
+</script>
+
+</body>
+</html>

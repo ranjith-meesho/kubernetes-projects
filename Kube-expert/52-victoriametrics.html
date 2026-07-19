@@ -1,0 +1,315 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Topic 52: VictoriaMetrics — Kubernetes Expert Course</title>
+<link rel="stylesheet" href="styles.css">
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+</head>
+<body>
+
+<header class="course-header">
+  <div class="kicker">Topic 52 of 70</div>
+  <h1>VictoriaMetrics</h1>
+  <div class="subtitle">A Prometheus-compatible, far more storage- and compute-efficient time series database for long-term, high-cardinality metrics at scale.</div>
+</header>
+
+<nav class="topic-nav">
+  <a href="51-prometheus.html">&larr; Prometheus</a>
+  <a href="index.html">Course Index</a>
+  <a href="53-grafana.html">Grafana &rarr;</a>
+</nav>
+
+<h2 id="explanation">Explanation</h2>
+<p>VictoriaMetrics (VM) is a time series database and monitoring solution that speaks the Prometheus remote-write/remote-read
+and PromQL protocols, but is implemented from scratch with a storage engine that is dramatically more efficient on disk,
+memory, and CPU than vanilla Prometheus's local TSDB. Teams don't adopt it because Prometheus is "wrong" — Prometheus's
+pull model, service discovery, and PromQL are all excellent — they adopt it because Prometheus's single-node local storage
+does not scale well past a certain cardinality and retention window, and federating many Prometheus servers becomes an
+operational headache.</p>
+
+<p>The core problem VictoriaMetrics solves is <strong>long-term, high-cardinality storage without a linear cost/complexity
+explosion</strong>. Vanilla Prometheus stores everything on local disk per-instance; once you want 1+ years of retention,
+tens of millions of active series, or a single global query view across many clusters, you either run a fleet of sharded
+Prometheus servers with Thanos/Cortex-style sidecars, or you replace the storage layer entirely. VictoriaMetrics takes the
+second approach: keep Prometheus doing what it's good at (scraping, alerting rules, service discovery) and use `vmagent`
+to remote_write scraped samples into a purpose-built, horizontally scalable storage cluster.</p>
+
+<p>Architecturally VM ships in two flavors: <strong>single-node</strong> (one binary, disk-based, extremely simple to
+operate, handles surprisingly large workloads) and <strong>cluster mode</strong>, split into three independently scalable
+components: <code>vminsert</code> (accepts writes, shards them by metric name/labels across storage nodes), <code>vmstorage</code>
+(actually persists compressed time series data, the workhorse), and <code>vmselect</code> (serves PromQL/MetricsQL queries by
+fanning out to the relevant vmstorage nodes and merging results). This separation lets you scale ingest and query paths
+independently — a classic write-heavy/read-light workload doesn't need to over-provision query capacity, and vice versa.</p>
+
+<p>Within the broader observability ecosystem, VictoriaMetrics sits exactly where Prometheus's local TSDB sits, but as a
+drop-in remote backend: Prometheus (or `vmagent`, VM's own lightweight scrape agent) remote-writes into it, Grafana queries
+it via a Prometheus-compatible datasource, and Alertmanager still fires alerts (VM ships its own `vmalert` component that
+can also evaluate recording/alerting rules directly against VM storage, removing the need to run Prometheus at all in some
+setups). This is why many platform teams describe their migration as "Prometheus for scraping, VictoriaMetrics for
+everything else."</p>
+
+<p>The efficiency gains come from VM's custom storage format: aggressive columnar compression tuned for time series data,
+deduplication, and a merge-tree-like structure (inspired by ClickHouse) that dramatically reduces disk I/O and storage
+footprint — commonly cited as 5-10x less disk space and RAM than the equivalent Prometheus TSDB for the same data. At
+Meesho-scale, where hundreds of microservices across multiple EKS clusters emit millions of active series, this
+difference is the line between a monitoring stack that fits in a reasonable budget and one that doesn't.</p>
+
+<h2 id="internal-working">Internal Working / Interactions</h2>
+<ul>
+  <li><strong>vmagent</strong> — a lightweight, Prometheus-compatible scrape agent; discovers targets (via the same Kubernetes SD mechanisms Prometheus uses), scrapes them, and remote_writes samples onward. Can also relabel, shard, and buffer during backend outages.</li>
+  <li><strong>vminsert</strong> — the write entrypoint for cluster mode; consistently hashes each time series (by metric name + labels) to the correct set of <code>vmstorage</code> nodes.</li>
+  <li><strong>vmstorage</strong> — durable storage nodes; each holds a shard of the overall series and answers query fragments from vmselect.</li>
+  <li><strong>vmselect</strong> — the read entrypoint; parses PromQL/MetricsQL, fans the query out to relevant vmstorage nodes, and merges/aggregates results before returning to Grafana or an alerting engine.</li>
+  <li><strong>vmalert</strong> — evaluates recording and alerting rules directly against VM, sending firing alerts to Alertmanager, closing the loop without needing Prometheus itself for rule evaluation.</li>
+  <li><strong>Grafana</strong> talks to <code>vmselect</code> (or the single-node binary) using the standard Prometheus datasource type, since the query API is wire-compatible.</li>
+</ul>
+
+<h2 id="architecture-diagram">Architecture Diagram</h2>
+<pre class="mermaid">
+flowchart LR
+    subgraph Targets["Scrape Targets (Pods/Services)"]
+      T1["service-a /metrics"]
+      T2["service-b /metrics"]
+    end
+
+    VA["vmagent<br/>(scrape + relabel)"] -->|remote_write| VI["vminsert<br/>(shard by series hash)"]
+    T1 --> VA
+    T2 --> VA
+
+    subgraph Storage["VictoriaMetrics Cluster"]
+      VI --> VS1["vmstorage-0"]
+      VI --> VS2["vmstorage-1"]
+      VI --> VS3["vmstorage-2"]
+      VSel["vmselect<br/>(fan-out + merge)"] --> VS1
+      VSel --> VS2
+      VSel --> VS3
+    end
+
+    GR["Grafana"] -->|PromQL| VSel
+    VMAL["vmalert<br/>(rule evaluation)"] -->|PromQL| VSel
+    VMAL -->|alerts| AM["Alertmanager"]
+</pre>
+
+<h2 id="code-example">Code Example</h2>
+<pre><code># vmagent Deployment — replaces (or complements) Prometheus's scrape role,
+# remote_writing samples into the VictoriaMetrics cluster's insert endpoint.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vmagent
+  namespace: monitoring
+spec:
+  replicas: 2                       # vmagent can run >1 replica; use --remoteWrite.label to dedupe if needed
+  selector:
+    matchLabels: { app: vmagent }
+  template:
+    metadata:
+      labels: { app: vmagent }
+    spec:
+      serviceAccountName: vmagent          # needs RBAC to list/watch Pods, Services, Endpoints (like Prometheus)
+      containers:
+        - name: vmagent
+          image: victoriametrics/vmagent:v1.101.0
+          args:
+            - "--promscrape.config=/etc/vmagent/scrape.yaml"   # same syntax as prometheus.yml scrape_configs
+            - "--remoteWrite.url=http://vminsert.monitoring.svc:8480/insert/0/prometheus/"
+            - "--remoteWrite.tmpDataPath=/tmpdata"             # local disk buffer if vminsert is unreachable
+            - "--remoteWrite.maxDiskUsagePerURL=2GB"           # caps buffer growth during backend outages
+          volumeMounts:
+            - name: config
+              mountPath: /etc/vmagent
+            - name: tmp
+              mountPath: /tmpdata
+      volumes:
+        - name: config
+          configMap: { name: vmagent-scrape-config }
+        - name: tmp
+          emptyDir: {}
+---
+# vmstorage StatefulSet — the durable, shardable storage tier.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: vmstorage
+  namespace: monitoring
+spec:
+  serviceName: vmstorage
+  replicas: 3                        # each replica is an independent shard; vminsert hashes series across all 3
+  selector:
+    matchLabels: { app: vmstorage }
+  template:
+    metadata:
+      labels: { app: vmstorage }
+    spec:
+      containers:
+        - name: vmstorage
+          image: victoriametrics/vmstorage:v1.101.0-cluster
+          args:
+            - "--retentionPeriod=12"          # months of retention kept on this shard
+            - "--storageDataPath=/storage"
+          ports:
+            - { containerPort: 8482, name: http }
+            - { containerPort: 8400, name: vminsert-conn }
+            - { containerPort: 8401, name: vmselect-conn }
+          volumeMounts:
+            - name: data
+              mountPath: /storage
+  volumeClaimTemplates:
+    - metadata: { name: data }
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources: { requests: { storage: 200Gi } }   # size per shard; scale nodes horizontally rather than disks vertically
+</code></pre>
+
+<h2 id="kubectl-cli-commands">kubectl / CLI Commands</h2>
+<pre><code>kubectl get pods -n monitoring -l app=vmstorage           # check all storage shards are Running
+kubectl logs -n monitoring deploy/vmagent --tail=100       # see scrape/remote_write errors
+kubectl port-forward -n monitoring svc/vmselect 8481:8481  # query vmselect locally
+curl 'http://localhost:8481/select/0/prometheus/api/v1/query?query=up'   # ad-hoc PromQL query against VM
+kubectl exec -n monitoring vmstorage-0 -- df -h /storage   # check disk usage on a storage shard
+kubectl get vmagent,vmstorage,vmselect -n monitoring        # if using the VictoriaMetrics Operator CRDs
+kubectl describe pod -n monitoring vmagent-xxxx             # diagnose CrashLoopBackOff / config errors
+</code></pre>
+
+<h2 id="best-practices">Best Practices &amp; Common Pitfalls</h2>
+<div class="grid-2">
+<div>
+<h4>Best Practices</h4>
+<ul>
+  <li>Use the <strong>VictoriaMetrics Operator</strong> in Kubernetes rather than hand-rolling manifests — it manages upgrades and scaling for you.</li>
+  <li>Start with single-node VM; only move to cluster mode once you clearly exceed its vertical limits (millions of active series).</li>
+  <li>Set <code>-remoteWrite.maxDiskUsagePerURL</code> on vmagent so a backend outage doesn't fill node disks.</li>
+  <li>Keep vmstorage replicas at 3+ with replication factor set for HA in production.</li>
+  <li>Use recording rules (via vmalert) to pre-aggregate expensive high-cardinality queries used on dashboards.</li>
+</ul>
+</div>
+<div>
+<h4>Pitfalls</h4>
+<ul>
+  <li>Migrating without validating label cardinality first — VM is efficient but unbounded cardinality still hurts any TSDB.</li>
+  <li>Forgetting vmselect and vminsert scale independently — over-provisioning one because the other is under load.</li>
+  <li>Not sizing vmstorage PVCs for the full retention period up front, causing disruptive resize operations later.</li>
+  <li>Assuming 100% PromQL compatibility for every advanced function — check MetricsQL docs for edge-case differences.</li>
+</ul>
+</div>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="interview-questions">50 Interview Questions</h2>
+
+<details class="qa"><summary>1. Why do teams adopt VictoriaMetrics instead of just running more Prometheus servers?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Prometheus's local TSDB doesn't scale well past a certain cardinality/retention, and federating many Prometheus servers is operationally painful.
+<br><strong>Detail:</strong> VictoriaMetrics keeps Prometheus doing scraping/alerting rules well, but replaces the storage layer with a horizontally scalable, far more disk/CPU-efficient engine.
+<br><strong>Production example:</strong> At Meesho-scale, hundreds of microservices across multiple EKS clusters emit millions of active series — a single global VM cluster avoids sharding dozens of independent Prometheus instances.
+<br><strong>Common mistake:</strong> Assuming Prometheus itself is "wrong" — its pull model, service discovery, and PromQL are kept; only storage is swapped out.</div></details>
+
+<details class="qa"><summary>2. What is the core problem VictoriaMetrics is designed to solve?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Long-term, high-cardinality time series storage without a linear cost/complexity explosion.
+<br><strong>Detail:</strong> Vanilla Prometheus stores everything on local per-instance disk; scaling retention or series count means either a sharded Prometheus fleet with Thanos/Cortex-style sidecars, or replacing the storage layer.
+<br><strong>Production example:</strong> A team needing 1+ years of retention across tens of millions of active series picks VM's cluster mode instead of federating Prometheus.
+<br><strong>Common mistake:</strong> Treating retention increases as a simple disk-size bump rather than an architectural decision.</div></details>
+
+<details class="qa"><summary>3. What are the two deployment flavors of VictoriaMetrics, and when would you choose each?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Single-node (one binary, disk-based, simple) and cluster mode (vminsert/vmstorage/vmselect, independently scalable).
+<br><strong>Detail:</strong> Single-node handles surprisingly large workloads with minimal operational overhead; cluster mode is needed once you clearly exceed single-node's vertical limits.
+<br><strong>Production example:</strong> Best practice per the reference doc: start with single-node VM and only move to cluster mode once you hit millions of active series.
+<br><strong>Common mistake:</strong> Jumping straight to cluster mode "for scale" before validating single-node actually can't handle the workload.</div></details>
+
+<details class="qa"><summary>4. What does vmagent do, and how does it relate to Prometheus?</summary>
+<div class="qa-body"><strong>Short answer:</strong> A lightweight, Prometheus-compatible scrape agent that discovers targets, scrapes them, and remote_writes samples onward.
+<br><strong>Detail:</strong> It uses the same Kubernetes SD mechanisms Prometheus uses, and can relabel, shard, and buffer scraped data during backend outages.
+<br><strong>Production example:</strong> A vmagent Deployment configured with <code>--promscrape.config</code> using the same syntax as <code>prometheus.yml</code> scrape_configs.
+<br><strong>Common mistake:</strong> Assuming vmagent requires a completely different scrape config format from Prometheus — it doesn't.</div></details>
+
+<details class="qa"><summary>5. What does vminsert do in cluster mode?</summary>
+<div class="qa-body"><strong>Short answer:</strong> It's the write entrypoint — it accepts writes and shards them by metric name/labels across vmstorage nodes.
+<br><strong>Detail:</strong> It consistently hashes each time series to the correct set of vmstorage shards so subsequent writes/reads for that series land consistently.
+<br><strong>Production example:</strong> vmagent's <code>--remoteWrite.url</code> points at <code>vminsert.monitoring.svc:8480/insert/0/prometheus/</code>.
+<br><strong>Common mistake:</strong> Confusing vminsert with vmstorage — vminsert routes, it does not persist data itself.</div></details>
+
+<details class="qa"><summary>6. What does vmstorage do, and how should its PVCs be sized?</summary>
+<div class="qa-body"><strong>Short answer:</strong> vmstorage is the durable storage tier — each replica is an independent shard that persists compressed time series data.
+<br><strong>Detail:</strong> It's deployed as a StatefulSet with a volumeClaimTemplate; you should scale nodes horizontally rather than disks vertically.
+<br><strong>Production example:</strong> A vmstorage StatefulSet with 3 replicas, each with a 200Gi PVC and a <code>--retentionPeriod=12</code> (months) flag.
+<br><strong>Common mistake:</strong> Not sizing vmstorage PVCs for the full retention period up front, causing disruptive resize operations later.</div></details>
+
+<details class="qa"><summary>7. What does vmselect do, and why can Grafana query it without special configuration?</summary>
+<div class="qa-body"><strong>Short answer:</strong> vmselect is the read entrypoint; it parses PromQL/MetricsQL, fans queries out to relevant vmstorage nodes, and merges results.
+<br><strong>Detail:</strong> Because vmselect's query API is wire-compatible with Prometheus, Grafana talks to it using the standard Prometheus datasource type.
+<br><strong>Production example:</strong> <code>kubectl port-forward -n monitoring svc/vmselect 8481:8481</code> then querying <code>/select/0/prometheus/api/v1/query?query=up</code> ad-hoc.
+<br><strong>Common mistake:</strong> Assuming Grafana needs a dedicated "VictoriaMetrics" plugin type instead of the ordinary Prometheus datasource.</div></details>
+
+<details class="qa"><summary>8. Why does cluster mode split ingest (vminsert) and query (vmselect) into separate components?</summary>
+<div class="qa-body"><strong>Short answer:</strong> So ingest and query paths can be scaled independently based on actual load.
+<br><strong>Detail:</strong> A write-heavy/read-light workload doesn't need to over-provision query capacity, and vice versa — a monolithic component would force both to scale together.
+<br><strong>Production example:</strong> Scaling vminsert replicas during a traffic spike in scrape volume without touching vmselect at all.
+<br><strong>Common mistake:</strong> Forgetting vmselect and vminsert scale independently, and over-provisioning one because the other is under load.</div></details>
+
+<details class="qa"><summary>9. What is vmalert, and how does it change the role of Alertmanager?</summary>
+<div class="qa-body"><strong>Short answer:</strong> vmalert evaluates recording and alerting rules directly against VM storage, sending firing alerts onward to Alertmanager.
+<br><strong>Detail:</strong> This closes the alerting loop without needing Prometheus itself for rule evaluation in some setups — "Prometheus for scraping, VictoriaMetrics for everything else."
+<br><strong>Production example:</strong> Using vmalert's recording rules to pre-aggregate expensive high-cardinality queries used on dashboards.
+<br><strong>Common mistake:</strong> Assuming you must keep a full Prometheus server running just to evaluate alerting rules once you're on VM.</div></details>
+
+<details class="qa"><summary>10. Why is VictoriaMetrics's storage engine so much more efficient than Prometheus's local TSDB?</summary>
+<div class="qa-body"><strong>Short answer:</strong> A custom storage format with aggressive columnar compression, deduplication, and a merge-tree-like structure inspired by ClickHouse.
+<br><strong>Detail:</strong> This dramatically reduces disk I/O and storage footprint, commonly cited as 5-10x less disk space and RAM than equivalent Prometheus TSDB for the same data.
+<br><strong>Production example:</strong> A platform team fitting a monitoring stack in a reasonable budget despite millions of active series across many EKS clusters.
+<br><strong>Common mistake:</strong> Assuming the efficiency gain is just "better defaults" rather than a fundamentally different on-disk data structure.</div></details>
+
+<details class="qa"><summary>11–50. Additional rapid-fire questions</summary>
+<div class="qa-body">
+<strong>11.</strong> What protocol does VictoriaMetrics use to receive data from Prometheus or vmagent? — remote_write.<br>
+<strong>12.</strong> What query language does VM support? — PromQL, plus its own extended MetricsQL.<br>
+<strong>13.</strong> Is 100% PromQL compatibility guaranteed on VM? — No — advanced functions may have edge-case differences; check MetricsQL docs.<br>
+<strong>14.</strong> What RBAC does vmagent need in Kubernetes? — Permission to list/watch Pods, Services, and Endpoints, same as Prometheus's service discovery.<br>
+<strong>15.</strong> What does <code>--remoteWrite.tmpDataPath</code> configure on vmagent? — A local disk buffer path used if vminsert is unreachable, so scraped samples aren't lost during a backend outage.<br>
+<strong>16.</strong> What does <code>--remoteWrite.maxDiskUsagePerURL</code> protect against? — Unbounded local buffer growth on vmagent filling node disks during a prolonged backend outage.<br>
+<strong>17.</strong> How does vminsert decide which vmstorage node a series goes to? — Consistent hashing on metric name + labels.<br>
+<strong>18.</strong> What tool should you use to manage VM in Kubernetes instead of hand-rolled manifests? — The VictoriaMetrics Operator, which manages upgrades and scaling.<br>
+<strong>19.</strong> What HA setting should vmstorage have in production? — 3+ replicas with a replication factor configured for redundancy.<br>
+<strong>20.</strong> What's a symptom of unvalidated label cardinality after migrating to VM? — Continued high resource usage — VM is efficient but unbounded cardinality still hurts any TSDB.<br>
+<strong>21.</strong> What ports does vmstorage expose and what are they for? — 8482 (HTTP), 8400 (vminsert connections), 8401 (vmselect connections).<br>
+<strong>22.</strong> How would you check vmstorage disk usage from kubectl? — <code>kubectl exec -n monitoring vmstorage-0 -- df -h /storage</code>.<br>
+<strong>23.</strong> How do you check for scrape/remote_write errors from vmagent? — <code>kubectl logs -n monitoring deploy/vmagent --tail=100</code>.<br>
+<strong>24.</strong> What CRDs might you see if using the VictoriaMetrics Operator? — vmagent, vmstorage, vmselect (and related VM* custom resources).<br>
+<strong>25.</strong> Why might you run vmagent with more than one replica? — For redundancy in scraping; use <code>--remoteWrite.label</code> to dedupe if needed.<br>
+<strong>26.</strong> What does the vmagent scrape config format look like compared to Prometheus? — Same syntax as <code>prometheus.yml</code> scrape_configs, referenced via <code>--promscrape.config</code>.<br>
+<strong>27.</strong> How does Grafana query a VictoriaMetrics cluster? — Via the standard Prometheus datasource type pointed at vmselect's URL, since the query API is wire-compatible.<br>
+<strong>28.</strong> What happens if you undersize vmstorage PVCs for your retention period? — You face disruptive resize operations later instead of planning capacity up front.<br>
+<strong>29.</strong> What is the relationship between vmalert and Alertmanager? — vmalert evaluates rules against VM and sends firing alerts to Alertmanager, which still handles routing/notification.<br>
+<strong>30.</strong> Why would a platform team prefer VM's merge-tree storage structure? — It's inspired by ClickHouse and dramatically reduces disk I/O and storage footprint versus Prometheus's local TSDB.<br>
+<strong>31.</strong> What is the practical effect of splitting write and read paths in cluster mode during a traffic spike? — You can scale vminsert alone for an ingest spike without touching vmselect capacity, and vice versa.<br>
+<strong>32.</strong> Why does VM's single-node mode remain viable for "surprisingly large" workloads? — Because its storage engine is efficient enough that many workloads don't need horizontal sharding at all.<br>
+<strong>33.</strong> What is the danger of only ever provisioning storage capacity, not query capacity? — vmselect can become a bottleneck since it fans out and merges across all vmstorage shards for every query.<br>
+<strong>34.</strong> Why does using recording rules via vmalert matter for dashboards? — It pre-aggregates expensive high-cardinality queries so dashboards don't recompute them from raw series on every load.<br>
+<strong>35.</strong> What's the significance of VM being "wire-compatible" with Prometheus remote_write/remote_read and PromQL? — It's a drop-in replacement for Prometheus's storage layer without changing scrape configs, dashboards, or alert rule syntax significantly.<br>
+<strong>36.</strong> How would you do an ad-hoc PromQL query directly against vmselect for debugging? — <code>curl 'http://localhost:8481/select/0/prometheus/api/v1/query?query=up'</code> after port-forwarding.<br>
+<strong>37.</strong> What's the tradeoff of running vmstorage with too few replicas? — Less horizontal capacity for storage and reduced resilience if a shard fails, since each holds a distinct portion of the series.<br>
+<strong>38.</strong> Why is vmagent described as a drop-in replacement for Prometheus's scrape role? — It performs the same discovery, scraping, and relabeling but forwards data via remote_write instead of storing it locally.<br>
+<strong>39.</strong> What migration mistake around cardinality is called out as a common pitfall? — Migrating without validating label cardinality first, since unbounded cardinality still hurts VM despite its efficiency.<br>
+<strong>40.</strong> Where does Alertmanager fit when vmalert is in use? — It still receives firing alerts from vmalert and handles routing/notification, just as it would from Prometheus.<br>
+<strong>41.</strong> How does VM's approach compare to running Thanos/Cortex sidecars on Prometheus? — VM replaces the storage layer directly with a purpose-built engine, versus federating/sharding many Prometheus servers with sidecars.<br>
+<strong>42.</strong> What does <code>--retentionPeriod=12</code> on vmstorage configure? — The number of months of data retained on that storage shard.<br>
+<strong>43.</strong> Why is the VictoriaMetrics Operator recommended over hand-rolled manifests? — It manages upgrades and scaling automatically instead of requiring manual StatefulSet/Deployment edits.<br>
+<strong>44.</strong> What's a reasonable first diagnostic step if vmagent pods are CrashLoopBackOff? — <code>kubectl describe pod -n monitoring vmagent-xxxx</code> to check for config errors.<br>
+<strong>45.</strong> How do you verify all VictoriaMetrics storage shards are healthy? — <code>kubectl get pods -n monitoring -l app=vmstorage</code>.<br>
+<strong>46.</strong> Why does VM's architecture fit Meesho-scale monitoring specifically? — Hundreds of microservices across multiple EKS clusters emitting millions of active series need horizontally scalable ingest/storage/query, which single Prometheus instances can't provide economically.<br>
+<strong>47.</strong> What's the risk of assuming every PromQL function behaves identically in MetricsQL? — Some advanced functions have edge-case differences; relying on undocumented compatibility can silently produce wrong query results.<br>
+<strong>48.</strong> Why is disk I/O reduction significant for time series workloads specifically? — Time series ingestion/query is I/O-heavy by nature (constant small writes, range scans), so compression and merge-tree structures directly cut cost and improve query latency.<br>
+<strong>49.</strong> What does "vmagent can shard during backend outages" mean in practice? — It can distribute buffered/forwarded data across multiple remote_write targets, aiding resilience when one backend path degrades.<br>
+<strong>50.</strong> If dashboards suddenly show gaps in data, what two VM components would you check first? — vmagent (is it scraping and successfully remote_writing) and vminsert/vmstorage (are shards accepting writes and healthy).
+</div></details>
+
+<!-- ============================================================ -->
+
+<footer class="course-footer">Next: Topic 53 — Grafana, the visualization and alerting layer on top of VictoriaMetrics/Prometheus.</footer>
+
+<script>
+  mermaid.initialize({ startOnLoad: true, theme: 'dark' });
+</script>
+
+</body>
+</html>

@@ -1,0 +1,275 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Topic 7: Controller Manager — Kubernetes Expert Course</title>
+<link rel="stylesheet" href="styles.css">
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+</head>
+<body>
+
+<header class="course-header">
+  <div class="kicker">Topic 7 of 70</div>
+  <h1>Controller Manager</h1>
+  <div class="subtitle">The reconciliation-loop pattern, the built-in controllers it runs, and how leader election keeps exactly one instance active.</div>
+</header>
+
+<nav class="topic-nav">
+  <a href="06-scheduler.html">&larr; Scheduler</a>
+  <a href="index.html">Course Index</a>
+  <a href="08-kubelet.html">kubelet &rarr;</a>
+</nav>
+
+<h2 id="explanation">Explanation</h2>
+<p>The <strong>kube-controller-manager</strong> is a single binary that bundles together dozens of independent
+<strong>controllers</strong>, each responsible for one narrow slice of cluster behavior: the Deployment controller
+manages ReplicaSets, the ReplicaSet controller manages Pods, the Node controller monitors node health, the Job
+controller runs batch workloads to completion, the ServiceAccount controller provisions default tokens, and so on.
+Each controller runs its own independent watch loop against the API Server — they don't know about each other, and
+they don't need to.</p>
+
+<p>Kubernetes needs this pattern because "declarative" only means something if some process is actively working to
+close the gap between desired and actual state. A <strong>reconciliation loop</strong> is the mechanism: watch for
+changes to a resource, compare desired (<code>spec</code>) against observed (<code>status</code>), and take whatever
+action shrinks the difference — then repeat, forever, reacting both to new events and to periodic full resyncs (so a
+missed event never permanently desyncs the system). This "level-triggered" design (react to full current state, not
+just the last delta) is what makes Kubernetes resilient to dropped messages and controller restarts.</p>
+
+<p>Bundling all these controllers into one process is a pragmatic choice rather than an architectural necessity —
+it means one leader-election lease, one binary to deploy, and shared caching infrastructure (informers), at the cost
+of them all sharing fate if the process crashes. Custom controllers and operators you write yourself follow the exact
+same pattern but run as separate processes/Deployments outside this binary — because the built-in controller manager
+only manages built-in resource types.</p>
+
+<p>Some example built-in controllers: the <strong>Deployment controller</strong> orchestrates rolling updates by
+creating new ReplicaSets and scaling old ones down; the <strong>Node controller</strong> watches heartbeats and marks
+Nodes NotReady, eventually evicting their Pods; the <strong>Endpoint/EndpointSlice controller</strong> keeps Service
+endpoints in sync with matching Pod readiness; the <strong>Namespace controller</strong> handles cascading deletion
+when a namespace is deleted; the <strong>ServiceAccount/Token controllers</strong> provision credentials.</p>
+
+<p>Like the Scheduler, the Controller Manager runs with multiple replicas for HA but uses <strong>leader election</strong>
+(a Lease object) so only one replica is ever actively reconciling — preventing two instances from racing to make
+conflicting decisions about the same resource.</p>
+
+<h2 id="internal-working">Internal Working / Interactions</h2>
+<ul>
+  <li><strong>Controller Manager &harr; API Server:</strong> every individual controller inside it watches its resource type(s) via informers and writes changes back through the same API Server.</li>
+  <li><strong>Deployment controller &rarr; ReplicaSet controller:</strong> a chain — Deployment creates/scales ReplicaSets, ReplicaSet controller creates/deletes Pods to match <code>replicas</code>.</li>
+  <li><strong>Node controller &harr; kubelet heartbeats:</strong> monitors Node status conditions; applies <code>NoExecute</code> taints and triggers eviction after the configured timeout.</li>
+  <li><strong>Leader election:</strong> all controllers inside the process share one Lease (<code>kube-controller-manager</code> in <code>kube-system</code>); only the leader replica runs any reconciliation.</li>
+  <li><strong>Custom controllers/operators:</strong> follow the identical watch-reconcile pattern but run as separate Deployments, extending the system without modifying this binary.</li>
+</ul>
+
+<h2 id="architecture-diagram">Architecture Diagram</h2>
+<pre class="mermaid">
+flowchart TB
+    API["API Server"]
+    subgraph CM["Controller Manager (single leader-elected process)"]
+        DC["Deployment Controller"]
+        RS["ReplicaSet Controller"]
+        NC["Node Controller"]
+        JC["Job Controller"]
+        EC["EndpointSlice Controller"]
+    end
+    API <-->|watch Deployments| DC
+    DC -->|create/scale| RS
+    API <-->|watch ReplicaSets| RS
+    RS -->|create/delete Pods| API
+    API <-->|watch Node heartbeats| NC
+    NC -->|taint/evict| API
+    API <-->|watch Jobs| JC
+    API <-->|watch Pods+Services| EC
+</pre>
+
+<pre class="mermaid">
+sequenceDiagram
+    participant U as kubectl
+    participant A as API Server
+    participant DCtl as Deployment Controller
+    participant RSCtl as ReplicaSet Controller
+    U->>A: kubectl scale deployment/web --replicas=5
+    A->>A: Persist spec.replicas=5 to etcd
+    A-->>DCtl: Watch event: Deployment updated
+    DCtl->>A: Update owned ReplicaSet's spec.replicas=5
+    A-->>RSCtl: Watch event: ReplicaSet updated
+    RSCtl->>RSCtl: Compare desired(5) vs actual(3) Pods
+    RSCtl->>A: Create 2 new Pod objects
+    A-->>U: (async) Pods transition Pending -> Running
+</pre>
+
+<h2 id="code-example">Code Example</h2>
+<pre><code># kube-controller-manager static pod — the relevant flags controlling
+# reconciliation behavior and leader election.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: kube-controller-manager
+  namespace: kube-system
+spec:
+  containers:
+    - name: kube-controller-manager
+      image: registry.k8s.io/kube-controller-manager:v1.29.0
+      command:
+        - kube-controller-manager
+        - --leader-elect=true                       # enable HA leader election
+        - --leader-elect-lease-duration=15s
+        - --leader-elect-renew-deadline=10s
+        - --node-monitor-period=5s                   # how often Node controller checks heartbeats
+        - --node-monitor-grace-period=40s             # heartbeat silence before NotReady
+        - --pod-eviction-timeout=5m0s                 # grace period before evicting Pods off a NotReady node
+        - --concurrent-deployment-syncs=5             # parallelism for the Deployment controller's workqueue
+        - --controllers=*,-bootstrapsigner,-tokencleaner  # enable all controllers except these two
+</code></pre>
+
+<h2 id="kubectl-commands">kubectl Commands</h2>
+<pre><code># Confirm controller-manager is running and check the leader lease
+kubectl get pods -n kube-system -l component=kube-controller-manager
+kubectl get lease -n kube-system kube-controller-manager -o yaml
+
+# Watch a Deployment's controller chain in action
+kubectl scale deployment web --replicas=5
+kubectl get replicasets -l app=web -w
+
+# Inspect owner references to see the controller chain explicitly
+kubectl get pod web-7d9f8c-abcde -o jsonpath='{.metadata.ownerReferences}'
+
+# Check Node controller behavior via conditions/taints
+kubectl describe node worker-3 | grep -A5 Taints
+kubectl get events --field-selector reason=NodeNotReady -A
+
+# View controller-manager logs directly (kubeadm cluster)
+kubectl logs kube-controller-manager-controlplane-1 -n kube-system
+</code></pre>
+
+<h2 id="best-practices">Best Practices &amp; Common Pitfalls</h2>
+<div class="grid-2">
+<div>
+<h4>Best Practices</h4>
+<ul>
+  <li>Tune <code>node-monitor-grace-period</code> and <code>pod-eviction-timeout</code> deliberately for your failure-tolerance needs.</li>
+  <li>Monitor leader-election lease flapping — it silently halts all reconciliation cluster-wide.</li>
+  <li>Understand owner-reference chains (Deployment &rarr; ReplicaSet &rarr; Pod) before manually editing any of them.</li>
+  <li>Write custom controllers to follow the same level-triggered reconcile pattern, not ad-hoc scripts.</li>
+</ul>
+</div>
+<div>
+<h4>Pitfalls</h4>
+<ul>
+  <li>Manually editing a ReplicaSet's Pods directly instead of through the Deployment — the controller will just recreate them.</li>
+  <li>Assuming multiple controller-manager replicas parallelize work — only the leader is ever active.</li>
+  <li>Setting eviction timeouts too aggressively, causing unnecessary reschedule storms on transient network blips.</li>
+  <li>Forgetting that disabling a specific controller (via <code>--controllers</code>) silently breaks features that depend on it (e.g. disabling <code>serviceaccount-token</code> breaks new pod credential provisioning).</li>
+</ul>
+</div>
+</div>
+
+<h2 id="interview-questions">50 Interview Questions</h2>
+
+<details class="qa"><summary>1. What is a reconciliation loop and why is it "level-triggered" rather than "edge-triggered"?</summary>
+<div class="qa-body"><strong>Short answer:</strong> A continuous process comparing full desired state against full observed state and acting to shrink the gap — level-triggered means it reacts to current state, not just the last event.
+<br><strong>Detailed explanation:</strong> Edge-triggered systems act only on the delta of the last change and can permanently desync if an event is dropped; level-triggered controllers periodically resync against full current state regardless of events, so a missed watch event never causes permanent drift.
+<br><strong>Production example:</strong> The ReplicaSet controller doesn't just react to "a Pod died" events — it periodically re-compares desired replica count against actual running Pods regardless.
+<br><strong>Common mistake:</strong> Writing a custom controller that only reacts to specific event deltas without a periodic full resync, making it fragile to missed watch events.</div></details>
+
+<details class="qa"><summary>2. Why does Controller Manager bundle dozens of controllers into a single binary?</summary>
+<div class="qa-body"><strong>Short answer:</strong> A pragmatic choice for one leader-election lease, one deployable artifact, and shared informer caching infrastructure.
+<br><strong>Detailed explanation:</strong> This isn't an architectural necessity — it's operational convenience. The tradeoff is shared fate: if the process crashes, every built-in controller (Deployment, Node, Job, etc.) stops simultaneously, unlike if each ran as a separate process.
+<br><strong>Production example:</strong> A crash-looping kube-controller-manager pod halts Deployment rollouts, Node health monitoring, and Job completion tracking all at once.
+<br><strong>Common mistake:</strong> Assuming individual controllers can be independently restarted without affecting the others — they all share one process's lifecycle.</div></details>
+
+<details class="qa"><summary>3. Trace the controller chain when you run <code>kubectl scale deployment web --replicas=5</code>.</summary>
+<div class="qa-body"><strong>Short answer:</strong> API Server persists the new replica count; the Deployment controller updates the owned ReplicaSet's replica count; the ReplicaSet controller then creates/deletes Pods to match.
+<br><strong>Detailed explanation:</strong> This is a chain of independent watch-reconcile loops, not one atomic operation — the Deployment controller watches Deployments and writes to ReplicaSets; the ReplicaSet controller separately watches ReplicaSets and writes to Pods. Each layer only knows about the layer directly below it via owner references.
+<br><strong>Production example:</strong> <code>kubectl get pod ... -o jsonpath='{.metadata.ownerReferences}'</code> reveals this exact chain explicitly on a running Pod.
+<br><strong>Common mistake:</strong> Believing scaling a Deployment directly creates Pods — it actually goes through an intermediate ReplicaSet update first.</div></details>
+
+<details class="qa"><summary>4. What does the Node controller do, and what are the relevant timing parameters?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Monitors node heartbeats and marks Nodes NotReady, eventually evicting their Pods, governed by <code>node-monitor-grace-period</code> and <code>pod-eviction-timeout</code>.
+<br><strong>Detailed explanation:</strong> <code>node-monitor-period</code> controls how often it checks heartbeats (default 5s); <code>node-monitor-grace-period</code> is how long without a heartbeat before NotReady (default 40s); <code>pod-eviction-timeout</code> is the additional grace period before Pods are actually evicted (default 5m) — this staged approach avoids overreacting to brief network blips.
+<br><strong>Production example:</strong> A transient 30-second network blip causes no Pod disruption since it's under the grace period; a genuine node failure triggers full eviction after ~5 minutes.
+<br><strong>Common mistake:</strong> Setting these timeouts too aggressively without considering the tradeoff between fast failure response and unnecessary reschedule storms from transient issues.</div></details>
+
+<details class="qa"><summary>5. Why is manually editing a controller-managed Pod pointless?</summary>
+<div class="qa-body"><strong>Short answer:</strong> The owning controller (e.g. ReplicaSet) will simply recreate or revert it to match the desired state on its next reconcile pass.
+<br><strong>Detailed explanation:</strong> Because reconciliation is continuous and level-triggered, any drift you manually introduce into a controller-owned resource is treated exactly like drift from a crash — the controller corrects it, often within seconds.
+<br><strong>Production example:</strong> Manually deleting a ReplicaSet-owned Pod for "testing" just results in the ReplicaSet controller creating a brand-new replacement Pod almost immediately.
+<br><strong>Common mistake:</strong> Trying to permanently change a controller-managed object's Pods directly instead of updating the owning resource's spec/template.</div></details>
+
+<details class="qa"><summary>6. How do custom controllers/operators relate to the built-in Controller Manager?</summary>
+<div class="qa-body"><strong>Short answer:</strong> They follow the identical watch-reconcile pattern but run as separate processes/Deployments, extending Kubernetes without modifying the core binary.
+<br><strong>Detailed explanation:</strong> The built-in Controller Manager only manages built-in resource types; custom controllers (often built with client-go/controller-runtime) watch CRDs or built-in types and reconcile them the same way, just outside this specific binary.
+<br><strong>Production example:</strong> An Argo CD application controller reconciles Application CRDs toward their desired Git state, using the same watch/informer/reconcile pattern as the built-in Deployment controller.
+<br><strong>Common mistake:</strong> Assuming you must modify or fork the core Controller Manager to add new reconciliation behavior — writing an independent controller/operator is the standard extension mechanism.</div></details>
+
+<details class="qa"><summary>7. Why does leader election matter specifically for Controller Manager, and what's shared across all its controllers?</summary>
+<div class="qa-body"><strong>Short answer:</strong> All controllers inside the process share one Lease; only the leader replica runs any reconciliation, preventing conflicting decisions from multiple active replicas.
+<br><strong>Detailed explanation:</strong> Because it's one binary with one lease (<code>kube-controller-manager</code> in <code>kube-system</code>), leadership is all-or-nothing — you can't have one controller inside the binary active on replica A while another is active on replica B.
+<br><strong>Production example:</strong> <code>kubectl get lease -n kube-system kube-controller-manager -o yaml</code> shows a single holder identity governing every built-in controller simultaneously.
+<br><strong>Common mistake:</strong> Expecting different controllers within the binary to have independent leadership/failover — they all fail over together as one unit.</div></details>
+
+<details class="qa"><summary>8. What's the effect of disabling a specific controller via <code>--controllers</code>?</summary>
+<div class="qa-body"><strong>Short answer:</strong> It silently breaks any feature that depends on that controller, often in non-obvious ways.
+<br><strong>Detailed explanation:</strong> For example, disabling <code>serviceaccount-token</code> breaks new pod credential provisioning; the failure won't be an explicit error about the disabled controller — it'll manifest as some downstream feature just not working as expected.
+<br><strong>Production example:</strong> A hardening pass disables several controllers to reduce attack surface, unaware one of them silently broke automatic ServiceAccount token rotation.
+<br><strong>Common mistake:</strong> Disabling controllers without a clear understanding of every downstream feature that implicitly depends on them.</div></details>
+
+<details class="qa"><summary>9. What does the EndpointSlice controller do and why does it matter for Services?</summary>
+<div class="qa-body"><strong>Short answer:</strong> It keeps a Service's EndpointSlice objects in sync with matching Pods' readiness state.
+<br><strong>Detailed explanation:</strong> As Pods pass or fail readiness probes, this controller adds/removes their IPs from the EndpointSlice(s) backing a Service; kube-proxy then watches those EndpointSlices to program actual routing rules — this controller is the missing link between "Pod is Ready" and "traffic actually reaches it."
+<br><strong>Production example:</strong> A Pod failing its readiness probe during a bad deploy gets removed from the EndpointSlice within seconds, stopping new traffic from routing to it.
+<br><strong>Common mistake:</strong> Debugging "Service not routing to my Pod" by looking only at the Pod's status instead of checking whether its IP actually appears in the EndpointSlice.</div></details>
+
+<details class="qa"><summary>10–50. Additional rapid-fire questions</summary>
+<div class="qa-body">
+<strong>10.</strong> What controller manages ReplicaSets on behalf of a Deployment? — The Deployment controller.<br>
+<strong>11.</strong> What controller creates/deletes Pods to match a desired replica count? — The ReplicaSet controller.<br>
+<strong>12.</strong> What object does leader election use under the hood? — A <code>Lease</code> object in <code>coordination.k8s.io/v1</code>.<br>
+<strong>13.</strong> What flag enables leader election on kube-controller-manager? — <code>--leader-elect=true</code>.<br>
+<strong>14.</strong> What controls how often the Node controller checks heartbeats? — <code>--node-monitor-period</code>.<br>
+<strong>15.</strong> What controls the grace period before eviction after a node is NotReady? — <code>--pod-eviction-timeout</code>.<br>
+<strong>16.</strong> What's the risk of setting <code>--concurrent-deployment-syncs</code> too high? — Increased load on the API Server and etcd from many simultaneous reconciliation operations.<br>
+<strong>17.</strong> Why does the Namespace controller matter during deletion? — It handles cascading deletion of all resources within a namespace when the namespace itself is deleted.<br>
+<strong>18.</strong> What's an owner reference and why does it matter for garbage collection? — A pointer from a child object (Pod) to its owner (ReplicaSet); when the owner is deleted, Kubernetes' garbage collector cleans up owned children automatically.<br>
+<strong>19.</strong> Why do controllers use informers instead of direct API calls on every reconcile? — Informers maintain a local cache populated via list+watch, avoiding redundant API Server load on every reconciliation pass.<br>
+<strong>20.</strong> What's the Job controller responsible for? — Running batch workloads to completion, tracking success/failure counts against the Job's spec.<br>
+<strong>21.</strong> Why might disabling <code>bootstrapsigner</code>/<code>tokencleaner</code> be acceptable in some clusters? — They're related to legacy bootstrap token cleanup, often unnecessary in clusters not using that bootstrap mechanism.<br>
+<strong>22.</strong> What's the practical effect of controller-manager leader-election flapping? — Reconciliation halts and restarts repeatedly, potentially causing inconsistent partial state changes cluster-wide.<br>
+<strong>23.</strong> How would you confirm which replica is the active controller-manager leader? — <code>kubectl get lease -n kube-system kube-controller-manager -o yaml</code>.<br>
+<strong>24.</strong> Why is reconciliation described as "eventually consistent" rather than instantaneous? — There's inherent latency between an event occurring, the watch firing, and the controller completing its reconcile action.<br>
+<strong>25.</strong> What's a real symptom of the ReplicaSet controller not functioning? — Deleted Pods under a Deployment don't get recreated at all, staying below the desired replica count indefinitely.<br>
+<strong>26.</strong> Why does the ServiceAccount/Token controller matter for new Pods? — It provisions the default credentials a Pod needs to authenticate to the API Server if no explicit ServiceAccount token is specified.<br>
+<strong>27.</strong> What's the relationship between reconciliation loops and idempotency? — Reapplying the same desired state repeatedly should always converge to the same result — reconciliation depends on actions being safely repeatable.<br>
+<strong>28.</strong> Why is "shared fate" a real operational risk of bundling controllers into one binary? — A bug or resource exhaustion in one controller's logic can crash the process, halting every other bundled controller simultaneously.<br>
+<strong>29.</strong> What's a common cause of Deployment rollouts appearing "stuck"? — The Deployment controller's leader (Controller Manager) losing its lease, or PodDisruptionBudgets/resource constraints blocking the ReplicaSet controller's Pod creation.<br>
+<strong>30.</strong> Why must custom controllers respect the same eventual-consistency model as built-in ones? — Kubernetes' entire object model assumes asynchronous reconciliation; a controller expecting synchronous immediate effects will misbehave.<br>
+<strong>31.</strong> What's the danger of writing a controller without a periodic full resync? — It becomes vulnerable to permanent desync if a watch event is ever dropped or missed during a restart/reconnect.<br>
+<strong>32.</strong> Why does the Controller Manager need the same version-skew discipline as other control-plane components? — Its internal API client code must stay compatible with the API Server's served API versions/behavior.<br>
+<strong>33.</strong> What's the effect of a Node controller misconfiguration causing overly aggressive eviction? — Unnecessary reschedule storms triggered by transient network blips rather than genuine node failures.<br>
+<strong>34.</strong> How do you verify the controller chain (Deployment → ReplicaSet → Pod) explicitly? — Inspect <code>ownerReferences</code> on the Pod and ReplicaSet objects via <code>kubectl get ... -o yaml</code>.<br>
+<strong>35.</strong> Why is the reconciliation pattern considered "self-healing"? — Because the loop runs continuously and reacts to any divergence from desired state, including divergence caused by crashes, manual edits, or infrastructure failure.<br>
+<strong>36.</strong> What's the risk of setting <code>node-monitor-grace-period</code> too low? — Nodes get marked NotReady (and Pods potentially evicted) due to brief, harmless network hiccups.<br>
+<strong>37.</strong> What's the risk of setting it too high? — Genuinely failed nodes take longer to be detected, delaying Pod rescheduling and prolonging any resulting service degradation.<br>
+<strong>38.</strong> Why does the Deployment controller create a *new* ReplicaSet during a rolling update rather than editing the existing one? — This is what enables rollback — the old ReplicaSet (with the previous Pod template) is scaled down but kept around, not destroyed.<br>
+<strong>39.</strong> What's a good first diagnostic step when a specific resource type (e.g. Jobs) stops reconciling but everything else works? — Check that specific controller's logs and confirm it wasn't disabled via <code>--controllers</code>.<br>
+<strong>40.</strong> Why is watching controller-manager CPU/memory usage important? — Resource starvation there can cause leader-election lease loss, halting reconciliation cluster-wide, not just for one resource type.<br>
+<strong>41.</strong> What's the difference between a controller reconciling a resource and a controller "owning" it? — Reconciling means acting to converge state; owning specifically means the resource has an ownerReference pointing to this controller's managed object, enabling cascading garbage collection.<br>
+<strong>42.</strong> Why shouldn't you rely on Deployment replica count alone for availability guarantees? — Without topology spread/anti-affinity, the ReplicaSet controller may satisfy the count without spreading Pods across failure domains.<br>
+<strong>43.</strong> What's an operator, in relation to the Controller Manager pattern? — A custom controller (often domain-specific, e.g. a database operator) that encodes operational knowledge into the same reconcile-loop pattern, extending it to custom resources.<br>
+<strong>44.</strong> How does the Controller Manager detect a Deployment's rollout is complete? — By comparing the new ReplicaSet's ready replica count against the Deployment's desired replica count and rollout strategy parameters.<br>
+<strong>45.</strong> Why is "one leader at a time" specifically important for the Node controller? — Two active instances could both decide independently to evict Pods off the same node, causing duplicate or conflicting eviction actions.<br>
+<strong>46.</strong> What's a good way to test a custom controller's resync behavior? — Deliberately drop or delay a watch event in a test environment and confirm the periodic resync still converges state correctly.<br>
+<strong>47.</strong> Why does disabling controllers require careful documentation in a hardened cluster? — Future engineers troubleshooting "missing" behavior have no obvious signal that a controller was intentionally turned off.<br>
+<strong>48.</strong> What's the relationship between PodDisruptionBudgets and the Node controller's eviction behavior? — The Node controller (and voluntary disruption paths) should respect PDBs to avoid dropping below the minimum available replica count during evictions where possible.<br>
+<strong>49.</strong> Why is understanding the full controller chain valuable during an incident? — It tells you exactly which layer to inspect first — Deployment spec, ReplicaSet status, or individual Pod events — instead of guessing.<br>
+<strong>50.</strong> What's the very first thing to check when "nothing self-heals" across the whole cluster? — Whether kube-controller-manager is running and holds its leader-election lease — a stuck lease halts every built-in controller at once.
+</div></details>
+
+<footer class="course-footer">Next: Topic 8 — kubelet, the node agent that actually acts on everything these controllers decide.</footer>
+
+<script>
+  mermaid.initialize({ startOnLoad: true, theme: 'dark' });
+</script>
+
+</body>
+</html>

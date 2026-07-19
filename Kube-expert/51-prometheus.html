@@ -1,0 +1,281 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Topic 51: Prometheus — Kubernetes Expert Course</title>
+<link rel="stylesheet" href="styles.css">
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+</head>
+<body>
+
+<header class="course-header">
+  <div class="kicker">Topic 51 of 70</div>
+  <h1>Prometheus</h1>
+  <div class="subtitle">Pull-based metrics collection, ServiceMonitors, PromQL, and alerting via Alertmanager.</div>
+</header>
+
+<nav class="topic-nav">
+  <a href="50-observability.html">&larr; Observability</a>
+  <a href="index.html">Course Index</a>
+  <a href="52-victoriametrics.html">VictoriaMetrics &rarr;</a>
+</nav>
+
+<h2 id="explanation">Explanation</h2>
+
+<p><strong>Prometheus</strong> is the de facto standard metrics system for Kubernetes — a CNCF graduated project that
+implements the metrics pillar of observability (Topic 50) with a specific, deliberate design choice: it
+<strong>pulls</strong> (scrapes) metrics from targets over HTTP on a schedule, rather than having applications push
+metrics to it. Kubernetes needs a metrics system with exactly this shape because the cluster is inherently dynamic —
+Prometheus's service-discovery integration lets it automatically find scrape targets as Pods come and go, rather than
+every workload needing to know a metrics endpoint's address to push to.</p>
+
+<p>Every scrape target exposes a plain-text <code>/metrics</code> HTTP endpoint listing current values for its
+counters, gauges, histograms, and summaries. Prometheus scrapes each target on an interval (commonly 15-30s),
+storing each sample with a timestamp in its own purpose-built time-series database. The pull model has real
+operational advantages in Kubernetes: Prometheus itself can detect a target is down (a failed scrape is a strong,
+unambiguous signal), and targets don't need any awareness of where Prometheus lives or need network egress to it —
+Prometheus just needs to know how to find and reach them.</p>
+
+<p>Manually configuring scrape targets for every microservice doesn't scale, so most clusters run the
+<strong>Prometheus Operator</strong> (Topic 46's Operator pattern applied to Prometheus itself), which introduces the
+<strong>ServiceMonitor</strong> CRD: a declarative object saying "scrape any Service matching these labels, on this
+port, at this path." The Operator watches ServiceMonitors and automatically regenerates Prometheus's underlying
+scrape configuration — so onboarding a new microservice's metrics is "add a ServiceMonitor," not "hand-edit a giant
+central Prometheus config file and reload it."</p>
+
+<p><strong>PromQL</strong> is Prometheus's query language, built around the concept of a time series identified by a
+metric name plus a set of label key/value pairs. Basic queries select a metric (<code>http_requests_total</code>);
+label matchers filter it (<code>http_requests_total{service="checkout"}</code>); range vectors and functions compute
+rates over time (<code>rate(http_requests_total[5m])</code> — the per-second average request rate over the last 5
+minutes, essential because raw counters only ever increase and are meaningless without a rate). Aggregation operators
+(<code>sum by (service) (...)</code>) roll many series into fewer for dashboards and alerts.</p>
+
+<p>Alerting is a separate concern handled by evaluating PromQL expressions as <strong>alerting rules</strong>
+(e.g. "fire if error rate &gt; 5% for 5 minutes") inside Prometheus itself, which then forwards firing alerts to
+<strong>Alertmanager</strong> — a distinct component responsible for deduplication, grouping, silencing, and routing
+alerts to notification channels (PagerDuty, Slack, email). This separation means Prometheus's job stops at "is this
+condition true," while Alertmanager owns the entirely different problem of "who should be told, how, and how often."</p>
+
+<h2 id="internal-working">Internal Working / Interactions</h2>
+<ul>
+  <li><strong>Prometheus server:</strong> scrapes targets on an interval, stores samples in its local TSDB, evaluates alerting/recording rules.</li>
+  <li><strong>Prometheus Operator:</strong> watches ServiceMonitor/PodMonitor/PrometheusRule CRDs and regenerates the running Prometheus server's config automatically.</li>
+  <li><strong>Kubernetes API Server / kube-state-metrics / cAdvisor:</strong> common scrape targets exposing cluster-object state and container resource usage respectively.</li>
+  <li><strong>Alertmanager:</strong> receives firing alerts pushed from Prometheus, handles dedup/grouping/silencing/routing to external notification channels.</li>
+  <li><strong>Grafana:</strong> queries Prometheus's HTTP API (PromQL) to render dashboards — a separate, stateless visualization layer.</li>
+</ul>
+
+<h2 id="architecture-diagram">Architecture Diagram</h2>
+<pre class="mermaid">
+flowchart TB
+    subgraph Targets["Scrape Targets"]
+        Pod1["checkout-service Pod\n:9100/metrics"]
+        KSM["kube-state-metrics"]
+        API["API Server /metrics"]
+    end
+    SM["ServiceMonitor CRD\n(selects Service by label)"]
+    Op["Prometheus Operator"]
+    Prom["Prometheus server\n(scrapes on interval, stores TSDB,\nevaluates PrometheusRules)"]
+    AM["Alertmanager\n(dedup, group, route)"]
+    Slack["Slack / PagerDuty"]
+    Graf["Grafana (PromQL queries)"]
+
+    SM --> Op
+    Op -->|generates scrape config| Prom
+    Prom -->|scrape| Pod1
+    Prom -->|scrape| KSM
+    Prom -->|scrape| API
+    Prom -->|firing alerts| AM
+    AM --> Slack
+    Graf -->|PromQL| Prom
+</pre>
+
+<h2 id="code-example">Code Example</h2>
+<pre><code># 1. ServiceMonitor — tells the Prometheus Operator to scrape checkout-service Pods
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: checkout-service
+  namespace: payments
+  labels:
+    release: prometheus            # Must match the Prometheus CR's serviceMonitorSelector.
+spec:
+  selector:
+    matchLabels:
+      app: checkout-service         # Selects the Service (not the Pod directly) with this label.
+  endpoints:
+    - port: metrics                 # Named port on the Service, e.g. "metrics" -> containerPort 9100.
+      path: /metrics
+      interval: 30s
+---
+# 2. PrometheusRule — alerting rule evaluated by Prometheus, routed via Alertmanager
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: checkout-service-alerts
+  namespace: payments
+  labels:
+    release: prometheus
+spec:
+  groups:
+    - name: checkout-service.rules
+      rules:
+        - alert: CheckoutHighErrorRate
+          expr: |
+            sum(rate(http_requests_total{service="checkout",status=~"5.."}[5m]))
+            /
+            sum(rate(http_requests_total{service="checkout"}[5m])) > 0.05
+          for: 5m                    # Must stay true for 5 minutes before firing (avoids noisy blips).
+          labels:
+            severity: critical
+          annotations:
+            summary: "Checkout service 5xx rate above 5% for 5 minutes"
+</code></pre>
+
+<h2 id="kubectl-commands">kubectl Commands</h2>
+<pre><code>kubectl get servicemonitors -A                          # List all ServiceMonitors the Operator is watching
+kubectl get prometheusrules -n payments                   # List alerting rules for this namespace
+kubectl port-forward svc/prometheus-operated 9090 -n observability   # Access Prometheus's own UI/API
+kubectl get pods -n observability -l app.kubernetes.io/name=prometheus  # Check Prometheus server Pod status
+kubectl logs -n observability prometheus-k8s-0 -c prometheus            # Prometheus server logs (scrape/rule errors)
+kubectl get alertmanager -n observability                                 # Inspect the Alertmanager custom resource
+curl -s localhost:9090/api/v1/query --data-urlencode 'query=up{job="checkout-service"}'  # Ad-hoc PromQL via the HTTP API
+</code></pre>
+
+<h2 id="best-practices">Best Practices &amp; Common Pitfalls</h2>
+<div class="grid-2">
+<div>
+<h4>Best Practices</h4>
+<ul>
+  <li>Use ServiceMonitors/PodMonitors via the Operator rather than hand-editing Prometheus's scrape config directly.</li>
+  <li>Always wrap counters in <code>rate()</code> over a window before graphing/alerting — raw counter values are meaningless.</li>
+  <li>Use <code>for:</code> durations on alerting rules to avoid paging on transient blips.</li>
+  <li>Keep label cardinality bounded — avoid labels with unbounded values like raw user IDs or request IDs.</li>
+</ul>
+</div>
+<div>
+<h4>Pitfalls</h4>
+<ul>
+  <li>Forgetting the ServiceMonitor selects a <em>Service</em>, not a Pod directly — a missing/mislabeled Service means silent scrape failure.</li>
+  <li>Running a single non-HA Prometheus instance for production alerting with no redundancy — a single point of failure for your alerting pipeline.</li>
+  <li>Confusing Prometheus's local TSDB retention limits with long-term storage needs — long-term/high-cardinality workloads usually need a remote-write backend (see VictoriaMetrics, next topic).</li>
+  <li>Routing every alert straight to a human pager without grouping/silencing in Alertmanager, causing alert fatigue.</li>
+</ul>
+</div>
+</div>
+
+<h2 id="interview-questions">50 Interview Questions</h2>
+
+<details class="qa"><summary>1. Why does Prometheus pull (scrape) metrics rather than have applications push them?</summary>
+<div class="qa-body"><strong>Short answer:</strong> The pull model lets Prometheus itself detect a target is down (a failed scrape is unambiguous), and targets never need to know where Prometheus lives or need network egress to it.
+<br><strong>Detail:</strong> This fits Kubernetes's dynamic nature — service discovery lets Prometheus automatically find scrape targets as Pods come and go, instead of every workload needing to know a metrics endpoint's address to push to.
+<br><strong>Production example:</strong> A crashed Pod simply stops responding to scrapes, and the resulting `up == 0` series is itself alertable — no separate "did the push stop" heuristic needed.
+<br><strong>Common mistake:</strong> Assuming Prometheus needs inbound network access configured per-application rather than the reverse — it's Prometheus reaching out, not applications pushing in.</div></details>
+
+<details class="qa"><summary>2. What does a scrape target's /metrics endpoint actually expose?</summary>
+<div class="qa-body"><strong>Short answer:</strong> A plain-text HTTP endpoint listing current values for its counters, gauges, histograms, and summaries.
+<br><strong>Detail:</strong> Prometheus scrapes each target on an interval (commonly 15-30s) and stores each sample with a timestamp in its own purpose-built time-series database (TSDB).
+<br><strong>Production example:</strong> `curl localhost:9100/metrics` on a Pod shows raw text like `http_requests_total{method="GET"} 4231`.
+<br><strong>Common mistake:</strong> Expecting /metrics to return JSON — it's a specific plain-text exposition format, not a generic API response.</div></details>
+
+<details class="qa"><summary>3. What problem does the Prometheus Operator's ServiceMonitor CRD solve?</summary>
+<div class="qa-body"><strong>Short answer:</strong> It replaces hand-editing a giant central Prometheus scrape config with a declarative object saying "scrape any Service matching these labels, on this port, at this path."
+<br><strong>Detail:</strong> The Operator watches ServiceMonitors and automatically regenerates Prometheus's underlying scrape configuration, so onboarding a new microservice's metrics becomes "add a ServiceMonitor," not a manual central-file edit and reload.
+<br><strong>Production example:</strong> A ServiceMonitor with `matchLabels: { app: checkout-service }` and `labels: { release: prometheus }` gets picked up automatically the moment it's applied.
+<br><strong>Common mistake:</strong> Forgetting the ServiceMonitor's own label (e.g. `release: prometheus`) must match the Prometheus CR's `serviceMonitorSelector` — otherwise the Operator silently ignores it.</div></details>
+
+<details class="qa"><summary>4. Does a ServiceMonitor select Pods directly or Services?</summary>
+<div class="qa-body"><strong>Short answer:</strong> A ServiceMonitor's selector matches a Service, not a Pod directly.
+<br><strong>Detail:</strong> The `endpoints.port` field references a named port on that Service (e.g. "metrics" mapping to containerPort 9100) — the Operator resolves the Service's endpoints to find actual scrape targets.
+<br><strong>Production example:</strong> A missing or mislabeled Service in front of otherwise-correct Pods means the ServiceMonitor matches nothing, and metrics silently stop being scraped.
+<br><strong>Common mistake:</strong> Debugging a "missing metrics" issue by checking the Pod's labels only, without checking whether the fronting Service itself has the labels the ServiceMonitor selects on.</div></details>
+
+<details class="qa"><summary>5. Why is `rate()` essential when working with counters in PromQL?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Raw counters only ever increase, so a raw counter value is meaningless on its own — you need `rate()` over a time window to get a meaningful per-second measure.
+<br><strong>Detail:</strong> `rate(http_requests_total[5m])` computes the per-second average request rate over the last 5 minutes, correctly handling counter resets (e.g. from a Pod restart) that a naive subtraction would not.
+<br><strong>Production example:</strong> Graphing `http_requests_total` directly just shows an ever-climbing line; graphing `rate(http_requests_total[5m])` shows the actual traffic pattern.
+<br><strong>Common mistake:</strong> Alerting or graphing directly on a raw counter value instead of wrapping it in `rate()` first.</div></details>
+
+<details class="qa"><summary>6. How do alerting rules relate to Alertmanager, and why is that split deliberate?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Prometheus evaluates PromQL expressions as alerting rules and decides "is this condition true"; Alertmanager is a separate component that owns "who should be told, how, and how often."
+<br><strong>Detail:</strong> This separation means Prometheus stays focused on detection while Alertmanager independently handles deduplication, grouping, silencing, and routing to notification channels like PagerDuty, Slack, or email.
+<br><strong>Production example:</strong> A `CheckoutHighErrorRate` PrometheusRule fires, and Alertmanager groups it with related alerts before routing a single deduplicated notification to Slack instead of paging once per replica.
+<br><strong>Common mistake:</strong> Routing every fired alert straight to a human pager without grouping/silencing configured in Alertmanager, causing alert fatigue.</div></details>
+
+<details class="qa"><summary>7. What does the `for:` duration on a PrometheusRule accomplish?</summary>
+<div class="qa-body"><strong>Short answer:</strong> It requires the alerting expression to stay true for a sustained period (e.g. 5 minutes) before the alert actually fires, avoiding noisy pages on transient blips.
+<br><strong>Detail:</strong> Without `for:`, a single scrape interval's momentary spike above threshold would immediately fire and notify, even if it self-resolved within seconds.
+<br><strong>Production example:</strong> `expr: ... > 0.05` combined with `for: 5m` means a brief 10-second error spike doesn't page anyone, but a sustained 5%+ error rate does.
+<br><strong>Common mistake:</strong> Setting `for: 0s` or omitting it entirely on noisy metrics, resulting in frequent false-positive pages for self-resolving blips.</div></details>
+
+<details class="qa"><summary>8. Why is running a single non-HA Prometheus instance a production risk?</summary>
+<div class="qa-body"><strong>Short answer:</strong> It becomes a single point of failure for the entire alerting pipeline — if that one instance goes down, both metrics collection and alert evaluation stop simultaneously.
+<br><strong>Detail:</strong> Unlike a stateless dashboard layer, Prometheus is both the scraper and the rule evaluator, so its unavailability isn't just a visibility gap, it's a silent alerting gap too.
+<br><strong>Production example:</strong> An incident that coincides with the Prometheus Pod itself crashing means no alert fires for the real incident, compounding the outage.
+<br><strong>Common mistake:</strong> Assuming Grafana dashboards being down is the only risk of a Prometheus outage, overlooking that alerting itself also silently stops.</div></details>
+
+<details class="qa"><summary>9. Why can't Prometheus's local TSDB substitute for long-term metrics storage?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Prometheus's local TSDB has retention limits designed for operational, recent-window querying, not indefinite long-term or high-cardinality historical storage.
+<br><strong>Detail:</strong> Long-term or high-cardinality workloads typically need a remote-write backend (e.g. VictoriaMetrics, Topic 52) that Prometheus forwards samples to, decoupling long-term storage/query scale from the scraping instance itself.
+<br><strong>Production example:</strong> A team needing 2 years of metrics history for capacity planning configures Prometheus to remote-write into VictoriaMetrics rather than extending local retention indefinitely.
+<br><strong>Common mistake:</strong> Confusing Prometheus's local retention window with a long-term storage guarantee and losing historical data when local disk-based retention rolls off.</div></details>
+
+<details class="qa"><summary>10. Why is label cardinality a specific operational concern for Prometheus?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Every unique combination of metric name + label values creates a distinct time series, so unbounded-value labels (raw user IDs, request IDs) can silently blow up storage and query cost.
+<br><strong>Detail:</strong> Prometheus's TSDB is optimized for a bounded set of label value combinations; high-cardinality labels defeat that assumption and degrade both ingestion and query performance.
+<br><strong>Production example:</strong> Adding a raw `user_id` label to `http_requests_total` multiplies the metric's series count by the number of distinct users, overwhelming the TSDB within days.
+<br><strong>Common mistake:</strong> Adding high-cardinality identifiers directly as PromQL labels instead of keeping that granularity in logs or traces where it belongs.</div></details>
+
+<details class="qa"><summary>11–50. Additional rapid-fire questions</summary>
+<div class="qa-body">
+<strong>11.</strong> What CNCF status does Prometheus hold? — Graduated project, the de facto standard for Kubernetes metrics.<br>
+<strong>12.</strong> What observability pillar does Prometheus implement? — Metrics (Topic 50's metrics pillar).<br>
+<strong>13.</strong> What's the typical scrape interval range? — Commonly 15-30 seconds.<br>
+<strong>14.</strong> What CRD does the Prometheus Operator introduce for scrape targets? — ServiceMonitor (also PodMonitor).<br>
+<strong>15.</strong> What CRD encodes alerting rules for the Operator to apply? — PrometheusRule.<br>
+<strong>16.</strong> What component receives firing alerts from Prometheus? — Alertmanager.<br>
+<strong>17.</strong> What does Alertmanager do with received alerts? — Deduplication, grouping, silencing, and routing to notification channels.<br>
+<strong>18.</strong> What identifies a PromQL time series uniquely? — A metric name plus its set of label key/value pairs.<br>
+<strong>19.</strong> How do you filter a metric to a specific service in PromQL? — A label matcher, e.g. `http_requests_total{service="checkout"}`.<br>
+<strong>20.</strong> What operator rolls many series into fewer for dashboards/alerts? — Aggregation operators like `sum by (service) (...)`.<br>
+<strong>21.</strong> What two common scrape targets expose cluster-object state vs container resource usage? — kube-state-metrics (object state) and cAdvisor (resource usage).<br>
+<strong>22.</strong> What does the API Server expose that Prometheus commonly scrapes? — Its own `/metrics` endpoint (request latency, etcd interaction latency).<br>
+<strong>23.</strong> What queries Prometheus's HTTP API to render dashboards? — Grafana, a separate stateless visualization layer.<br>
+<strong>24.</strong> What kubectl command lists all ServiceMonitors across namespaces? — `kubectl get servicemonitors -A`.<br>
+<strong>25.</strong> What kubectl command accesses Prometheus's own UI/API locally? — `kubectl port-forward svc/prometheus-operated 9090 -n observability`.<br>
+<strong>26.</strong> What HTTP API endpoint lets you run ad-hoc PromQL queries? — `/api/v1/query`.<br>
+<strong>27.</strong> Why does a ServiceMonitor need a `release: prometheus` label (or similar)? — To match the Prometheus CR's `serviceMonitorSelector` so the Operator actually picks it up.<br>
+<strong>28.</strong> What field in a ServiceMonitor's `endpoints` entry names the port to scrape? — `port`, referencing a named Service port.<br>
+<strong>29.</strong> What field on an alerting rule sets how long a condition must hold before firing? — `for:`.<br>
+<strong>30.</strong> Why is `sum(rate(...))` used instead of `rate(sum(...))` when computing an aggregate error ratio? — Rates must be computed per-series first, then summed, otherwise counter resets across series produce incorrect results.<br>
+<strong>31.</strong> What Kubernetes pattern is the Prometheus Operator an application of? — The Operator pattern (Topic 46) applied to Prometheus itself.<br>
+<strong>32.</strong> What's the risk of manually hand-editing Prometheus's scrape config in a large cluster? — It doesn't scale — onboarding each new service becomes a manual, error-prone central-file edit and reload.<br>
+<strong>33.</strong> What does a failed scrape signal to Prometheus? — A strong, unambiguous "target down" signal, exposed via the `up` metric.<br>
+<strong>34.</strong> What's the `up` metric used for? — Indicating whether the last scrape of a target succeeded (1) or failed (0).<br>
+<strong>35.</strong> Why don't scrape targets need to know where Prometheus lives? — Because Prometheus pulls from them; targets just expose /metrics and never initiate contact.<br>
+<strong>36.</strong> What notification channels does Alertmanager commonly route to? — PagerDuty, Slack, email, and similar external systems.<br>
+<strong>37.</strong> What's the practical effect of the Prometheus/Alertmanager split on incident response? — Detection logic (PromQL) stays independent from notification/routing logic, so each can evolve without touching the other.<br>
+<strong>38.</strong> What kubectl command checks Prometheus server logs for scrape/rule errors? — `kubectl logs -n observability prometheus-k8s-0 -c prometheus`.<br>
+<strong>39.</strong> What kubectl command inspects the Alertmanager custom resource? — `kubectl get alertmanager -n observability`.<br>
+<strong>40.</strong> Why is a histogram different from a gauge in Prometheus's data model? — A histogram buckets observed values (e.g. request durations) to support percentile-style queries; a gauge is a single point-in-time value that can go up or down.<br>
+<strong>41.</strong> What's a summary metric type used for? — Similar to a histogram but computes quantiles client-side rather than via bucket-based server-side aggregation.<br>
+<strong>42.</strong> Why is PromQL's `for:` alerting delay especially important on flappy metrics? — It prevents rapid on/off threshold crossings from generating repeated noisy alert fire/resolve cycles.<br>
+<strong>43.</strong> What's the relationship between VictoriaMetrics (Topic 52) and vanilla Prometheus? — A high-performance, long-term-storage alternative/complement, often used as a remote-write backend for Prometheus.<br>
+<strong>44.</strong> Why is bounded label cardinality specifically called out as a best practice? — Unbounded-value labels multiply stored time series and can silently overwhelm TSDB storage and query performance.<br>
+<strong>45.</strong> What Kubernetes concept from Topic 46 does the Prometheus Operator directly reuse? — The Operator/CRD-plus-controller pattern for managing complex stateful application configuration declaratively.<br>
+<strong>46.</strong> Why does Prometheus store samples with timestamps rather than just latest values? — To support range queries, rate calculations, and historical trend analysis, not just current-state snapshots.<br>
+<strong>47.</strong> What's a common cause of a ServiceMonitor "silently" not scraping anything? — A missing or mislabeled Service in front of the Pods, since the ServiceMonitor selects Services, not Pods.<br>
+<strong>48.</strong> Why should alerting rules generally avoid firing on raw infrastructure metrics alone? — Symptom-based alerting (error rate, latency users actually feel) is more actionable than raw infra signals that may not indicate real user impact.<br>
+<strong>49.</strong> What's the benefit of PrometheusRule being a CRD instead of a static rules file? — The Operator can manage and reload rules declaratively per-namespace/team without touching a central Prometheus config file directly.<br>
+<strong>50.</strong> What's the first thing to check when a PrometheusRule doesn't seem to be firing as expected? — Whether the underlying metric/series actually exists and has recent data (via ad-hoc PromQL), before assuming the rule expression itself is wrong.
+</div></details>
+
+<footer class="course-footer">Next: Topic 52 — VictoriaMetrics, a high-performance, long-term-storage alternative/complement to vanilla Prometheus.</footer>
+
+<script>
+  mermaid.initialize({ startOnLoad: true, theme: 'dark' });
+</script>
+
+</body>
+</html>

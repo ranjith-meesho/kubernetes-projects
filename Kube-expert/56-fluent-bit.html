@@ -1,0 +1,304 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Topic 56: Fluent Bit — Kubernetes Expert Course</title>
+<link rel="stylesheet" href="styles.css">
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+</head>
+<body>
+
+<header class="course-header">
+  <div class="kicker">Topic 56 of 70</div>
+  <h1>Fluent Bit</h1>
+  <div class="subtitle">A lightweight, high-performance log forwarder built for exactly the node-level DaemonSet pattern described in the logging topic.</div>
+</header>
+
+<nav class="topic-nav">
+  <a href="55-logging.html">&larr; Logging</a>
+  <a href="index.html">Course Index</a>
+  <a href="57-loki.html">Loki &rarr;</a>
+</nav>
+
+<h2 id="explanation">Explanation</h2>
+<p>Fluent Bit is a lightweight (written in C, small memory footprint, sub-second startup) log and metrics forwarder from
+the Fluentd/CNCF ecosystem, purpose-built to run as the node-level agent described in the Logging topic. Where Fluentd
+(its heavier Ruby-based predecessor) is a full-featured aggregator often run centrally, Fluent Bit is optimized to run
+on <em>every node</em> as a DaemonSet with minimal CPU/memory overhead — a critical property, since a log agent that
+consumes significant resources on every node in a large cluster becomes a tax on the entire fleet.</p>
+
+<p>Kubernetes needs a tool like Fluent Bit because raw log files on disk (as covered in the Logging topic) are not
+useful until they're parsed, enriched with Kubernetes metadata, and routed to a durable backend. Fluent Bit does all
+three: it tails the node's container log files, parses them (JSON or plain text with configurable parsers), calls the
+Kubernetes API to attach pod/namespace/label metadata to each line (so a log line in Loki/Elasticsearch is filterable
+by <code>namespace="checkout"</code> without any application code change), and forwards the result to one or more
+outputs simultaneously.</p>
+
+<p>Fluent Bit's configuration model is built around three plugin types chained into a pipeline: <strong>Input</strong>
+plugins (most commonly <code>tail</code>, reading log files matching a glob) produce records; <strong>Filter</strong>
+plugins transform records in-flight — the <code>kubernetes</code> filter is the most important one in this context,
+enriching each record with pod metadata by querying the Kubernetes API and caching results; and <strong>Output</strong>
+plugins deliver the final records to a destination — Loki, Elasticsearch, an OpenTelemetry Collector's OTLP logs
+receiver, S3, Kafka, or many others. This plugin architecture is why Fluent Bit fits equally well feeding Loki (Topic 57)
+or feeding an OTel Collector pipeline (Topic 54) — it's a transport and enrichment layer that's backend-agnostic.</p>
+
+<p>In production, Fluent Bit typically runs with a small, tuned configuration: <code>Mem_Buf_Limit</code> to cap memory
+if the output is slow or unreachable, <code>Skip_Long_Lines On</code> to avoid one giant log line blocking the pipeline,
+and multiple <code>[OUTPUT]</code> blocks with <code>Match</code> patterns routing different namespaces/labels to
+different destinations (e.g. security-relevant namespaces to a separate, longer-retention index).</p>
+
+<p>Within the broader ecosystem, Fluent Bit is one of two dominant choices for the "collector" role alongside Promtail
+(Loki's own purpose-built agent) and the OpenTelemetry Collector's filelog receiver; many teams standardize on Fluent
+Bit specifically because of its plugin breadth (it can output to almost anything) and its proven low resource
+footprint at very large node counts.</p>
+
+<h2 id="internal-working">Internal Working / Interactions</h2>
+<ul>
+  <li><strong>Input (tail)</strong> — reads <code>/var/log/containers/*.log</code>, tracking file offsets in a local SQLite/flat-file database so it resumes correctly after a restart without re-reading or losing lines.</li>
+  <li><strong>Kubernetes filter</strong> — calls the Kubernetes API server (via a ServiceAccount token) to look up pod metadata by parsing the log file's path/tag, caching results locally to avoid hammering the API server.</li>
+  <li><strong>Parser</strong> — converts raw text/JSON into structured fields (e.g. <code>docker</code> or <code>cri</code> parser depending on runtime log format).</li>
+  <li><strong>Output plugins</strong> — deliver to Loki (via the <code>loki</code> output), Elasticsearch, or an OTel Collector (via <code>opentelemetry</code>/<code>forward</code> output), often with buffering and retry on failure.</li>
+  <li>Runs as a <strong>DaemonSet</strong> so exactly one instance per node handles that node's own log volume — horizontally scales automatically as nodes are added.</li>
+</ul>
+
+<h2 id="architecture-diagram">Architecture Diagram</h2>
+<pre class="mermaid">
+flowchart LR
+    subgraph Node["Worker Node"]
+      LOGS["/var/log/containers/*.log"] --> TAIL["Input: tail"]
+      TAIL --> PARSE["Parser<br/>(cri/docker/json)"]
+      PARSE --> KFILTER["Filter: kubernetes<br/>(enrich with pod/ns/labels)"]
+      KFILTER --> ROUTE{"Output routing<br/>by Match pattern"}
+    end
+
+    API["Kubernetes API Server"] -.->|pod metadata lookup| KFILTER
+
+    ROUTE -->|app logs| LOKI["Loki"]
+    ROUTE -->|audit/security logs| ES["Elasticsearch"]
+    ROUTE -->|otel-bound| OTEL["OTel Collector"]
+</pre>
+
+<h2 id="code-example">Code Example</h2>
+<pre><code># Fluent Bit ConfigMap — classic DaemonSet config: tail container logs, enrich with
+# Kubernetes metadata, and ship to Loki.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fluent-bit-config
+  namespace: logging
+data:
+  fluent-bit.conf: |
+    [SERVICE]
+        Flush         5                 # flush buffered records every 5s
+        Log_Level     info
+        Parsers_File  parsers.conf
+
+    [INPUT]
+        Name              tail
+        Path              /var/log/containers/*.log   # matches the symlinked per-container log files
+        Tag               kube.*
+        Parser            cri                          # matches containerd's CRI log line format
+        Mem_Buf_Limit     15MB                          # caps memory if downstream output stalls
+        Skip_Long_Lines   On                            # don't block the pipeline on one oversized line
+        Refresh_Interval  10
+
+    [FILTER]
+        Name                kubernetes
+        Match               kube.*
+        Kube_URL            https://kubernetes.default.svc:443   # talks to the API server for metadata
+        Kube_CA_File        /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+        Kube_Token_File     /var/run/secrets/kubernetes.io/serviceaccount/token
+        Merge_Log           On                          # parse JSON app logs into structured fields
+        K8S-Logging.Parser  On
+
+    [OUTPUT]
+        Name            loki
+        Match           kube.*
+        Host            loki.logging.svc
+        Port            3100
+        Labels          job=fluentbit, namespace=$kubernetes['namespace_name'], pod=$kubernetes['pod_name']
+        Line_Format     json
+---
+# DaemonSet running Fluent Bit with the config above mounted, and read-only access to node log dirs.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: fluent-bit
+  namespace: logging
+spec:
+  selector:
+    matchLabels: { app: fluent-bit }
+  template:
+    metadata:
+      labels: { app: fluent-bit }
+    spec:
+      serviceAccountName: fluent-bit           # RBAC: get/list/watch on pods (for the kubernetes filter)
+      containers:
+        - name: fluent-bit
+          image: fluent/fluent-bit:3.0
+          resources:
+            requests: { cpu: "50m", memory: "64Mi" }   # deliberately tiny — this is per-node overhead
+            limits:   { cpu: "200m", memory: "128Mi" }
+          volumeMounts:
+            - name: varlog
+              mountPath: /var/log
+              readOnly: true
+            - name: config
+              mountPath: /fluent-bit/etc
+      volumes:
+        - name: varlog
+          hostPath: { path: /var/log }
+        - name: config
+          configMap: { name: fluent-bit-config }
+</code></pre>
+
+<h2 id="kubectl-cli-commands">kubectl / CLI Commands</h2>
+<pre><code>kubectl get pods -n logging -l app=fluent-bit -o wide       # confirm one pod per node, all Running
+kubectl logs -n logging fluent-bit-xxxxx --tail=100          # check for parse/output errors
+kubectl exec -n logging fluent-bit-xxxxx -- cat /fluent-bit/etc/fluent-bit.conf   # verify loaded config
+kubectl top pod -n logging -l app=fluent-bit                  # confirm resource usage stays within limits
+kubectl describe ds fluent-bit -n logging                     # check rollout status across all nodes
+kubectl get sa fluent-bit -n logging -o yaml                  # verify RBAC ServiceAccount is bound correctly
+kubectl rollout restart ds/fluent-bit -n logging               # reload config after a ConfigMap change
+</code></pre>
+
+<h2 id="best-practices">Best Practices &amp; Common Pitfalls</h2>
+<div class="grid-2">
+<div>
+<h4>Best Practices</h4>
+<ul>
+  <li>Set tight, explicit resource requests/limits — Fluent Bit should be a lightweight per-node tax, not a heavyweight pod.</li>
+  <li>Use <code>Mem_Buf_Limit</code> and <code>storage.type filesystem</code> for buffering to survive backend hiccups without dropping logs.</li>
+  <li>Cache Kubernetes API lookups (the filter does this by default) to avoid overloading the API server across hundreds of nodes.</li>
+  <li>Route different namespaces/log types to different outputs using <code>Match</code> tags rather than one firehose destination.</li>
+  <li>Pin parser choice (<code>cri</code> vs <code>docker</code>) to match your actual container runtime's log format.</li>
+</ul>
+</div>
+<div>
+<h4>Pitfalls</h4>
+<ul>
+  <li>Forgetting <code>Skip_Long_Lines On</code>, letting one massive stack-trace log line stall the whole pipeline.</li>
+  <li>Not setting <code>Mem_Buf_Limit</code>, causing OOM on the DaemonSet pod during an output outage.</li>
+  <li>Granting the ServiceAccount cluster-admin instead of the minimal get/list/watch on pods needed for enrichment.</li>
+  <li>Running conflicting Fluent Bit and Promtail DaemonSets simultaneously, double-shipping the same logs.</li>
+</ul>
+</div>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="interview-questions">50 Interview Questions</h2>
+
+<details class="qa"><summary>1. Why is Fluent Bit written in C instead of a higher-level language like Fluentd's Ruby?</summary>
+<div class="qa-body"><strong>Short answer:</strong> To achieve a small memory footprint and sub-second startup as a per-node agent.
+<br><strong>Detail:</strong> Since Fluent Bit runs on every node in the cluster, any per-instance overhead is multiplied by node count — C gives it the low CPU/memory profile needed to avoid taxing the whole fleet.
+<br><strong>Production example:</strong> A 500-node cluster running Fluent Bit at ~64Mi/50m requests versus a heavier JVM/Ruby agent that could cost gigabytes of aggregate memory across the fleet.
+<br><strong>Common mistake:</strong> Assuming any log agent's resource cost is negligible without checking it against total node count.</div></details>
+
+<details class="qa"><summary>2. What are the three plugin types in a Fluent Bit pipeline, and what does each do?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Input, Filter, and Output plugins.
+<br><strong>Detail:</strong> Input plugins (e.g. <code>tail</code>) produce records; Filter plugins transform records in-flight (e.g. the <code>kubernetes</code> filter enriches with metadata); Output plugins deliver final records to a destination.
+<br><strong>Production example:</strong> tail reads <code>/var/log/containers/*.log</code>, the kubernetes filter attaches namespace/pod labels, and the loki output ships the enriched record.
+<br><strong>Common mistake:</strong> Configuring an Output without a matching <code>Match</code> tag against the right Input/Filter chain, silently dropping records.</div></details>
+
+<details class="qa"><summary>3. Why is the Kubernetes filter considered the most important filter in this context?</summary>
+<div class="qa-body"><strong>Short answer:</strong> It attaches pod/namespace/label metadata to raw log lines, making them filterable without any application code change.
+<br><strong>Detail:</strong> It queries the Kubernetes API server to resolve metadata for each record based on the log file path/tag, then caches results to avoid overloading the API server.
+<br><strong>Production example:</strong> A log line in Loki becomes filterable by <code>namespace="checkout"</code> purely from container path parsing, with no app-side logging changes.
+<br><strong>Common mistake:</strong> Disabling or misconfiguring the kubernetes filter and losing the ability to filter logs by namespace/pod in the backend.</div></details>
+
+<details class="qa"><summary>4. Why does Fluent Bit run as a DaemonSet rather than a Deployment?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Exactly one instance per node is needed to handle that node's own log volume.
+<br><strong>Detail:</strong> A DaemonSet automatically scales horizontally as nodes are added or removed, matching the node-local nature of log tailing.
+<br><strong>Production example:</strong> Adding worker nodes to a cluster automatically schedules a new Fluent Bit pod on each, with no manual intervention.
+<br><strong>Common mistake:</strong> Running it as a Deployment with replicas, which wouldn't guarantee coverage of every node's log files.</div></details>
+
+<details class="qa"><summary>5. How does the tail input plugin avoid re-reading or losing lines after a restart?</summary>
+<div class="qa-body"><strong>Short answer:</strong> It tracks file offsets in a local SQLite/flat-file database.
+<br><strong>Detail:</strong> On restart, the tail plugin resumes reading from the last recorded offset for each tracked file instead of starting from the beginning or losing new lines written in the gap.
+<br><strong>Production example:</strong> A Fluent Bit pod restart during a node reboot resumes tailing exactly where it left off, with no duplicate or missing log lines.
+<br><strong>Common mistake:</strong> Wiping the offset database/volume on every restart, causing either duplicate re-ingestion or lost logs.</div></details>
+
+<details class="qa"><summary>6. What is the purpose of <code>Mem_Buf_Limit</code>?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Caps memory usage if the output destination is slow or unreachable.
+<br><strong>Detail:</strong> Without a buffer cap, records accumulate in memory unboundedly during an output outage, risking OOM on the DaemonSet pod.
+<br><strong>Production example:</strong> A Loki outage causes buffered records to hit the 15MB cap rather than growing until the pod is OOMKilled.
+<br><strong>Common mistake:</strong> Not setting <code>Mem_Buf_Limit</code>, which is explicitly called out as a pitfall leading to OOM during output outages.</div></details>
+
+<details class="qa"><summary>7. What does <code>Skip_Long_Lines On</code> protect against?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Prevents one oversized log line (e.g. a giant stack trace) from stalling the whole pipeline.
+<br><strong>Detail:</strong> Without it, a single line exceeding internal buffer expectations can block processing of all subsequent records on that input.
+<br><strong>Production example:</strong> A Java service emitting a multi-KB stack trace as one line doesn't halt log shipping for the rest of the node's containers.
+<br><strong>Common mistake:</strong> Forgetting this setting, explicitly listed as a pitfall that stalls the pipeline on a single massive line.</div></details>
+
+<details class="qa"><summary>8. Why does the Kubernetes filter cache its API lookups?</summary>
+<div class="qa-body"><strong>Short answer:</strong> To avoid overloading the Kubernetes API server across potentially hundreds of nodes each running a Fluent Bit instance.
+<br><strong>Detail:</strong> Since every node's Fluent Bit needs metadata for its local pods, unrestrained per-record API calls would multiply into significant API server load cluster-wide.
+<br><strong>Production example:</strong> A large cluster with hundreds of nodes relies on this caching to keep the enrichment filter from becoming an API server bottleneck.
+<br><strong>Common mistake:</strong> Assuming metadata lookups are free and not accounting for their cumulative cost at scale.</div></details>
+
+<details class="qa"><summary>9. How does routing to multiple outputs work in Fluent Bit, and why is it used?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Multiple <code>[OUTPUT]</code> blocks with <code>Match</code> patterns route different namespaces/labels to different destinations.
+<br><strong>Detail:</strong> This lets teams send security-relevant namespaces to a separate, longer-retention index while routing general application logs elsewhere (e.g. Loki).
+<br><strong>Production example:</strong> Application logs go to Loki while audit/security-relevant logs are routed to Elasticsearch with longer retention.
+<br><strong>Common mistake:</strong> Routing everything through one firehose destination instead of differentiating by <code>Match</code> tags, called out explicitly as a best practice violation.</div></details>
+
+<details class="qa"><summary>10. Why must the parser choice (<code>cri</code> vs <code>docker</code>) match the container runtime?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Each runtime writes log lines in a different on-disk format, so the wrong parser will fail to correctly structure fields.
+<br><strong>Detail:</strong> The <code>cri</code> parser matches containerd's CRI log line format, while a docker-formatted log requires the docker parser instead.
+<br><strong>Production example:</strong> A cluster running containerd uses <code>Parser cri</code> in the INPUT block to correctly split timestamp/stream/message fields.
+<br><strong>Common mistake:</strong> Copy-pasting a config from a Docker-runtime cluster onto a containerd cluster without updating the parser, producing garbled structured fields.</div></details>
+
+<details class="qa"><summary>11–50. Additional rapid-fire questions</summary>
+<div class="qa-body">
+<strong>11.</strong> What problem does Fluent Bit solve that raw log files on disk don't already solve? — Raw files aren't parsed, enriched with Kubernetes metadata, or routed to a durable backend; Fluent Bit does all three.<br>
+<strong>12.</strong> How does Fluent Bit compare to Fluentd operationally? — Fluentd is a heavier, Ruby-based aggregator often run centrally; Fluent Bit is optimized to run as a lightweight per-node agent.<br>
+<strong>13.</strong> What are Fluent Bit's two main "competitor" agents in the collector role? — Promtail (Loki's own agent) and the OpenTelemetry Collector's filelog receiver.<br>
+<strong>14.</strong> Why do many teams standardize on Fluent Bit specifically? — Its broad plugin/output support (it can output to almost anything) and proven low resource footprint at large node counts.<br>
+<strong>15.</strong> What ServiceAccount permissions does the Fluent Bit DaemonSet need? — get/list/watch on pods, used by the kubernetes filter for metadata enrichment via the API server.<br>
+<strong>16.</strong> What's the pitfall of over-granting RBAC to the Fluent Bit ServiceAccount? — Granting cluster-admin instead of the minimal get/list/watch needed is an explicit pitfall — excessive blast radius for a log agent.<br>
+<strong>17.</strong> How does Fluent Bit authenticate to the Kubernetes API server for the kubernetes filter? — Via a ServiceAccount token (<code>Kube_Token_File</code>) and CA cert (<code>Kube_CA_File</code>) mounted into the pod.<br>
+<strong>18.</strong> What does <code>Kube_URL https://kubernetes.default.svc:443</code> point to? — The in-cluster Kubernetes API server endpoint the kubernetes filter queries for metadata.<br>
+<strong>19.</strong> What does <code>Merge_Log On</code> do in the kubernetes filter? — Parses JSON-formatted application log content into structured fields rather than leaving it as a raw string.<br>
+<strong>20.</strong> What is the role of <code>Tag kube.*</code> in the INPUT block? — Tags records so downstream FILTER and OUTPUT blocks can select them via matching <code>Match</code> patterns.<br>
+<strong>21.</strong> Why is the DaemonSet's <code>varlog</code> volume mounted read-only? — Fluent Bit only needs to read node log files, not modify them — read-only limits blast radius if the agent is compromised.<br>
+<strong>22.</strong> What happens if you run Fluent Bit and Promtail as DaemonSets simultaneously on the same nodes? — They double-ship the same logs — an explicit pitfall in the file.<br>
+<strong>23.</strong> Why are the DaemonSet's resource requests/limits set deliberately tiny (e.g. 50m/64Mi)? — Fluent Bit is per-node overhead; a heavyweight agent taxes the entire fleet, so requests are kept minimal by design.<br>
+<strong>24.</strong> What outputs can Fluent Bit ship logs to, per the file? — Loki, Elasticsearch, an OpenTelemetry Collector's OTLP logs receiver, S3, Kafka, and others.<br>
+<strong>25.</strong> Why does Fluent Bit fit equally well feeding Loki or an OTel Collector? — Its plugin architecture makes it a backend-agnostic transport/enrichment layer rather than being tied to one destination.<br>
+<strong>26.</strong> What's the significance of <code>Refresh_Interval 10</code> in the tail input? — Controls how often the input plugin rescans for new files matching the glob pattern.<br>
+<strong>27.</strong> Why does the OUTPUT block for Loki set <code>Line_Format json</code>? — Sends the structured record as JSON to Loki rather than a flattened plain-text line, preserving field structure.<br>
+<strong>28.</strong> How does the Loki OUTPUT's <code>Labels</code> field work? — It maps enriched Kubernetes metadata (e.g. <code>$kubernetes['namespace_name']</code>) into Loki labels like <code>namespace</code> and <code>pod</code>.<br>
+<strong>29.</strong> What is the purpose of <code>Flush 5</code> in the SERVICE block? — Buffered records are flushed downstream every 5 seconds rather than per-line, batching for efficiency.<br>
+<strong>30.</strong> How do you verify Fluent Bit rolled out correctly across all nodes? — <code>kubectl describe ds fluent-bit -n logging</code> to check rollout status across all nodes.<br>
+<strong>31.</strong> How do you check whether Fluent Bit is parsing/outputting logs without errors? — <code>kubectl logs -n logging fluent-bit-xxxxx --tail=100</code> to inspect for parse/output errors.<br>
+<strong>32.</strong> How do you confirm Fluent Bit's resource usage stays within configured limits? — <code>kubectl top pod -n logging -l app=fluent-bit</code>.<br>
+<strong>33.</strong> How do you reload Fluent Bit configuration after editing its ConfigMap? — <code>kubectl rollout restart ds/fluent-bit -n logging</code>, since ConfigMap changes aren't hot-reloaded automatically.<br>
+<strong>34.</strong> How can you verify the actual config loaded inside a running Fluent Bit pod? — <code>kubectl exec -n logging fluent-bit-xxxxx -- cat /fluent-bit/etc/fluent-bit.conf</code>.<br>
+<strong>35.</strong> Why is Parsers_File referenced separately in the SERVICE block? — It points to the parser definitions (e.g. cri/docker/json formats) that INPUT/FILTER blocks reference by name.<br>
+<strong>36.</strong> What would happen if the kubernetes filter's Kube_URL were unreachable? — Metadata enrichment would fail, so log lines would ship without namespace/pod/label context, breaking filterability downstream.<br>
+<strong>37.</strong> Why is caching in the kubernetes filter especially important at Fluent Bit's scale? — Because a DaemonSet means hundreds of instances could otherwise each hammer the API server independently for metadata.<br>
+<strong>38.</strong> What's the risk of not pinning parser choice to your runtime's log format? — Logs get mis-parsed into the wrong fields (or fail to parse), producing garbled structured output — an explicit pitfall.<br>
+<strong>39.</strong> How does Fluent Bit's plugin model make it easy to migrate log destinations? — Since Input/Filter stay the same, only the OUTPUT block needs to change to redirect to a new backend.<br>
+<strong>40.</strong> What's the relationship between Fluent Bit and the Logging topic's node-level agent pattern? — Fluent Bit is a concrete, purpose-built implementation of exactly that pattern — tailing, parsing, enriching, and forwarding node logs.<br>
+<strong>41.</strong> Why might a security-relevant namespace be routed to a different output than general app logs? — To apply longer retention or stricter access controls on that data via a separate destination/index.<br>
+<strong>42.</strong> What does <code>storage.type filesystem</code>-style buffering (mentioned as a best practice) provide over pure in-memory buffering? — Buffered records survive backend hiccups without being dropped, unlike memory-only buffers that are lost on pod restart.<br>
+<strong>43.</strong> How would you diagnose a Fluent Bit pod repeatedly OOMKilled? — Check whether <code>Mem_Buf_Limit</code> is set and whether the output destination has been unreachable, causing buffer buildup.<br>
+<strong>44.</strong> Why does Fluent Bit tail the *symlinked* container log paths under <code>/var/log/containers/*.log</code>? — That's the standard kubelet-managed path where per-container log symlinks are exposed on the node.<br>
+<strong>45.</strong> What kind of RBAC object binds the ServiceAccount's permissions? — A Role/ClusterRole plus RoleBinding/ClusterRoleBinding granting the minimal get/list/watch on pods.<br>
+<strong>46.</strong> How would you confirm the RBAC binding for Fluent Bit is correct? — <code>kubectl get sa fluent-bit -n logging -o yaml</code>, then inspect the associated Role/ClusterRoleBinding.<br>
+<strong>47.</strong> What's a concrete tradeoff of choosing Fluent Bit over Promtail for a Loki-only setup? — Fluent Bit offers broader plugin/output support beyond Loki, at the cost of not being as purpose-tuned to Loki specifically as Promtail is.<br>
+<strong>48.</strong> Why is Fluent Bit described as sitting "equally well" in front of both Loki and an OTel Collector pipeline? — Because its output plugin architecture treats both as interchangeable destinations, not a hardcoded target.<br>
+<strong>49.</strong> What happens to unflushed buffered records if the Fluent Bit pod is deleted before a flush interval completes? — Records not yet flushed (and not persisted via filesystem-backed buffering) can be lost, which is why durable buffering matters.<br>
+<strong>50.</strong> What's the first thing to check when Loki isn't receiving any logs from Fluent Bit? — Fluent Bit pod logs for output/connection errors, then confirm the OUTPUT block's <code>Match</code>, <code>Host</code>, and <code>Port</code> are correctly targeting the Loki service.
+</div></details>
+
+
+<footer class="course-footer">Next: Topic 57 — Loki, the label-indexed log storage backend Fluent Bit commonly ships to.</footer>
+
+<script>
+  mermaid.initialize({ startOnLoad: true, theme: 'dark' });
+</script>
+
+</body>
+</html>

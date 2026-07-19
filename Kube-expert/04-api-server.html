@@ -1,0 +1,287 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Topic 4: API Server — Kubernetes Expert Course</title>
+<link rel="stylesheet" href="styles.css">
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+</head>
+<body>
+
+<header class="course-header">
+  <div class="kicker">Topic 4 of 70</div>
+  <h1>API Server</h1>
+  <div class="subtitle">The single front door to Kubernetes: REST API, the authn/authz/admission pipeline, aggregation, and the watch mechanism.</div>
+</header>
+
+<nav class="topic-nav">
+  <a href="03-worker-nodes.html">&larr; Worker Nodes</a>
+  <a href="index.html">Course Index</a>
+  <a href="05-etcd.html">etcd &rarr;</a>
+</nav>
+
+<h2 id="explanation">Explanation</h2>
+<p>The <strong>kube-apiserver</strong> is the only component in the entire cluster that talks to etcd. Every other
+piece — kubectl, kubelets, controllers, the scheduler, even other control-plane components — interacts with the
+cluster exclusively through the API Server's REST interface. It exposes every Kubernetes object (Pods, Services,
+Deployments, CRDs...) as a resource under a versioned HTTP path (e.g. <code>/api/v1/namespaces/default/pods</code>,
+<code>/apis/apps/v1/namespaces/default/deployments</code>), validates schema, and is the single enforcement point for
+security policy.</p>
+
+<p>Kubernetes needs a centralized API gateway because a distributed system with dozens of independent controllers
+cannot safely allow direct database access — there'd be no consistent place to enforce RBAC, no consistent
+validation, and no way to intercept/mutate objects (webhooks) before they're persisted. By forcing every write through
+one code path, Kubernetes gets a single choke point where authentication, authorization, quota enforcement, and
+admission policy can all be applied uniformly regardless of which client is making the request.</p>
+
+<p>Every request passes through a strict pipeline: <strong>Authentication</strong> (who are you — client cert, bearer
+token, OIDC) &rarr; <strong>Authorization</strong> (RBAC — are you allowed to do this verb on this resource in this
+namespace?) &rarr; <strong>Admission Control</strong> (mutating webhooks can modify the object, e.g. inject a sidecar;
+validating webhooks and built-in plugins like ResourceQuota or NodeRestriction can reject it) &rarr; <strong>schema
+validation</strong> &rarr; persisted to etcd. Only after all of this succeeds does the object become "real."</p>
+
+<p>The API Server also supports an <strong>aggregation layer</strong>, letting you register additional API servers
+(like the metrics-server or custom API extensions) that appear under the same unified API surface at
+<code>/apis/</code>, and a <strong>watch API</strong> — long-lived HTTP connections that stream change events to
+clients instead of requiring them to poll. This watch mechanism, combined with client-side caches (informers), is
+what lets Kubernetes scale to thousands of watching clients without collapsing under polling load.</p>
+
+<p>Because it is stateless (all durable state lives in etcd), the API Server scales horizontally trivially — production
+clusters run 3+ replicas behind a load balancer. Its performance is nonetheless gated by etcd write latency and by how
+many watch connections/list calls it must serve, which is why API Priority and Fairness (APF) exists to prevent one
+noisy client from starving others.</p>
+
+<h2 id="internal-working">Internal Working / Interactions</h2>
+<ul>
+  <li><strong>API Server &harr; etcd:</strong> the only reader/writer; every mutating request becomes a Raft-replicated write.</li>
+  <li><strong>API Server &harr; Authentication plugins:</strong> client certs, static tokens, OIDC, webhook token auth — pluggable chain, first success wins.</li>
+  <li><strong>API Server &harr; RBAC:</strong> evaluates Role/ClusterRole bindings for the authenticated identity on every request.</li>
+  <li><strong>API Server &harr; Admission webhooks:</strong> calls out to external HTTP services (mutating first, then validating) before persistence.</li>
+  <li><strong>API Server &harr; every controller/kubelet/scheduler:</strong> serves long-lived watch streams so each can react to changes without polling.</li>
+</ul>
+
+<h2 id="architecture-diagram">Architecture Diagram</h2>
+<pre class="mermaid">
+flowchart LR
+    C["Client (kubectl / kubelet / controller)"] -->|HTTPS request| AUTHN["Authentication"]
+    AUTHN --> AUTHZ["Authorization (RBAC)"]
+    AUTHZ --> MUT["Mutating Admission Webhooks"]
+    MUT --> SCHEMA["Schema Validation (OpenAPI)"]
+    SCHEMA --> VAL["Validating Admission Webhooks"]
+    VAL --> ETCD[("etcd")]
+    ETCD --> WATCH["Watch dispatch to all watchers"]
+</pre>
+
+<pre class="mermaid">
+sequenceDiagram
+    participant U as kubectl
+    participant API as API Server
+    participant WH as Admission Webhook
+    participant E as etcd
+    U->>API: POST /api/v1/namespaces/default/pods
+    API->>API: Authenticate (client cert)
+    API->>API: Authorize (RBAC check)
+    API->>WH: Mutating webhook call (e.g. inject sidecar)
+    WH-->>API: Patched object
+    API->>API: Validate against OpenAPI schema
+    API->>WH: Validating webhook call
+    WH-->>API: Allowed
+    API->>E: Write object (Raft consensus)
+    E-->>API: Ack
+    API-->>U: 201 Created
+    API->>API: Notify all active watchers
+</pre>
+
+<h2 id="code-example">Code Example</h2>
+<pre><code># ValidatingWebhookConfiguration — registers a policy check into the API Server's
+# admission pipeline. This is how OPA Gatekeeper / Kyverno plug into the API Server.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingWebhookConfiguration
+metadata:
+  name: require-resource-limits
+webhooks:
+  - name: require-limits.policy.example.com
+    admissionReviewVersions: ["v1"]
+    sideEffects: None
+    failurePolicy: Fail        # reject the request if the webhook is unreachable (fail closed)
+    clientConfig:
+      service:
+        name: policy-webhook    # Service fronting the webhook server
+        namespace: policy-system
+        path: "/validate-pods"
+      caBundle: <base64-ca-cert>
+    rules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE"]
+        resources: ["pods"]
+    namespaceSelector:
+      matchLabels:
+        policy-enforced: "true"   # only applies to namespaces opting in
+---
+# Minimal RBAC that the API Server evaluates during authorization for a CI ServiceAccount
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: pod-reader
+  namespace: default
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]   # least-privilege: read-only, no create/delete
+</code></pre>
+
+<h2 id="kubectl-commands">kubectl Commands</h2>
+<pre><code># Check API Server health directly
+kubectl get --raw='/healthz?verbose'
+
+# List all API groups/versions the server currently serves
+kubectl api-versions
+
+# See the live OpenAPI schema for a resource
+kubectl explain pod.spec --recursive
+
+# Inspect registered admission webhooks
+kubectl get validatingwebhookconfigurations
+kubectl get mutatingwebhookconfigurations
+
+# Watch raw API events for a resource (what the watch API streams)
+kubectl get pods --watch -o yaml
+
+# Check current RBAC permissions for yourself or another identity
+kubectl auth can-i create pods --namespace default
+kubectl auth can-i list pods --as=system:serviceaccount:default:ci-bot
+</code></pre>
+
+<h2 id="best-practices">Best Practices &amp; Common Pitfalls</h2>
+<div class="grid-2">
+<div>
+<h4>Best Practices</h4>
+<ul>
+  <li>Enable audit logging for compliance and incident forensics.</li>
+  <li>Set <code>failurePolicy</code> deliberately on webhooks — <code>Fail</code> for security-critical checks, <code>Ignore</code> for best-effort ones.</li>
+  <li>Use API Priority and Fairness to isolate noisy or misbehaving clients.</li>
+  <li>Keep admission webhook latency low (&lt;1s) — every request blocks on it.</li>
+</ul>
+</div>
+<div>
+<h4>Pitfalls</h4>
+<ul>
+  <li>Registering a webhook with <code>failurePolicy: Fail</code> and no HA — a single webhook outage blocks all matching API calls cluster-wide.</li>
+  <li>Bypassing the API Server (direct etcd edits) — skips all authz/admission entirely.</li>
+  <li>Overly broad RBAC bindings (<code>cluster-admin</code> for convenience) instead of least privilege.</li>
+  <li>Not accounting for aggregation-layer availability (e.g. metrics-server down breaks <code>kubectl top</code>).</li>
+</ul>
+</div>
+</div>
+
+<h2 id="interview-questions">50 Interview Questions</h2>
+
+<details class="qa"><summary>1. Why is the API Server the only component that talks to etcd?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Centralizing etcd access is the single enforcement point for authn, authz, admission, and schema validation.
+<br><strong>Detailed explanation:</strong> If controllers or kubelets wrote to etcd directly, there'd be no consistent place to check RBAC or run mutating/validating webhooks — every write path would need its own security logic, defeating the purpose of a uniform policy layer.
+<br><strong>Production example:</strong> A ResourceQuota admission check only works because every namespace-scoped create request is forced through the same API Server code path.
+<br><strong>Common mistake:</strong> Editing etcd directly to "fix" an object — this skips all admission control and validation entirely.</div></details>
+
+<details class="qa"><summary>2. Walk through the full request pipeline for a <code>kubectl apply</code>.</summary>
+<div class="qa-body"><strong>Short answer:</strong> Authentication &rarr; Authorization (RBAC) &rarr; Mutating admission &rarr; Schema validation &rarr; Validating admission &rarr; persisted to etcd.
+<br><strong>Detailed explanation:</strong> Authentication identifies the caller (client cert, bearer token, OIDC); Authorization checks if that identity can perform the verb on the resource; mutating webhooks can modify the object (e.g. inject a sidecar); the object is validated against its OpenAPI schema; validating webhooks can still reject it; only then is it written to etcd via Raft consensus.
+<br><strong>Production example:</strong> Istio's sidecar injector runs as a mutating webhook early in this chain, before OPA Gatekeeper's validating webhook checks policy compliance.
+<br><strong>Common mistake:</strong> Assuming validating webhooks run before mutating ones — mutating always runs first so validation sees the final object.</div></details>
+
+<details class="qa"><summary>3. What is the difference between mutating and validating admission webhooks?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Mutating webhooks can modify the incoming object; validating webhooks can only accept or reject it.
+<br><strong>Detailed explanation:</strong> Mutating webhooks run first and can patch the object (add labels, inject containers); validating webhooks run after schema validation and see the final, mutated object, deciding admit/deny with no further changes allowed.
+<br><strong>Production example:</strong> Istio's injector (mutating) adds an Envoy sidecar container; a policy engine (validating) then confirms the resulting Pod still meets security requirements.
+<br><strong>Common mistake:</strong> Writing a validating webhook that tries to modify the object — validating webhooks cannot mutate, only allow/deny.</div></details>
+
+<details class="qa"><summary>4. What is the watch API and why does it matter for scalability?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Long-lived HTTP connections that stream change events to clients instead of requiring polling.
+<br><strong>Detailed explanation:</strong> Combined with client-side informer caches, watch lets thousands of controllers/kubelets react to changes within milliseconds without hammering the API Server with repeated list calls — this is what allows Kubernetes to scale to large clusters.
+<br><strong>Production example:</strong> Every kubelet watches only Pods bound to its own node, and every controller watches only its resource type, minimizing redundant traffic.
+<br><strong>Common mistake:</strong> Writing a custom controller that polls the API Server on a timer instead of using watch/informers — this doesn't scale and adds unnecessary load.</div></details>
+
+<details class="qa"><summary>5. What is the aggregation layer and what problem does it solve?</summary>
+<div class="qa-body"><strong>Short answer:</strong> It lets you register additional API servers that appear under the same unified API surface at <code>/apis/</code>.
+<br><strong>Detailed explanation:</strong> Instead of every extension needing to be built into kube-apiserver itself, the aggregation layer allows components like metrics-server to serve their own API while looking, to clients, like part of the core API.
+<br><strong>Production example:</strong> <code>kubectl top</code> works because metrics-server registers itself via the aggregation layer under <code>metrics.k8s.io</code>.
+<br><strong>Common mistake:</strong> Forgetting that aggregation-layer availability matters too — if metrics-server is down, <code>kubectl top</code> fails even though the core API Server is healthy.</div></details>
+
+<details class="qa"><summary>6. Why is the API Server horizontally scalable while Scheduler/Controller Manager are not (in the same way)?</summary>
+<div class="qa-body"><strong>Short answer:</strong> The API Server is stateless with no leader election — all replicas can serve traffic simultaneously; Scheduler/Controller Manager use leader election so only one is ever active.
+<br><strong>Detailed explanation:</strong> Because durable state lives only in etcd, any API Server replica can serve any request; but Scheduler/Controller Manager making conflicting decisions concurrently would cause race conditions, so they intentionally run single-active via a Lease.
+<br><strong>Production example:</strong> Running 3 API Server replicas behind a load balancer scales read/write throughput; running 3 Scheduler replicas only improves failover time, not throughput.
+<br><strong>Common mistake:</strong> Assuming adding more Scheduler replicas increases scheduling throughput.</div></details>
+
+<details class="qa"><summary>7. What is API Priority and Fairness (APF) and why does it exist?</summary>
+<div class="qa-body"><strong>Short answer:</strong> A mechanism to prevent one noisy or misbehaving client from starving other clients of API Server capacity.
+<br><strong>Detailed explanation:</strong> APF classifies requests into priority levels/flow schemas and applies fair queuing, so a runaway controller issuing excessive list/watch calls can't degrade the whole cluster's API responsiveness.
+<br><strong>Production example:</strong> A custom controller with a bug causing excessive full-list calls gets throttled by APF instead of taking down API Server responsiveness for everyone else.
+<br><strong>Common mistake:</strong> Not enabling/tuning APF in large multi-tenant clusters and being surprised when one bad actor degrades cluster-wide API latency.</div></details>
+
+<details class="qa"><summary>8. What's the risk of setting <code>failurePolicy: Fail</code> on an admission webhook without HA?</summary>
+<div class="qa-body"><strong>Short answer:</strong> A single webhook outage blocks every matching API request cluster-wide.
+<br><strong>Detailed explanation:</strong> <code>failurePolicy: Fail</code> means the API Server rejects the request if it can't reach the webhook — appropriate for security-critical checks, but catastrophic if the webhook service itself has no redundancy and goes down.
+<br><strong>Production example:</strong> A policy webhook Deployment scaled to a single replica crashes, and suddenly no Pods can be created anywhere in the cluster.
+<br><strong>Common mistake:</strong> Deploying admission webhooks as single-replica services while setting <code>failurePolicy: Fail</code>.</div></details>
+
+<details class="qa"><summary>9. How does RBAC authorization actually get evaluated for a request?</summary>
+<div class="qa-body"><strong>Short answer:</strong> The API Server checks Role/ClusterRole bindings for the authenticated identity against the requested verb, resource, and namespace.
+<br><strong>Detailed explanation:</strong> After authentication establishes identity (a user or ServiceAccount), the authorization stage looks up all applicable RoleBindings/ClusterRoleBindings and checks if any grants the specific verb (get/list/create/delete/etc.) on the target resource.
+<br><strong>Production example:</strong> <code>kubectl auth can-i create pods --as=system:serviceaccount:default:ci-bot</code> simulates exactly this check without making the real request.
+<br><strong>Common mistake:</strong> Granting <code>cluster-admin</code> broadly for convenience instead of scoping least-privilege Roles per namespace/ServiceAccount.</div></details>
+
+<details class="qa"><summary>10–50. Additional rapid-fire questions</summary>
+<div class="qa-body">
+<strong>10.</strong> What does <code>kubectl api-versions</code> show? — All API groups/versions currently served by the API Server, including aggregated ones.<br>
+<strong>11.</strong> How does <code>kubectl explain</code> get its schema information? — It queries the API Server's live OpenAPI schema definitions.<br>
+<strong>12.</strong> What authentication methods can the API Server accept? — Client certificates, static bearer tokens, OIDC tokens, and webhook token authentication, evaluated in a pluggable chain.<br>
+<strong>13.</strong> What happens if authentication fails? — The request is rejected with 401 before authorization or admission is ever evaluated.<br>
+<strong>14.</strong> What happens if authorization (RBAC) fails? — The request is rejected with 403 Forbidden before any admission webhook runs.<br>
+<strong>15.</strong> Why is schema validation performed after mutating admission? — Because mutating webhooks might change the object's shape, so validation must check the final version, not the original request body.<br>
+<strong>16.</strong> What object registers a validating webhook? — A <code>ValidatingWebhookConfiguration</code>.<br>
+<strong>17.</strong> What object registers a mutating webhook? — A <code>MutatingWebhookConfiguration</code>.<br>
+<strong>18.</strong> Why does the API Server need a <code>caBundle</code> in a webhook config? — To verify the TLS certificate presented by the webhook service when the API Server calls out to it.<br>
+<strong>19.</strong> What's the purpose of audit logging on the API Server? — Records every request for compliance and incident forensics, independent of whether it succeeded or failed.<br>
+<strong>20.</strong> Why is the API Server described as "stateless"? — It holds no durable data itself; all persistent state lives in etcd, which it's the sole gateway to.<br>
+<strong>21.</strong> What HTTP verb maps to a Kubernetes "watch"? — A GET request with <code>?watch=true</code>, kept open as a streaming HTTP connection.<br>
+<strong>22.</strong> How does an informer reduce load on the API Server? — It maintains a local cache populated by an initial list + ongoing watch, so controllers query the cache instead of re-listing from the API Server repeatedly.<br>
+<strong>23.</strong> What's the risk of an admission webhook with high latency? — Every matching request blocks on it, so slow webhooks directly slow down all affected API operations cluster-wide.<br>
+<strong>24.</strong> Why might <code>kubectl top</code> fail even if core API Server health checks pass? — It depends on the aggregation layer and metrics-server being healthy, which is separate from core API Server health.<br>
+<strong>25.</strong> What does <code>namespaceSelector</code> on a webhook config do? — Scopes the webhook to only fire for objects in namespaces matching specific labels, letting some namespaces opt out.<br>
+<strong>26.</strong> Why is <code>kubectl auth can-i</code> useful before debugging a "Forbidden" error? — It directly simulates the RBAC decision without side effects, quickly confirming whether it's an authorization issue.<br>
+<strong>27.</strong> What's a typical cause of "the server doesn't have a resource type" errors? — The API group/version for that resource (often a CRD) isn't registered/installed on this cluster.<br>
+<strong>28.</strong> Why does the API Server enforce OpenAPI schema validation? — To reject malformed objects before they ever reach etcd, keeping stored data structurally consistent.<br>
+<strong>29.</strong> What's the effect of setting <code>failurePolicy: Ignore</code> on a webhook? — If the webhook is unreachable, the request proceeds as if the webhook had allowed it — safer for non-critical checks, riskier for security ones.<br>
+<strong>30.</strong> How would you find all currently registered admission webhooks? — <code>kubectl get validatingwebhookconfigurations</code> and <code>kubectl get mutatingwebhookconfigurations</code>.<br>
+<strong>31.</strong> Why does API Server performance depend heavily on etcd? — Every write must be committed to etcd via Raft before the request completes; slow etcd fsync directly slows every write-path API call.<br>
+<strong>32.</strong> What's the purpose of <code>--enable-admission-plugins</code>? — Enables specific built-in admission controllers (ResourceQuota, NodeRestriction, etc.) as part of the pipeline.<br>
+<strong>33.</strong> What kind of identity can a webhook's <code>clientConfig.service</code> point to? — An in-cluster Service fronting the webhook server, resolved and called by the API Server over HTTPS.<br>
+<strong>34.</strong> Why is it dangerous to grant broad RBAC to CI/CD ServiceAccounts? — A compromised CI pipeline with excessive permissions can create/delete/modify arbitrary cluster resources.<br>
+<strong>35.</strong> How does the API Server notify watchers after a successful write? — It dispatches the change event to all active watch streams matching that resource/selector immediately after the etcd commit is acknowledged.<br>
+<strong>36.</strong> What's a common reason for "429 Too Many Requests" from the API Server? — API Priority and Fairness throttling a client that's exceeded its allotted concurrency/queue capacity.<br>
+<strong>37.</strong> Why should webhook servers be deployed with multiple replicas? — To avoid a single point of failure blocking all matching admission requests, especially under <code>failurePolicy: Fail</code>.<br>
+<strong>38.</strong> What's the difference between a Role and a ClusterRole? — A Role is namespace-scoped; a ClusterRole can be applied cluster-wide or bound within a specific namespace via a RoleBinding.<br>
+<strong>39.</strong> Why does <code>kubectl explain pod.spec --recursive</code> matter for interview/exam prep? — It shows you can query the live schema instead of memorizing every field, reflecting real-world workflow.<br>
+<strong>40.</strong> What's the operational impact of API Server certificate expiry? — Clients (kubectl, kubelets, controllers) fail to authenticate, effectively causing a cluster-wide outage of new operations.<br>
+<strong>41.</strong> Why is rate-limiting/APF particularly important in multi-tenant clusters? — Multiple independent teams' controllers/CI pipelines share the same API Server, so one team's bug shouldn't degrade everyone else.<br>
+<strong>42.</strong> What's the purpose of the <code>sideEffects</code> field on a webhook? — Declares whether the webhook has side effects outside the admission request, which affects dry-run behavior compatibility.<br>
+<strong>43.</strong> How does the API Server support optimistic concurrency? — Via <code>resourceVersion</code> on objects — a write with a stale resourceVersion is rejected, forcing the client to re-fetch and retry.<br>
+<strong>44.</strong> Why is direct etcd access considered a security anti-pattern even for read-only debugging? — etcd has no RBAC of its own comparable to the API Server's; direct read access exposes plaintext Secrets unless encryption-at-rest is configured.<br>
+<strong>45.</strong> What's a good diagnostic first step when many unrelated <code>kubectl</code> commands suddenly start timing out? — Check API Server health (<code>/healthz</code>) and then etcd latency, since API Server slowness is very often downstream of etcd.<br>
+<strong>46.</strong> Why does dry-run (<code>--dry-run=server</code>) still invoke admission webhooks? — To accurately simulate what would happen, including mutations and validation rejections, without persisting to etcd.<br>
+<strong>47.</strong> What's the risk of a mutating webhook that isn't idempotent? — Reapplying the same manifest could keep adding/duplicating injected content on every mutation pass.<br>
+<strong>48.</strong> Why does OPA Gatekeeper/Kyverno typically run as validating (not mutating) webhooks for policy enforcement? — Policy decisions are about allow/deny; mutation is a separate concern usually handled by dedicated defaulting webhooks.<br>
+<strong>49.</strong> What's a sign that admission webhook latency is impacting cluster performance? — Elevated API Server request latency specifically for resource types matched by the webhook's rules, not across all resources.<br>
+<strong>50.</strong> Why is the API Server considered the cluster's single trust boundary? — Every authn/authz/admission decision funnels through it; a misconfiguration there (RBAC, webhook) compromises the whole cluster regardless of how secure other components are.
+</div></details>
+
+<footer class="course-footer">Next: Topic 5 — etcd, the source of truth every API Server write lands in.</footer>
+
+<script>
+  mermaid.initialize({ startOnLoad: true, theme: 'dark' });
+</script>
+
+</body>
+</html>

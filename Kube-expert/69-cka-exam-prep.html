@@ -1,0 +1,281 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Topic 69: CKA Exam Preparation — Kubernetes Expert Course</title>
+<link rel="stylesheet" href="styles.css">
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+</head>
+<body>
+
+<header class="course-header">
+  <div class="kicker">Topic 69 of 70</div>
+  <h1>CKA Exam Preparation</h1>
+  <div class="subtitle">Turning course knowledge into exam performance: domain weightings, time management, and imperative kubectl speed.</div>
+</header>
+
+<nav class="topic-nav">
+  <a href="68-aks.html">&larr; AKS</a>
+  <a href="index.html">Course Index</a>
+  <a href="70-production-best-practices.html">Production Best Practices &rarr;</a>
+</nav>
+
+<h2 id="explanation">Explanation</h2>
+<p>The Certified Kubernetes Administrator (CKA) exam is a 2-hour, entirely hands-on, performance-based exam — there
+are no multiple-choice questions, only real clusters you must configure and debug via a terminal, typically 15-20
+tasks with different point weights. The official domains and approximate weightings (subject to periodic revision by
+the CNCF) are roughly: <strong>Cluster Architecture, Installation &amp; Configuration (~25%)</strong> — RBAC, HA
+topology, kubeadm-based cluster bootstrapping/upgrade; <strong>Workloads &amp; Scheduling (~15%)</strong> —
+Deployments, ConfigMaps/Secrets, scheduling constraints (affinity, taints/tolerations); <strong>Services &amp;
+Networking (~20%)</strong> — Services, Ingress, CNI, NetworkPolicy, DNS; <strong>Storage (~10%)</strong> — PV/PVC,
+StorageClasses, volume modes; and <strong>Troubleshooting (~30%)</strong> — the single largest domain, covering
+cluster component failures, node problems, application/container failures, and network troubleshooting. That
+weighting is itself the most important strategic fact about the exam: nearly a third of your score depends on
+diagnosing broken things quickly, not building new things from scratch, so your preparation time should be weighted
+accordingly rather than spent purely memorizing manifest syntax.</p>
+
+<p>Time management is the exam's second real challenge, independent of Kubernetes knowledge. With 15-20 tasks across
+multiple clusters (the exam uses several separate clusters/contexts you switch between per question) in 120 minutes,
+you have roughly 6-8 minutes per task on average — but tasks are not evenly difficult, so the correct strategy is to
+triage: skim all questions first if time allows, flag and skip anything that looks like it will eat more than ~10
+minutes early on, bank the guaranteed points from easy/medium tasks, and return to hard ones with whatever time
+remains. Never let one difficult troubleshooting task consume 20 minutes at the cost of three easy tasks you haven't
+attempted yet — partial credit does not exist per-task the way it might in a written exam context, so an unattempted
+easy task is a much larger loss than an unfinished hard one.</p>
+
+<p>The single highest-leverage technical skill for the exam is <strong>imperative kubectl fluency</strong> — generating
+resource YAML via <code>kubectl create/run ... --dry-run=client -o yaml</code> and piping to a file for edits, rather
+than hand-writing YAML from memory. This alone can cut task time by 60-70%. Equally important: setting a permanent
+alias (<code>alias k=kubectl</code>) and <code>export do="--dry-run=client -o yaml"</code> at the start of the exam,
+memorizing the exact context-switch command (<code>kubectl config use-context &lt;name&gt;</code>) since each task
+specifies a different cluster, and knowing <code>vim</code> or your chosen editor's basics well enough that syntax
+errors in YAML don't cost you minutes of debugging indentation.</p>
+
+<p>The exam environment itself matters: it's proctored remotely via browser lockdown with webcam monitoring, you get
+one allowed scratchpad/notes reference (in newer formats you may reference kubernetes.io documentation directly in a
+browser tab — confirm the current allowed-resources policy before sitting the exam, as this has changed across
+versions), and you have exactly one free retake if you don't pass. Because of that retake structure, treat your
+first attempt seriously but not as unrecoverable — the practical skill you build studying for it is worth more than
+the certificate itself, and is exactly the skill set this course has been building toward across all 70 topics.</p>
+
+<h2 id="internal-working">Internal Working / Interactions</h2>
+<ul>
+  <li><strong>Domain weighting drives study allocation:</strong> spend proportionally more time on Troubleshooting
+  and Networking than on Storage, matching the exam's actual point distribution.</li>
+  <li><strong>Context switching:</strong> each task may target a different cluster; the first action on every task
+  should be confirming/switching context, since work done on the wrong cluster scores zero.</li>
+  <li><strong>Imperative-then-edit workflow:</strong> generate a base manifest imperatively, redirect to a file,
+  edit only the specific fields the task requires, then apply — faster and less error-prone than writing YAML from
+  scratch.</li>
+  <li><strong>Triage loop:</strong> skim tasks, attempt easy/medium ones first, flag hard ones, return only if time
+  remains — this is a time-allocation algorithm you should rehearse under a timer before exam day.</li>
+  <li><strong>Verification step:</strong> after each task, verify the actual state (e.g. <code>kubectl get</code>,
+  <code>describe</code>, a curl/exec check) rather than trusting that <code>kubectl apply</code> succeeding means the
+  task is actually complete.</li>
+</ul>
+
+<h2 id="architecture-diagram">Architecture Diagram</h2>
+<pre class="mermaid">
+flowchart TD
+  Start["Exam starts - 120 min, 15-20 tasks"] --> Skim["Skim all tasks,\nnote point values + est. difficulty"]
+  Skim --> Loop{Next task}
+  Loop --> Ctx["kubectl config use-context <task-cluster>"]
+  Ctx --> Assess{Looks quick\nor hard?}
+  Assess -- Quick --> Do["Do it: imperative create\n--dry-run=client -o yaml > file.yaml,\nedit, apply"]
+  Assess -- Hard/slow --> Flag["Flag & skip for now"]
+  Do --> Verify["Verify actual state\n(get/describe/exec/curl)"]
+  Verify --> More{More tasks\nremaining?}
+  Flag --> More
+  More -- Yes --> Loop
+  More -- No, time left --> Revisit["Revisit flagged hard tasks"]
+  More -- No time left --> End["Submit exam"]
+  Revisit --> End
+</pre>
+
+<h2 id="code-example">Code Example</h2>
+<pre><code>#############################################
+# 1. Exam-start setup (do this in the first 60 seconds)
+#############################################
+alias k=kubectl                                        # save keystrokes on every single command
+export do="--dry-run=client -o yaml"                    # generate YAML fast: k run pod $do > pod.yaml
+export now="--force --grace-period=0"                   # fast-delete when a task needs it
+source <(kubectl completion bash)                        # tab-completion for resource names/fields
+complete -F __start_kubectl k
+
+---
+# 2. Imperative-first workflow example (create a Deployment fast, then customize)
+kubectl create deployment web --image=nginx:1.25 --replicas=3 $do > web-deploy.yaml
+# Edit only what the task actually requires - e.g. add resource requests/limits -
+# then apply. Faster and less error-prone than writing the whole Deployment by hand.
+vim web-deploy.yaml
+kubectl apply -f web-deploy.yaml
+
+---
+# 3. Fast troubleshooting checklist for a "Pod won't start" style task
+kubectl get pods -A --field-selector=status.phase!=Running   # find broken pods across all namespaces fast
+kubectl describe pod <pod> -n <ns> | tail -30                 # events section shows the actual failure reason
+kubectl logs <pod> -n <ns> --previous                          # check logs from the last crashed instance
+kubectl get events -n <ns> --sort-by=.lastTimestamp            # chronological event stream, fastest root-cause tool
+</code></pre>
+
+<h2 id="kubectl-cli-commands">kubectl / CLI Commands</h2>
+<pre><code># Switch to the cluster/context specified by the current task - do this FIRST every time
+kubectl config use-context <context-name>
+
+# Generate a Pod/Deployment/Job YAML fast instead of writing it by hand
+kubectl run mypod --image=nginx $do > pod.yaml
+
+# Generate a Service YAML for an existing Deployment
+kubectl expose deployment web --port=80 --target-port=8080 $do > svc.yaml
+
+# Quickly check cluster/component health during troubleshooting tasks
+kubectl get componentstatuses
+kubectl get nodes -o wide
+
+# Fast root-cause tools: events, describe, logs, exec
+kubectl get events -A --sort-by=.lastTimestamp
+kubectl exec -it <pod> -n <ns> -- sh
+
+# Confirm current exam-relevant state before moving to the next task
+kubectl get all -n <ns>
+</code></pre>
+
+<h2 id="best-practices">Best Practices &amp; Common Pitfalls</h2>
+<div class="grid-2">
+  <div class="lab-card">
+    <h4>Best Practices</h4>
+    <ul>
+      <li>Weight study time toward Troubleshooting and Networking — they carry the most exam points.</li>
+      <li>Set up <code>alias k</code> and <code>$do</code> shortcuts in the first minute of the exam, every time.</li>
+      <li>Always confirm/switch context before touching anything on a new task.</li>
+      <li>Triage aggressively — bank easy points before spending time on hard tasks.</li>
+      <li>Verify actual resulting state after every task, don't trust "apply succeeded" alone.</li>
+    </ul>
+  </div>
+  <div class="lab-card">
+    <h4>Common Pitfalls</h4>
+    <ul>
+      <li>Hand-writing YAML from memory instead of generating it imperatively and editing.</li>
+      <li>Losing 20+ minutes on one hard task while easy tasks remain unattempted.</li>
+      <li>Forgetting to switch context and doing correct work on the wrong cluster (scores zero).</li>
+      <li>Not practicing under real time pressure before exam day, misjudging your actual speed.</li>
+      <li>Skipping the docs-lookup practice, then fumbling navigation under time pressure on exam day.</li>
+    </ul>
+  </div>
+</div>
+
+<h2 id="interview-questions">50 Interview Questions</h2>
+
+<details class="qa"><summary>1. What is the CKA exam's format, and why does that shape how you should prepare?</summary>
+<div class="qa-body"><strong>Short answer:</strong> A 2-hour, entirely hands-on, performance-based exam with no multiple-choice questions — 15-20 tasks on real clusters you configure and debug via terminal.
+<br><strong>Detail:</strong> Because there's no partial credit for "knowing the concept" without executing it correctly on a live cluster, preparation must emphasize hands-on speed and accuracy over passive reading or memorized theory.
+<br><strong>Production example:</strong> A candidate who can recite RBAC concepts perfectly but is slow typing `kubectl create rolebinding` commands under time pressure will underperform someone with less theoretical depth but faster hands-on execution.
+<br><strong>Common mistake:</strong> Studying primarily via reading/videos instead of practicing the actual terminal workflow under a timer.</div></details>
+
+<details class="qa"><summary>2. Why is Troubleshooting weighted as the single largest exam domain (~30%), and what does that imply for study time?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Nearly a third of the score depends on diagnosing broken things quickly, not building new things from scratch — so study time should be weighted toward troubleshooting and networking rather than purely memorizing manifest syntax.
+<br><strong>Detail:</strong> This reflects the real-world skill CKA certifies: production Kubernetes work is disproportionately about debugging existing broken systems, not authoring fresh YAML, and the exam's weighting deliberately mirrors that.
+<br><strong>Production example:</strong> A candidate who has drilled `kubectl describe`/`logs`/`events` root-cause workflows extensively will bank Troubleshooting-domain points faster than one who only practiced writing Deployments from scratch.
+<br><strong>Common mistake:</strong> Spending disproportionate study time on Storage (~10%) or memorizing manifest syntax by hand, while under-preparing for the highest-weighted Troubleshooting domain.</div></details>
+
+<details class="qa"><summary>3. What's the recommended time-management strategy given 15-20 tasks in 120 minutes?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Skim all questions first if time allows, flag and skip anything that looks like it will eat more than ~10 minutes early on, bank guaranteed points from easy/medium tasks, and return to hard ones with whatever time remains.
+<br><strong>Detail:</strong> Because tasks are not evenly difficult and partial credit doesn't exist per-task the way it might in a written exam, an unattempted easy task is a much larger loss than an unfinished hard one — so triage protects your score more than perfectionism on any single task.
+<br><strong>Production example:</strong> A candidate who spends 20 minutes stuck on one hard networking task instead of skipping it loses three easy tasks' worth of guaranteed points elsewhere.
+<br><strong>Common mistake:</strong> Letting one difficult troubleshooting task consume 20+ minutes at the cost of easy tasks not yet attempted.</div></details>
+
+<details class="qa"><summary>4. Why is imperative kubectl fluency called the single highest-leverage technical skill for the exam?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Generating resource YAML via `kubectl create/run ... --dry-run=client -o yaml` and piping to a file for edits, rather than hand-writing YAML from memory, can cut task time by 60-70%.
+<br><strong>Detail:</strong> Given the exam's strict time budget (roughly 6-8 minutes per task on average), the difference between hand-typing a full Deployment manifest and generating a base one imperatively before editing only the required fields is often the difference between finishing and running out of time.
+<br><strong>Production example:</strong> `kubectl create deployment web --image=nginx:1.25 --replicas=3 --dry-run=client -o yaml > web-deploy.yaml` produces a correct base manifest in seconds, leaving edit time only for the fields the task actually requires.
+<br><strong>Common mistake:</strong> Hand-writing YAML from memory instead of generating it imperatively and editing only what's needed.</div></details>
+
+<details class="qa"><summary>5. What exam-start setup is recommended in the first 60 seconds, and why?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Set `alias k=kubectl`, `export do="--dry-run=client -o yaml"`, `export now="--force --grace-period=0"`, and enable tab-completion — small time savers that compound across 15-20 tasks.
+<br><strong>Detail:</strong> These shortcuts individually seem minor, but across dozens of commands per task and multiple tasks, the cumulative keystroke/time savings can be the margin between finishing the exam and running out of time.
+<br><strong>Production example:</strong> Using `k run mypod --image=nginx $do > pod.yaml` instead of typing `kubectl run mypod --image=nginx --dry-run=client -o yaml > pod.yaml` repeatedly saves meaningful time over the full exam.
+<br><strong>Common mistake:</strong> Skipping this setup "to save time," then re-typing the same long flags/commands manually throughout the exam, losing far more time overall.</div></details>
+
+<details class="qa"><summary>6. Why must context-switching be the first action on every task, and what's the cost of forgetting it?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Each task may target a different cluster; work done on the wrong cluster scores zero regardless of correctness, so confirming/switching context via `kubectl config use-context <name>` must happen before any other action.
+<br><strong>Detail:</strong> The exam deliberately uses multiple separate clusters/contexts to test this discipline — a perfectly correct answer applied to the wrong cluster earns no credit, making this a pure process-discipline risk rather than a knowledge gap.
+<br><strong>Production example:</strong> A candidate who solves a task flawlessly but forgot to switch context first discovers, only at review time, that the work was applied to the previous task's cluster.
+<br><strong>Common mistake:</strong> Forgetting to switch context at the start of a new task and doing otherwise-correct work on the wrong cluster.</div></details>
+
+<details class="qa"><summary>7. Why does the exam methodology insist on a verification step after every task rather than trusting `kubectl apply` success?</summary>
+<div class="qa-body"><strong>Short answer:</strong> `kubectl apply` succeeding only confirms the API accepted the manifest, not that the resulting state actually satisfies the task — verifying via `get`/`describe`/exec/curl confirms the task is truly complete.
+<br><strong>Detail:</strong> A manifest can apply successfully yet still fail to achieve the intended state (e.g. a Pod stuck Pending, a Service with no matching endpoints) — verification catches these gaps before moving on, when there's still time to fix them.
+<br><strong>Production example:</strong> An applied Deployment shows `deployment.apps/web created` but `kubectl get pods` reveals the Pods are stuck in ImagePullBackOff — caught only by the verification step, not by the apply command's success message.
+<br><strong>Common mistake:</strong> Trusting that `kubectl apply` succeeding means the task is complete, without a follow-up `get`/`describe` check.</div></details>
+
+<details class="qa"><summary>8. What's the fast root-cause toolchain recommended for a "Pod won't start" style troubleshooting task?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Filter for broken Pods across namespaces, `describe` for the events section, `logs --previous` for the last crashed instance, and `get events --sort-by=.lastTimestamp` for a chronological event stream.
+<br><strong>Detail:</strong> This ordered sequence moves from broad detection (`--field-selector=status.phase!=Running`) to increasingly specific evidence (events, then logs, then a full chronological timeline), matching the same "narrow down" discipline used in real production incident response.
+<br><strong>Production example:</strong> `kubectl get pods -A --field-selector=status.phase!=Running` quickly surfaces a CrashLoopBackOff Pod across dozens of namespaces without manually scanning each one.
+<br><strong>Common mistake:</strong> Jumping straight to `kubectl logs` on a guessed Pod without first using a field-selector or events stream to actually identify which Pod/namespace is broken.</div></details>
+
+<details class="qa"><summary>9. What allowed-resources and retake policies matter operationally when planning your exam attempt?</summary>
+<div class="qa-body"><strong>Short answer:</strong> The exam is proctored remotely via browser lockdown with webcam monitoring, allows one scratchpad/notes reference (and in newer formats, kubernetes.io documentation in-browser), and gives exactly one free retake if you don't pass.
+<br><strong>Detail:</strong> Because the allowed-documentation policy has changed across exam versions, confirming the current policy before sitting the exam is itself part of proper preparation — and knowing you have a free retake should inform (but not excuse) how seriously you treat your first attempt.
+<br><strong>Production example:</strong> A candidate who has practiced navigating kubernetes.io documentation quickly (if allowed) avoids wasting minutes fumbling through unfamiliar doc navigation mid-exam.
+<br><strong>Common mistake:</strong> Skipping docs-lookup practice, then fumbling navigation under time pressure on exam day.</div></details>
+
+<details class="qa"><summary>10. Why does the course frame the CKA's real value as being "the skill, not the certificate"?</summary>
+<div class="qa-body"><strong>Short answer:</strong> The practical skill built while studying for the exam (fast troubleshooting, imperative kubectl fluency, disciplined time management) is the same skill set this entire 70-topic course has been building toward, independent of whether the certificate itself is ever used.
+<br><strong>Detail:</strong> This reframes exam prep from "memorize enough to pass" to "genuinely build production-relevant speed and troubleshooting instincts" — which is also why the exam's domain weighting mirrors real operational priorities rather than academic ones.
+<br><strong>Production example:</strong> An engineer who drilled the imperative-then-edit workflow and fast troubleshooting checklist for the exam finds those exact habits directly useful during a real production incident afterward.
+<br><strong>Common mistake:</strong> Treating exam prep as a one-time memorization exercise disconnected from actual day-to-day Kubernetes operational skill.</div></details>
+
+<details class="qa"><summary>11–50. Additional rapid-fire questions</summary>
+<div class="qa-body">
+<strong>11.</strong> How long is the CKA exam? — 2 hours (120 minutes).<br>
+<strong>12.</strong> Does the CKA exam have multiple-choice questions? — No — entirely hands-on, performance-based tasks on real clusters.<br>
+<strong>13.</strong> Roughly how many tasks are on the exam? — Typically 15-20 tasks with different point weights.<br>
+<strong>14.</strong> What's the approximate weighting of Cluster Architecture, Installation & Configuration? — ~25%.<br>
+<strong>15.</strong> What's the approximate weighting of Workloads & Scheduling? — ~15%.<br>
+<strong>16.</strong> What's the approximate weighting of Services & Networking? — ~20%.<br>
+<strong>17.</strong> What's the approximate weighting of Storage? — ~10%.<br>
+<strong>18.</strong> What's the approximate weighting of Troubleshooting, the largest domain? — ~30%.<br>
+<strong>19.</strong> Roughly how much time do you have per task on average? — About 6-8 minutes.<br>
+<strong>20.</strong> What command generates a Pod/Deployment YAML fast instead of hand-writing it? — `kubectl create/run ... --dry-run=client -o yaml`.<br>
+<strong>21.</strong> What alias is recommended to save keystrokes throughout the exam? — `alias k=kubectl`.<br>
+<strong>22.</strong> What environment variable shortcut is recommended for the dry-run flags? — `export do="--dry-run=client -o yaml"`.<br>
+<strong>23.</strong> What environment variable shortcut speeds up force-deletes? — `export now="--force --grace-period=0"`.<br>
+<strong>24.</strong> What command switches the active cluster context? — `kubectl config use-context <name>`.<br>
+<strong>25.</strong> Why must context be checked/switched first on every task? — Each task may target a different cluster; work on the wrong cluster scores zero.<br>
+<strong>26.</strong> What's the recommended triage strategy under time pressure? — Skim all tasks, flag/skip ones likely to take too long, bank easy points first, revisit hard tasks if time remains.<br>
+<strong>27.</strong> What's the risk of spending 20+ minutes on one hard task? — Losing guaranteed points from multiple easy tasks left unattempted.<br>
+<strong>28.</strong> Does partial credit exist per-task the way it might on a written exam? — No, effectively not in the same way — an unattempted easy task is a bigger loss than an unfinished hard one.<br>
+<strong>29.</strong> What command generates a Service YAML for an existing Deployment? — `kubectl expose deployment <name> --port=<p> --target-port=<tp> $do > svc.yaml`.<br>
+<strong>30.</strong> What command quickly finds broken Pods across all namespaces? — `kubectl get pods -A --field-selector=status.phase!=Running`.<br>
+<strong>31.</strong> What command shows the actual failure reason via the events section? — `kubectl describe pod <pod> -n <ns> | tail -30`.<br>
+<strong>32.</strong> What command checks logs from a Pod's last crashed instance? — `kubectl logs <pod> -n <ns> --previous`.<br>
+<strong>33.</strong> What command gives a chronological, cluster-wide event stream for root-causing? — `kubectl get events -A --sort-by=.lastTimestamp`.<br>
+<strong>34.</strong> What command checks overall cluster/component health quickly? — `kubectl get componentstatuses` and `kubectl get nodes -o wide`.<br>
+<strong>35.</strong> Why verify state after every task instead of trusting `kubectl apply` alone? — Apply succeeding only means the API accepted the manifest, not that the resulting state actually satisfies the task.<br>
+<strong>36.</strong> What's the proctoring format for the exam? — Remote, browser lockdown, webcam monitoring.<br>
+<strong>37.</strong> How many free retakes come with a CKA exam attempt? — One.<br>
+<strong>38.</strong> What reference material may be allowed during the exam (subject to policy changes)? — A scratchpad/notes reference, and in newer formats, kubernetes.io documentation in-browser.<br>
+<strong>39.</strong> Why should you confirm the allowed-resources policy before sitting the exam? — It has changed across exam format versions, so assumptions from older prep material may be outdated.<br>
+<strong>40.</strong> What editor skill is called out as important for exam speed? — Knowing vim (or your chosen editor) well enough that YAML indentation errors don't cost debugging time.<br>
+<strong>41.</strong> Why is the imperative-then-edit workflow faster and less error-prone than hand-writing YAML? — It generates a syntactically correct base manifest automatically, leaving edits only to the specific fields the task requires.<br>
+<strong>42.</strong> What's the first action recommended on every new task regardless of its content? — Confirm/switch to the correct kubectl context.<br>
+<strong>43.</strong> Why is Troubleshooting weighted so heavily relative to Storage? — It reflects real production work being disproportionately about diagnosing existing broken systems rather than building new storage configs.<br>
+<strong>44.</strong> What's a good study-time allocation strategy based on domain weighting? — Spend proportionally more time on Troubleshooting and Networking than on Storage, matching the exam's actual point distribution.<br>
+<strong>45.</strong> Why is tab-completion setup (`kubectl completion bash`) worth doing at exam start? — It speeds up typing resource/field names accurately under time pressure, reducing small typo-driven delays.<br>
+<strong>46.</strong> What's the danger of not practicing under real time pressure before exam day? — Misjudging your actual per-task speed, leading to poor real-time triage decisions during the actual exam.<br>
+<strong>47.</strong> Why does the course tie CKA prep directly to the whole 70-topic course rather than treating it as separate? — The practical skills (troubleshooting, imperative kubectl, time-boxed prioritization) built through the course are exactly what the exam performance-tests.<br>
+<strong>48.</strong> What's the risk of treating your first CKA attempt as low-stakes because of the free retake? — It can lead to under-preparing, wasting the retake on avoidable mistakes rather than as a genuine safety net.<br>
+<strong>49.</strong> Why does the exam use multiple separate clusters/contexts instead of one big cluster? — To specifically test the discipline of confirming/switching context correctly per task, mirroring real multi-cluster operational environments.<br>
+<strong>50.</strong> What's the single biggest strategic insight this topic emphasizes about exam performance? — Domain weighting (Troubleshooting ~30%) and time-boxed triage matter as much as raw Kubernetes knowledge — the exam rewards fast, disciplined execution over exhaustive expertise on any one task.
+</div></details>
+
+<footer class="course-footer">Continue to Topic 70: Production Best Practices — the final topic of this course.</footer>
+
+<script>
+  mermaid.initialize({ startOnLoad: true, theme: 'dark' });
+</script>
+
+</body>
+</html>

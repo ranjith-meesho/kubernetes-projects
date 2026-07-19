@@ -1,0 +1,300 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Topic 20: CoreDNS — Kubernetes Expert Course</title>
+<link rel="stylesheet" href="styles.css">
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+</head>
+<body>
+
+<header class="course-header">
+  <div class="kicker">Topic 20 of 70</div>
+  <h1>CoreDNS</h1>
+  <div class="subtitle">The pluggable DNS server that implements cluster DNS — its Corefile plugin chain, live watches, and caching/forwarding behavior.</div>
+</header>
+
+<nav class="topic-nav">
+  <a href="19-dns.html">&larr; DNS</a>
+  <a href="index.html">Course Index</a>
+  <a href="21-networking.html">Networking &rarr;</a>
+</nav>
+
+<h2 id="explanation">Explanation</h2>
+<p><strong>CoreDNS</strong> is the DNS server implementation that provides cluster DNS in essentially every modern
+Kubernetes distribution (it replaced kube-dns as the default around Kubernetes 1.13). Where the previous topic
+described the naming <em>convention</em> (how DNS names are structured), this topic is about the actual server that
+answers those queries: a general-purpose, plugin-chain-based DNS server written in Go, running as a Deployment inside
+the cluster itself, exposed via its own Service.</p>
+
+<p>Kubernetes needs CoreDNS specifically (rather than a generic DNS server with a static zone file) because cluster
+DNS records are not static — they must reflect the live, constantly-changing set of Services, Endpoints, and
+optionally Pods. A traditional DNS server reads records from disk or a database that something else must keep in
+sync; CoreDNS instead has a first-class <code>kubernetes</code> plugin that talks directly to the Kubernetes API
+Server via a watch connection, so DNS answers are generated on the fly from live cluster state with no separate
+synchronization step and no stale-zone-file problem.</p>
+
+<p>CoreDNS's defining architectural idea is the <strong>plugin chain</strong>, configured via a <code>Corefile</code>
+(analogous to nginx.conf but for DNS). Each plugin handles one concern and the request flows through them in the
+order they're listed: <code>errors</code> logs errors, <code>health</code>/<code>ready</code> expose liveness/readiness
+endpoints for the Pod's own probes, <code>kubernetes</code> answers queries about cluster Services/Pods by watching
+the API Server, <code>prometheus</code> exposes metrics, <code>forward</code> sends any query CoreDNS doesn't own
+(e.g. an external domain like <code>api.stripe.com</code>) upstream to the node's configured resolver (often the
+cloud provider's DNS, e.g. AmazonProvidedDNS on EKS), <code>cache</code> caches both the cluster-internal and
+forwarded answers for a configurable TTL to cut both API Server load and outbound query latency, and
+<code>loop</code> detects and breaks DNS forwarding loops that would otherwise crash CoreDNS with an infinite request
+storm.</p>
+
+<p>Because CoreDNS is deployed as an ordinary Kubernetes Deployment (typically 2 replicas for HA, often with the
+<code>cluster-autoscaler</code>-aware <code>topologySpreadConstraints</code> to spread across nodes), it benefits
+from — and is subject to — every property already covered: it's exposed via a stable Service so kubelet can inject
+one durable IP into every Pod's resolv.conf, and it self-heals like any Deployment-managed workload. This is a nice
+demonstration of the platform's own composability: even a piece of "core infrastructure" like cluster DNS is just
+another workload running on top of Kubernetes' regular primitives.</p>
+
+<h2 id="internal-working">Internal Working / Interactions</h2>
+<ul>
+  <li><strong>API Server</strong> — CoreDNS's <code>kubernetes</code> plugin maintains a watch/informer against
+  Services, EndpointSlices, and (if the plugin is configured to) Pods, to build in-memory DNS answers.</li>
+  <li><strong>kube-dns Service</strong> — CoreDNS Pods sit behind this stable ClusterIP Service; it's this IP that
+  kubelet writes into every other Pod's <code>/etc/resolv.conf</code>.</li>
+  <li><strong>kubelet</strong> — indirectly depends on CoreDNS being healthy; if CoreDNS is down, name resolution
+  cluster-wide fails even though existing established connections keep working.</li>
+  <li><strong>Upstream resolver</strong> — for non-cluster domains, the <code>forward</code> plugin sends queries to
+  whatever DNS server is configured on the CoreDNS Pod's own node (often <code>/etc/resolv.conf</code> of the host,
+  passed through).</li>
+  <li><strong>Deployment / ReplicaSet controller</strong> — manage CoreDNS's own Pods exactly like any other
+  Deployment; a crashed CoreDNS Pod is replaced the same way any other workload's Pod would be.</li>
+</ul>
+
+<h2 id="architecture-diagram">Architecture Diagram</h2>
+<pre class="mermaid">
+flowchart TB
+    Q["Incoming DNS query"]
+    subgraph Corefile["CoreDNS Plugin Chain (Corefile)"]
+      direction TB
+      ERR["errors"] --> HEALTH["health / ready"]
+      HEALTH --> K8S["kubernetes plugin\n(watches Services/EndpointSlices via API Server)"]
+      K8S --> FWD["forward\n(non-cluster domains -> upstream resolver)"]
+      FWD --> CACHE["cache\n(TTL-based, both internal + forwarded answers)"]
+    end
+    Q --> ERR
+    CACHE --> ANS["Answer returned to client Pod"]
+    K8S -.watch.-> API["API Server"]
+    FWD -.query.-> UP["Upstream DNS\n(e.g. AmazonProvidedDNS / 8.8.8.8)"]
+</pre>
+
+<pre class="mermaid">
+sequenceDiagram
+    participant P as Client Pod
+    participant CD as CoreDNS
+    participant Cache as cache plugin
+    participant A as API Server
+    participant Up as Upstream DNS
+
+    P->>CD: A? checkout.payments.svc.cluster.local
+    CD->>Cache: Check cache
+    alt Cache miss
+        CD->>A: (already watching) lookup in local Service/EndpointSlice cache
+        A-->>CD: ClusterIP 10.96.10.5
+        CD->>Cache: Store with TTL
+    end
+    CD-->>P: 10.96.10.5
+
+    P->>CD: A? api.stripe.com
+    CD->>CD: kubernetes plugin: not a cluster domain, pass through
+    CD->>Up: Forward query
+    Up-->>CD: Real external IP
+    CD-->>P: Answer (cached for next time)
+</pre>
+
+<h2 id="code-example">Code Example</h2>
+<pre><code># ConfigMap holding the Corefile — CoreDNS's actual configuration (edit via kubectl edit cm coredns -n kube-system)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: coredns
+  namespace: kube-system
+data:
+  Corefile: |
+    .:53 {                          # Listen on port 53 for all domains (".").
+        errors                        # Log DNS errors to stdout.
+        health {
+           lameduck 5s                 # Report unhealthy 5s before shutdown, for clean rolling updates.
+        }
+        ready                         # Readiness endpoint used by CoreDNS's own Pod readinessProbe.
+        kubernetes cluster.local in-addr.arpa ip6.arpa {   # Handles cluster.local + reverse DNS.
+           pods insecure                 # Allow resolving Pod IPs directly (pod-ip.ns.pod.cluster.local).
+           fallthrough in-addr.arpa ip6.arpa
+           ttl 30                        # TTL for records served by this plugin.
+        }
+        prometheus :9153               # Expose Prometheus metrics on :9153.
+        forward . /etc/resolv.conf {    # Anything not matched above -> forward to node's upstream resolver.
+           max_concurrent 1000
+        }
+        cache 30                       # Cache answers for 30s to cut API Server load + latency.
+        loop                           # Detect and break forwarding loops.
+        reload                        # Auto-reload Corefile changes without restarting the Pod.
+        loadbalance                   # Round-robin shuffle of A/AAAA records returned, for basic load spreading.
+    }
+</code></pre>
+
+<h2 id="kubectl-commands">kubectl Commands</h2>
+<pre><code># Check CoreDNS Pod health and replica count
+kubectl get pods -n kube-system -l k8s-app=kube-dns
+
+# View live logs (great for diagnosing resolution failures)
+kubectl logs -n kube-system -l k8s-app=kube-dns --tail=100 -f
+
+# View or edit the active Corefile
+kubectl get configmap coredns -n kube-system -o yaml
+kubectl edit configmap coredns -n kube-system
+
+# Check CoreDNS's own Service (the IP injected into every Pod's resolv.conf)
+kubectl get svc kube-dns -n kube-system
+
+# Restart CoreDNS to pick up a Corefile change immediately (reload plugin usually handles this automatically)
+kubectl rollout restart deployment coredns -n kube-system
+
+# Scrape CoreDNS's Prometheus metrics endpoint for query volume / error rates
+kubectl port-forward -n kube-system deploy/coredns 9153:9153
+curl localhost:9153/metrics | grep coredns_dns_requests_total
+</code></pre>
+
+<h2 id="best-practices">Best Practices &amp; Common Pitfalls</h2>
+<div class="grid-2">
+<div>
+<h4>Best Practices</h4>
+<ul>
+  <li>Run at least 2 CoreDNS replicas with pod anti-affinity/topology spread for HA.</li>
+  <li>Tune the <code>cache</code> plugin's TTL to balance API Server load against DNS staleness tolerance.</li>
+  <li>Monitor <code>coredns_dns_request_duration_seconds</code> and error-rate metrics — DNS latency spikes often precede wider outages.</li>
+  <li>Use the <code>kubernetes-autoscaler</code>/CoreDNS-autoscaler add-on to scale replica count with cluster size.</li>
+</ul>
+</div>
+<div>
+<h4>Pitfalls</h4>
+<ul>
+  <li>Forgetting the <code>loop</code> plugin, risking a forwarding loop that crash-loops CoreDNS under certain node resolv.conf misconfigurations.</li>
+  <li>Setting cache TTL too high, causing stale answers after fast Service/Endpoint churn (e.g. during rollouts).</li>
+  <li>Not monitoring CoreDNS at all — since it's "just infrastructure," teams often notice it's down only via app-wide DNS failures.</li>
+  <li>Editing the Corefile without validating syntax — a malformed Corefile can crash-loop every CoreDNS replica simultaneously.</li>
+</ul>
+</div>
+</div>
+
+<h2 id="interview-questions">50 Interview Questions</h2>
+
+<details class="qa"><summary>1. Why can't cluster DNS be implemented with a traditional static zone file?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Cluster DNS records must reflect the live, constantly-changing set of Services, Endpoints, and Pods — a static file would immediately go stale.
+<br><strong>Detailed explanation:</strong> CoreDNS's kubernetes plugin instead talks directly to the API Server via a watch connection, generating DNS answers on the fly from live cluster state with no separate synchronization step and no stale-zone-file problem.
+<br><strong>Production example:</strong> The moment a checkout Service's ClusterIP-backing Pods change, the next DNS query reflects current state — there's no "reload the zone file" step required.
+<br><strong>Common mistake:</strong> Assuming CoreDNS needs to be manually reloaded or restarted whenever Services/Pods change — the kubernetes plugin's watch handles this automatically.</div></details>
+
+<details class="qa"><summary>2. What is the Corefile plugin chain, and why does plugin order matter?</summary>
+<div class="qa-body"><strong>Short answer:</strong> The Corefile lists plugins (errors, health, kubernetes, forward, cache, etc.) that a request flows through in listed order, each handling one concern.
+<br><strong>Detailed explanation:</strong> Since each plugin can inspect, answer, or pass along a query, ordering determines behavior — e.g. kubernetes must come before forward so cluster-domain queries are answered locally instead of being needlessly forwarded upstream.
+<br><strong>Production example:</strong> In the standard Corefile, kubernetes handles cluster.local/in-addr.arpa/ip6.arpa, and only queries it doesn't recognize fall through to forward for upstream resolution.
+<br><strong>Common mistake:</strong> Reordering the Corefile without understanding fallthrough semantics, accidentally causing cluster-internal queries to be forwarded upstream (and fail) instead of answered locally.</div></details>
+
+<details class="qa"><summary>3. What does the forward plugin do, and where does it send queries it handles?</summary>
+<div class="qa-body"><strong>Short answer:</strong> It sends any query CoreDNS doesn't own (e.g. an external domain like api.stripe.com) upstream to the node's configured resolver.
+<br><strong>Detailed explanation:</strong> By default this reads from <code>/etc/resolv.conf</code> on the CoreDNS Pod's own node, meaning external resolution ultimately depends on whatever DNS server the underlying infrastructure provides (e.g. AmazonProvidedDNS on EKS).
+<br><strong>Production example:</strong> A Pod querying <code>api.stripe.com</code> gets answered via CoreDNS's kubernetes plugin recognizing it's not a cluster domain, then forward relaying it to the node's upstream resolver.
+<br><strong>Common mistake:</strong> Assuming CoreDNS resolves external domains itself rather than merely forwarding to an upstream server it doesn't control.</div></details>
+
+<details class="qa"><summary>4. Why does the loop plugin exist, and what specific failure mode does it prevent?</summary>
+<div class="qa-body"><strong>Short answer:</strong> It detects and breaks DNS forwarding loops that would otherwise crash CoreDNS with an infinite request storm.
+<br><strong>Detailed explanation:</strong> A misconfigured node resolv.conf (e.g. pointing back at CoreDNS itself as an upstream) can create a forwarding cycle; loop detects this pattern and fails fast instead of letting CoreDNS spiral into a crash-loop under the resulting query storm.
+<br><strong>Production example:</strong> A cluster where the node's own resolv.conf was accidentally pointed at the cluster DNS IP would trigger loop's detection, surfacing a clear error instead of CoreDNS silently melting down.
+<br><strong>Common mistake:</strong> Removing the loop plugin from a Corefile "to simplify it," losing this safety net against a subtle but severe misconfiguration.</div></details>
+
+<details class="qa"><summary>5. What does the cache plugin actually cache, and what's the tradeoff in setting its TTL?</summary>
+<div class="qa-body"><strong>Short answer:</strong> It caches both cluster-internal and forwarded (external) answers for a configurable TTL, cutting API Server load and outbound query latency.
+<br><strong>Detailed explanation:</strong> Too high a TTL risks serving stale answers after fast Service/Endpoint churn (e.g. during rollouts); too low a TTL reduces the caching benefit, increasing load and latency for repeated queries.
+<br><strong>Production example:</strong> A Corefile with <code>cache 30</code> balances a 30-second staleness window against meaningfully reduced query volume for high-traffic Service names.
+<br><strong>Common mistake:</strong> Setting cache TTL far too high for a cluster with fast-churning Services (frequent rollouts), causing clients to briefly resolve to already-gone Pod-backed IPs.</div></details>
+
+<details class="qa"><summary>6. Why is CoreDNS deployed as an ordinary Deployment rather than some special always-on system process?</summary>
+<div class="qa-body"><strong>Short answer:</strong> To demonstrate and benefit from Kubernetes' own composability — even core infrastructure is just another workload managed by the same primitives.
+<br><strong>Detailed explanation:</strong> Running as a Deployment means CoreDNS self-heals like any other workload (ReplicaSet controller replaces a crashed Pod), can be scaled via replica count, and benefits from standard rollout/rollback mechanics for Corefile/image changes.
+<br><strong>Production example:</strong> A crashed CoreDNS Pod is replaced within seconds by the ReplicaSet controller exactly as any other Deployment-managed Pod would be — no special-cased recovery logic exists.
+<br><strong>Common mistake:</strong> Treating CoreDNS as untouchable "system magic" instead of applying the same operational rigor (monitoring, resource limits, topology spread) used for any other critical Deployment.</div></details>
+
+<details class="qa"><summary>7. Why does CoreDNS typically run with at least 2 replicas and topology spread constraints?</summary>
+<div class="qa-body"><strong>Short answer:</strong> For high availability — since literally every Pod in the cluster depends on it for name resolution, a single point of failure would be catastrophic.
+<br><strong>Detailed explanation:</strong> Spreading replicas across nodes (via topologySpreadConstraints or anti-affinity) ensures a single node failure can't take down all CoreDNS replicas simultaneously, which would cause cluster-wide new-connection failures.
+<br><strong>Production example:</strong> A CoreDNS Deployment with 2 replicas pinned via anti-affinity to different nodes survives a single node failure without any DNS resolution outage.
+<br><strong>Common mistake:</strong> Running CoreDNS with a single replica "since it's just DNS," creating a severe single point of failure for the entire cluster.</div></details>
+
+<details class="qa"><summary>8. What happens cluster-wide if CoreDNS goes down entirely, and why do existing connections keep working?</summary>
+<div class="qa-body"><strong>Short answer:</strong> New name resolutions fail cluster-wide, but already-established connections keep working since DNS is only consulted at connection-initiation time.
+<br><strong>Detailed explanation:</strong> This creates a deceptive symptom pattern — existing traffic looks fine while anything attempting a fresh connection (including retries, reconnects, and new Pods starting up) fails, often masking the true root cause during an incident.
+<br><strong>Production example:</strong> An outage where CoreDNS crash-loops might show healthy dashboards for long-lived connections while every new Pod rollout or reconnect attempt silently fails.
+<br><strong>Common mistake:</strong> Ruling out a DNS outage too early during an incident because "some things still seem to be working."</div></details>
+
+<details class="qa"><summary>9. Why is monitoring CoreDNS's own metrics (via the prometheus plugin) important, given it's "just infrastructure"?</summary>
+<div class="qa-body"><strong>Short answer:</strong> DNS latency spikes and error rates often precede wider outages, but teams frequently don't monitor CoreDNS directly and only notice it's degraded via downstream app-wide failures.
+<br><strong>Detailed explanation:</strong> Metrics like <code>coredns_dns_request_duration_seconds</code> and request error rates give an early, direct signal of DNS health, rather than waiting to infer it indirectly from application-level symptoms across the whole cluster.
+<br><strong>Production example:</strong> A Grafana dashboard scraping CoreDNS's :9153 metrics endpoint can alert on rising query latency minutes before it manifests as broad application timeouts.
+<br><strong>Common mistake:</strong> Not scraping CoreDNS's Prometheus endpoint at all, treating it as invisible infrastructure until it's already causing a visible cluster-wide incident.</div></details>
+
+<details class="qa"><summary>10. Why can a malformed Corefile crash-loop every CoreDNS replica simultaneously?</summary>
+<div class="qa-body"><strong>Short answer:</strong> All CoreDNS replicas typically share the exact same Corefile (via the same ConfigMap), so a syntax error affects every replica identically at once.
+<br><strong>Detailed explanation:</strong> Unlike application config errors that might only affect a subset of replicas due to rolling deployment timing, a Corefile error is baked into the ConfigMap all replicas mount, meaning a bad edit + rollout restart can take down 100% of DNS capacity simultaneously.
+<br><strong>Production example:</strong> An engineer editing the Corefile ConfigMap with a typo and then running <code>kubectl rollout restart deployment coredns</code> can crash every CoreDNS Pod at once, causing a full cluster DNS outage.
+<br><strong>Common mistake:</strong> Editing the live Corefile ConfigMap directly in production without validating syntax first or testing in a non-production cluster.</div></details>
+
+<details class="qa"><summary>11–50. Additional rapid-fire questions</summary>
+<div class="qa-body">
+<strong>11.</strong> What did CoreDNS replace as the Kubernetes DNS default? — kube-dns, around Kubernetes 1.13.<br>
+<strong>12.</strong> What language is CoreDNS written in? — Go.<br>
+<strong>13.</strong> What's the name of the plugin that handles cluster.local resolution? — The kubernetes plugin.<br>
+<strong>14.</strong> What port does CoreDNS listen on for DNS traffic? — 53 (both TCP and UDP).<br>
+<strong>15.</strong> What port exposes CoreDNS's Prometheus metrics by convention? — 9153.<br>
+<strong>16.</strong> What plugin exposes CoreDNS's own liveness/readiness endpoints? — health (liveness) and ready (readiness).<br>
+<strong>17.</strong> What does the errors plugin do? — Logs DNS errors to stdout for visibility/debugging.<br>
+<strong>18.</strong> What does the reload plugin enable? — Auto-reloading Corefile changes without restarting the CoreDNS Pod.<br>
+<strong>19.</strong> What does the loadbalance plugin do? — Round-robin shuffles the order of A/AAAA records returned, for basic client-side load spreading.<br>
+<strong>20.</strong> What does pods insecure do inside the kubernetes plugin block? — Allows resolving Pod IPs directly via a pod-ip-derived DNS name, without stricter verification.<br>
+<strong>21.</strong> How do you view the currently active Corefile? — <code>kubectl get configmap coredns -n kube-system -o yaml</code>.<br>
+<strong>22.</strong> How do you edit the Corefile? — <code>kubectl edit configmap coredns -n kube-system</code>.<br>
+<strong>23.</strong> Does editing the Corefile ConfigMap immediately affect running CoreDNS Pods? — With the reload plugin present, yes, automatically within its check interval — otherwise a manual rollout restart is needed.<br>
+<strong>24.</strong> What's the CoreDNS-autoscaler add-on used for? — Automatically scaling CoreDNS replica count in proportion to cluster size (node/core count).<br>
+<strong>25.</strong> Why does CoreDNS replica count need to scale with cluster size? — Larger clusters generate more DNS query volume and more watched Service/Endpoint objects, increasing both query load and memory footprint.<br>
+<strong>26.</strong> What happens if the kubernetes plugin loses its watch connection to the API Server? — It attempts to reconnect/resync; until then, served answers may become stale or queries may fail depending on how the plugin handles the gap.<br>
+<strong>27.</strong> Is CoreDNS aware of NetworkPolicies? — No — DNS resolution and NetworkPolicy enforcement are entirely separate systems; NetworkPolicy could still block the actual traffic even after a successful DNS answer.<br>
+<strong>28.</strong> What's the lameduck setting under the health plugin for? — Reports unhealthy for a grace period (e.g. 5s) before shutdown, allowing load balancers/kube-proxy to stop routing to a terminating Pod cleanly.<br>
+<strong>29.</strong> Why does CoreDNS's own readiness probe matter during its rolling updates? — Ensures traffic isn't routed to a CoreDNS Pod that isn't fully initialized yet, avoiding self-inflicted resolution failures during CoreDNS's own deploys.<br>
+<strong>30.</strong> What's a realistic reason to add a custom zone/plugin block to the Corefile? — Resolving an internal corporate domain (e.g. an on-prem service) that isn't part of the standard cluster.local zone.<br>
+<strong>31.</strong> Can CoreDNS answer queries for a completely custom internal TLD? — Yes — additional server blocks in the Corefile can serve arbitrary zones alongside the standard cluster.local one.<br>
+<strong>32.</strong> What's the relationship between CoreDNS and the kube-dns Service name? — CoreDNS Pods sit behind a Service still conventionally named kube-dns for backward compatibility, even though kube-dns (the old server) is gone.<br>
+<strong>33.</strong> Why might CoreDNS's memory usage grow with cluster size even without more query volume? — It caches an in-memory representation of watched Services/Endpoints/Pods, which scales with object count, not just query rate.<br>
+<strong>34.</strong> What's a good first diagnostic step for slow DNS resolution cluster-wide? — Check CoreDNS Pod CPU/memory usage and its own request-duration metrics before assuming an application-level problem.<br>
+<strong>35.</strong> Does CoreDNS support DNS over TLS (DoT) for its own queries or forwarding? — Yes, in more recent configurations forward can be configured to use TLS to upstream resolvers, though it's not the historical default.<br>
+<strong>36.</strong> What's the effect of accidentally listing forward before kubernetes in the Corefile? — Cluster-internal queries could be sent upstream unnecessarily (and fail, since the upstream doesn't know cluster.local) before ever reaching the kubernetes plugin.<br>
+<strong>37.</strong> Why is fallthrough important in the kubernetes plugin's config? — Without it, unmatched queries within the configured zones might not correctly pass to subsequent plugins like forward.<br>
+<strong>38.</strong> What's a good rollout practice for Corefile changes in production? — Test in a non-production cluster first, validate syntax, and apply during low-traffic windows given the blast radius of a mistake.<br>
+<strong>39.</strong> Does CoreDNS itself enforce any RBAC on who can query it? — No — DNS queries are unauthenticated network requests; access control is a network/firewall concern, not a CoreDNS-level one.<br>
+<strong>40.</strong> What RBAC does CoreDNS's own ServiceAccount need? — Read (list/watch) access to Services, EndpointSlices, and optionally Pods/Namespaces, to populate its in-memory records.<br>
+<strong>41.</strong> Why would you scrape coredns_dns_requests_total specifically? — To track query volume trends and detect abnormal spikes that might indicate a misbehaving client or a forwarding loop starting to form.<br>
+<strong>42.</strong> What's a subtle risk of setting an extremely low cache TTL? — Increased load on both CoreDNS and the API Server watch/informer layer from far more frequent re-resolution, undermining the point of caching.<br>
+<strong>43.</strong> Can CoreDNS run with more plugins than the defaults shown in a typical install? — Yes — it's fully pluggable; third-party and custom plugins can be compiled in for specialized behavior.<br>
+<strong>44.</strong> What's the operational risk of running an outdated CoreDNS version long-term? — Missing bug fixes/performance improvements and potentially losing compatibility with newer Kubernetes API behaviors.<br>
+<strong>45.</strong> How would you validate a Corefile change before applying it in production? — Use a local/staging CoreDNS instance or dry-run tooling to check syntax and basic query behavior first.<br>
+<strong>46.</strong> What's the danger of manually restarting CoreDNS during a live incident without understanding the root cause? — Could briefly worsen an outage further (zero DNS capacity during the restart window) without fixing the underlying config/resource issue.<br>
+<strong>47.</strong> Does CoreDNS support IPv6 (AAAA) resolution? — Yes — the kubernetes plugin can serve AAAA records for dual-stack clusters.<br>
+<strong>48.</strong> What's a good way to load-test CoreDNS before a major cluster size increase? — Simulate expected query volume/Service count in a staging cluster and observe latency/error metrics before scaling production.<br>
+<strong>49.</strong> Why is CoreDNS considered a "cluster-critical add-on" despite being a normal Deployment? — Because nearly every other workload's ability to discover dependencies transitively depends on it being healthy.<br>
+<strong>50.</strong> What's the first thing to check when DNS resolution is failing cluster-wide? — <code>kubectl get pods -n kube-system -l k8s-app=kube-dns</code> for CoreDNS Pod health, followed by its logs for errors/crash-loops.
+</div></details>
+
+<footer class="course-footer">Next: Topic 21 — Networking, the CNI model underpinning how Pods actually reach each other.</footer>
+
+<script>
+  mermaid.initialize({ startOnLoad: true, theme: 'dark' });
+</script>
+
+</body>
+</html>

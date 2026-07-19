@@ -1,0 +1,859 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Topic 1: Kubernetes Architecture — Kubernetes Expert Course</title>
+<link rel="stylesheet" href="styles.css">
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+</head>
+<body>
+
+<header class="course-header">
+  <div class="kicker">Topic 1 of 70</div>
+  <h1>Kubernetes Architecture</h1>
+  <div class="subtitle">The foundation: how every Kubernetes component fits together and why the system is shaped the way it is.</div>
+</header>
+
+<nav class="topic-nav">
+  <span>&larr; (first topic)</span>
+  <a href="index.html">Course Index</a>
+  <span>Control Plane &rarr;</span>
+</nav>
+
+<ol class="toc">
+  <li><a href="#introduction">1. Introduction</a></li>
+  <li><a href="#internal-working">2. Internal Working</a></li>
+  <li><a href="#architecture-diagram">3. Architecture Diagrams</a></li>
+  <li><a href="#yaml-deep-dive">4. YAML Deep Dive</a></li>
+  <li><a href="#yaml-examples">5. YAML Examples</a></li>
+  <li><a href="#kubectl-commands">6. kubectl Commands</a></li>
+  <li><a href="#production-scenario">7. Production Scenario</a></li>
+  <li><a href="#best-practices">8. Best Practices</a></li>
+  <li><a href="#security">9. Security Considerations</a></li>
+  <li><a href="#performance">10. Performance Optimization</a></li>
+  <li><a href="#troubleshooting">11. Troubleshooting</a></li>
+  <li><a href="#interview-questions">12. 50 Interview Questions</a></li>
+  <li><a href="#labs">13. Practical Labs</a></li>
+  <li><a href="#mini-project">14. Mini Project</a></li>
+  <li><a href="#real-project">15. Real Production Project</a></li>
+  <li><a href="#common-errors">16. Common Errors</a></li>
+  <li><a href="#visual-learning">17. Visual Learning</a></li>
+  <li><a href="#resources">18. Free Learning Resources</a></li>
+  <li><a href="#exercises">19. Hands-on Exercises</a></li>
+  <li><a href="#challenges">20. Challenge Questions</a></li>
+  <li><a href="#cheat-sheet">21. Cheat Sheet</a></li>
+  <li><a href="#summary">22. Summary</a></li>
+</ol>
+
+<!-- ============================================================ -->
+<h2 id="introduction">1. Introduction</h2>
+
+<h3>What it is</h3>
+<p>Kubernetes architecture is the overall design of the system: a <strong>control plane</strong> that makes global
+decisions about the cluster (scheduling, detecting and responding to events) and a set of <strong>worker nodes</strong>
+that actually run your containers. Every other Kubernetes concept — Pods, Deployments, Services, RBAC — is built on
+top of this architecture, so understanding it deeply is the single highest-leverage thing you can learn.</p>
+
+<p>At the highest level, Kubernetes is a <strong>declarative, distributed control system</strong>. You tell it the
+desired state of your application ("I want 3 replicas of this container, exposed on port 80"), and a set of
+independent control loops continuously work to make the actual state of the cluster match that desired state.</p>
+
+<h3>Why Kubernetes needs it</h3>
+<p>Running containers on a single Docker host is easy. Running hundreds of containers across hundreds of machines,
+surviving hardware failure, rolling out updates without downtime, and scaling elastically is not. Kubernetes needs a
+clear separation between:</p>
+<ul>
+  <li><strong>The brain (control plane):</strong> stores desired state, decides <em>what</em> should run <em>where</em>.</li>
+  <li><strong>The muscle (worker nodes):</strong> executes containers and reports back actual state.</li>
+</ul>
+<p>Without this separation you cannot achieve self-healing, horizontal scalability, or safe multi-tenant operation.</p>
+
+<h3>Why it exists</h3>
+<p>Kubernetes descends from Google's internal systems Borg and Omega, which ran Google's production workloads for over
+a decade before Kubernetes was open-sourced in 2014. The architecture encodes hard-won lessons: keep the control plane
+stateless and horizontally scalable, keep a single source of truth (etcd), and make every component reconcile against
+that source of truth independently rather than talking to each other directly. This is what allows Kubernetes to
+tolerate component crashes, network partitions, and rolling upgrades without losing consistency.</p>
+
+<h3>Real-world analogy</h3>
+<div class="callout">
+  <strong>Airport control tower analogy:</strong> The control plane is the control tower — it doesn't fly planes, but
+  it knows the desired schedule, tracks every plane's actual position, and issues instructions. The worker nodes are
+  the runways and ground crews — they do the physical work of taxiing, fueling, and boarding based on instructions,
+  and report status back to the tower. If a runway (node) goes down, the tower reroutes flights to other runways.
+  The tower itself is replicated (multiple controllers, redundant systems) so no single failure grounds the airport.
+</div>
+
+<h3>Production use case</h3>
+<p>A payments company runs 400 microservices across 60 nodes in 3 availability zones. The control plane schedules pods
+away from failing nodes automatically, the API server enforces RBAC so only the payments team can touch payment
+services, and controllers restart crashed containers within seconds — all without a human paging at 3 AM for routine
+failures. This is architecture doing its job: turning individual machine failures into non-events.</p>
+
+<!-- ============================================================ -->
+<h2 id="internal-working">2. Internal Working</h2>
+
+<p>Every action in Kubernetes — <code>kubectl apply</code>, a node dying, a pod crashing — flows through the same
+basic pattern: <strong>write intent to etcd via the API server, then have independent controllers reconcile reality
+towards that intent.</strong> Let's trace it step by step.</p>
+
+<h3>Step-by-step: what happens when you run <code>kubectl apply -f pod.yaml</code></h3>
+<ol>
+  <li><strong>kubectl</strong> reads the YAML, converts it to JSON, and sends an HTTPS request to the <strong>API
+  Server</strong> (authenticated via your kubeconfig's client cert or token).</li>
+  <li><strong>API Server</strong> runs the request through a pipeline: <em>Authentication</em> (who are you?) &rarr;
+  <em>Authorization</em> (RBAC — are you allowed to create Pods in this namespace?) &rarr; <em>Admission Control</em>
+  (mutating webhooks may inject sidecars; validating webhooks may reject the request; resource quotas are checked).</li>
+  <li>If it passes, the API Server <strong>persists the object to etcd</strong> as the single source of truth. Nothing
+  is considered "real" until it is in etcd.</li>
+  <li>The API Server returns success to kubectl — but at this point <strong>no container is running yet</strong>. Only
+  the desired state exists.</li>
+  <li>The <strong>Scheduler</strong> is watching the API Server (via a watch/informer, not polling) for Pods with an
+  empty <code>spec.nodeName</code>. It picks one up, runs filtering (which nodes satisfy resource/affinity/taint
+  requirements) and scoring (which node is the best fit), then writes the chosen node name back to the Pod object via
+  the API Server, which persists it to etcd.</li>
+  <li>The <strong>kubelet</strong> on that specific node is also watching the API Server for Pods bound to its node
+  name. It notices the new assignment and begins the actual work: pulling the image, creating the sandbox (pause
+  container), and invoking the <strong>Container Runtime</strong> (via the CRI) to start the containers.</li>
+  <li><strong>kube-proxy</strong> on every node watches Services/Endpoints and updates iptables/IPVS rules so traffic
+  can reach the new Pod once it's ready.</li>
+  <li>The kubelet continuously reports the Pod's actual status (Running, Ready, container statuses) back to the API
+  Server, which updates etcd. This is the "actual state" half of the reconciliation loop.</li>
+  <li>Various <strong>Controllers</strong> in the Controller Manager (e.g. ReplicaSet controller) are simultaneously
+  watching to make sure the number of running Pods matches the desired replica count, creating or deleting Pods as
+  needed.</li>
+</ol>
+
+<h3>Which components interact, and how</h3>
+<table>
+<tr><th>Component</th><th>Interaction</th></tr>
+<tr><td>API Server</td><td>The only component that talks to etcd directly. Every other component talks only to the API Server, never to etcd or to each other directly.</td></tr>
+<tr><td>etcd</td><td>Distributed, strongly-consistent key-value store. Holds every object's desired and last-known-actual state. Uses the Raft consensus algorithm for leader election and write consistency.</td></tr>
+<tr><td>Scheduler</td><td>Watches for unscheduled Pods, writes back <code>nodeName</code> via the API Server.</td></tr>
+<tr><td>kubelet</td><td>Watches for Pods assigned to its node, drives the container runtime via CRI, reports status back.</td></tr>
+<tr><td>kube-proxy</td><td>Watches Services/EndpointSlices, programs node-level networking rules.</td></tr>
+<tr><td>Controller Manager</td><td>Runs dozens of independent control loops (Deployment, ReplicaSet, Node, Job, etc.), each reconciling one resource type toward its desired state.</td></tr>
+</table>
+
+<div class="callout good">
+  <strong>Key architectural principle — the "watch, don't poll" pattern:</strong> Every controller and kubelet uses a
+  long-lived HTTP watch connection to the API Server, backed by a local cache (informer). This means Kubernetes scales
+  to thousands of nodes without the API Server being hammered by constant polling, and every component reacts to
+  changes within milliseconds instead of on a fixed poll interval.
+</div>
+
+<h3>Complete request flow (text form)</h3>
+<pre><code>kubectl apply -f pod.yaml
+   │
+   ▼
+API Server ──(authn/authz/admission)──▶ etcd (desired state persisted)
+   │
+   ▼ (scheduler watch fires)
+Scheduler ──(filter + score nodes)──▶ API Server ──▶ etcd (nodeName bound)
+   │
+   ▼ (kubelet watch fires on target node)
+kubelet ──▶ CRI ──▶ Container Runtime ──▶ Pod running
+   │
+   ▼
+kubelet reports status ──▶ API Server ──▶ etcd (actual state updated)
+   │
+   ▼
+Controllers reconcile (ReplicaSet/Deployment controllers compare desired vs actual)
+</code></pre>
+
+<!-- ============================================================ -->
+<h2 id="architecture-diagram">3. Architecture Diagrams</h2>
+
+<h3>High-level cluster architecture</h3>
+<pre class="mermaid">
+flowchart TB
+    subgraph CP["Control Plane"]
+        API["API Server"]
+        ETCD[("etcd")]
+        SCHED["Scheduler"]
+        CM["Controller Manager"]
+        CCM["Cloud Controller Manager"]
+    end
+
+    subgraph W1["Worker Node 1"]
+        KL1["kubelet"]
+        KP1["kube-proxy"]
+        CR1["Container Runtime"]
+        P1["Pods"]
+    end
+
+    subgraph W2["Worker Node 2"]
+        KL2["kubelet"]
+        KP2["kube-proxy"]
+        CR2["Container Runtime"]
+        P2["Pods"]
+    end
+
+    User["kubectl / CI-CD / Operators"] -->|HTTPS REST| API
+    API <--> ETCD
+    API <--> SCHED
+    API <--> CM
+    API <--> CCM
+    API <-->|watch| KL1
+    API <-->|watch| KL2
+    API <-->|watch| KP1
+    API <-->|watch| KP2
+    KL1 --> CR1 --> P1
+    KL2 --> CR2 --> P2
+</pre>
+
+<h3>Request lifecycle sequence diagram</h3>
+<pre class="mermaid">
+sequenceDiagram
+    participant U as kubectl
+    participant A as API Server
+    participant E as etcd
+    participant S as Scheduler
+    participant K as kubelet
+    participant R as Container Runtime
+
+    U->>A: POST /api/v1/namespaces/default/pods
+    A->>A: Authn + Authz (RBAC) + Admission
+    A->>E: Write Pod object (desired state)
+    E-->>A: Ack
+    A-->>U: 201 Created
+    S->>A: Watch unscheduled Pods
+    A-->>S: New Pod (nodeName empty)
+    S->>S: Filter + Score nodes
+    S->>A: PATCH Pod.spec.nodeName = node-2
+    A->>E: Persist binding
+    K->>A: Watch Pods bound to node-2
+    A-->>K: New Pod assignment
+    K->>R: CreateContainer (via CRI)
+    R-->>K: Container running
+    K->>A: Update Pod status = Running
+    A->>E: Persist actual state
+</pre>
+
+<h3>Component state diagram (etcd write path)</h3>
+<pre class="mermaid">
+stateDiagram-v2
+    [*] --> Received: kubectl apply
+    Received --> Authenticated: Authn passes
+    Authenticated --> Authorized: RBAC passes
+    Authorized --> AdmissionChecked: Mutating + Validating webhooks
+    AdmissionChecked --> PersistedInEtcd: Write via Raft consensus
+    PersistedInEtcd --> Scheduled: Scheduler binds node
+    Scheduled --> Running: kubelet starts containers
+    Running --> Reconciling: Controllers keep watching
+    Reconciling --> Running
+    Running --> [*]: Deleted
+</pre>
+
+<!-- ============================================================ -->
+<h2 id="yaml-deep-dive">4. YAML Deep Dive</h2>
+
+<p>Architecture itself has no single YAML manifest (it's the system, not a resource) — but every object you'll ever
+write obeys the same top-level envelope, because it's enforced by the API Server's schema validation. Understanding
+this envelope IS understanding how the architecture represents state.</p>
+
+<pre><code>apiVersion: v1        # Which API group/version this object belongs to.
+                       # The API Server exposes many "API groups" (core "v1", apps/v1, batch/v1...);
+                       # this tells the API Server which schema + endpoint to validate/route to.
+kind: Pod              # The resource type. Combined with apiVersion, uniquely identifies the REST endpoint,
+                       # e.g. apps/v1 Deployment -> /apis/apps/v1/namespaces/{ns}/deployments
+metadata:              # Identity + bookkeeping data. NOT part of desired behavior.
+  name: my-pod          # Unique within a namespace. Immutable after creation.
+  namespace: default     # Logical partition of the cluster (RBAC, quotas, network policies scope to this).
+  labels: {}             # Arbitrary key/value used for selection (Services, ReplicaSets match on these).
+  annotations: {}        # Arbitrary key/value NOT used for selection — for tooling/metadata only.
+  uid:                   # Server-generated globally unique ID (you never set this).
+  resourceVersion:       # Server-generated optimistic-concurrency token (etcd's internal revision marker).
+spec:                  # Desired state — the only part you're really "writing" as a human.
+  ...                    # Structure is entirely defined by kind (Pod spec != Deployment spec).
+status:                # Actual/observed state — written ONLY by the system (kubelet, controllers), never by you.
+  ...                    # This is what makes Kubernetes "declarative": spec is your intent, status is reality,
+                         # and controllers exist solely to shrink the diff between the two to zero.
+</code></pre>
+
+<div class="callout">
+  <strong>Why this matters architecturally:</strong> the fact that <code>spec</code> and <code>status</code> are
+  separate subresources (with separate RBAC rules and separate API endpoints — <code>/status</code>) is a deliberate
+  design choice. It lets kubelet be granted permission to update <em>only</em> status, never spec, closing off a whole
+  class of privilege-escalation bugs.
+</div>
+
+<!-- ============================================================ -->
+<h2 id="yaml-examples">5. YAML Examples</h2>
+
+<h3>Basic — a single Pod showing the architecture's object envelope</h3>
+<pre><code>apiVersion: v1
+kind: Pod
+metadata:
+  name: nginx-basic
+  namespace: default
+  labels:
+    app: nginx
+spec:
+  containers:
+    - name: nginx
+      image: nginx:1.25
+      ports:
+        - containerPort: 80
+</code></pre>
+
+<h3>Intermediate — Pod with resource requests/limits (Scheduler + kubelet both read this)</h3>
+<pre><code>apiVersion: v1
+kind: Pod
+metadata:
+  name: nginx-intermediate
+  labels:
+    app: nginx
+spec:
+  containers:
+    - name: nginx
+      image: nginx:1.25
+      resources:
+        requests:          # Scheduler uses this to decide WHICH node has room.
+          cpu: "250m"
+          memory: "128Mi"
+        limits:            # kubelet/runtime enforces this via cgroups on the node.
+          cpu: "500m"
+          memory: "256Mi"
+      readinessProbe:       # kubelet uses this to decide when kube-proxy should route traffic here.
+        httpGet:
+          path: /
+          port: 80
+        initialDelaySeconds: 5
+</code></pre>
+
+<h3>Advanced — Pod pinned via node affinity + toleration (Scheduler filtering in action)</h3>
+<pre><code>apiVersion: v1
+kind: Pod
+metadata:
+  name: nginx-advanced
+spec:
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+          - matchExpressions:
+              - key: topology.kubernetes.io/zone
+                operator: In
+                values: ["ap-south-1a"]
+  tolerations:
+    - key: "dedicated"
+      operator: "Equal"
+      value: "frontend"
+      effect: "NoSchedule"
+  containers:
+    - name: nginx
+      image: nginx:1.25
+</code></pre>
+
+<h3>Enterprise — full production Deployment exercising the whole architecture</h3>
+<pre><code>apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: checkout-service
+  namespace: payments
+  labels:
+    app: checkout-service
+    team: payments
+spec:
+  replicas: 6                       # ReplicaSet controller in Controller Manager enforces this count.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 2
+      maxUnavailable: 0             # Zero-downtime: Deployment controller orchestrates this.
+  selector:
+    matchLabels:
+      app: checkout-service
+  template:
+    metadata:
+      labels:
+        app: checkout-service
+    spec:
+      serviceAccountName: checkout-sa   # Identity presented to the API Server for RBAC checks.
+      containers:
+        - name: checkout
+          image: registry.internal/checkout-service:2.4.1
+          resources:
+            requests: { cpu: "500m", memory: "512Mi" }
+            limits: { cpu: "1", memory: "1Gi" }
+          readinessProbe:
+            httpGet: { path: /healthz, port: 8080 }
+          livenessProbe:
+            httpGet: { path: /healthz, port: 8080 }
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels: { app: checkout-service }
+</code></pre>
+
+<!-- ============================================================ -->
+<h2 id="kubectl-commands">6. kubectl Commands</h2>
+
+<pre><code># Inspect the control plane itself
+kubectl get componentstatuses          # (deprecated in newer versions, but still common in exam contexts)
+kubectl get nodes -o wide              # See every worker node, its role, version, internal/external IP
+kubectl cluster-info                   # Shows API Server and core DNS addresses
+kubectl version --short                # Client vs server version skew — critical for upgrade planning
+
+# Watch the reconciliation loop happen live
+kubectl get pods -w                    # Watch Pod status transition Pending -> ContainerCreating -> Running
+kubectl get events --sort-by=.lastTimestamp   # See Scheduler + kubelet events in order
+
+# Inspect how an object flows through the architecture
+kubectl describe pod my-pod            # Shows Node assigned, Events (scheduling decision, image pull, etc.)
+kubectl get pod my-pod -o yaml         # Full object including status subresource — see actual vs desired
+kubectl explain pod.spec               # Pulls live schema from the API Server's OpenAPI definitions
+</code></pre>
+
+<p><strong>Output explained:</strong> <code>kubectl describe pod</code> shows an <code>Events</code> section at the
+bottom with entries like <code>Scheduled</code>, <code>Pulling</code>, <code>Pulled</code>, <code>Created</code>,
+<code>Started</code> — this is literally the internal working section above, made visible. Each event was emitted by
+a different component (Scheduler emits <code>Scheduled</code>; kubelet emits the rest).</p>
+
+<!-- ============================================================ -->
+<h2 id="production-scenario">7. Production Scenario</h2>
+
+<table>
+<tr><th>Company</th><th>Why architecture matters to them</th></tr>
+<tr><td>Google</td><td>Runs GKE control planes fully managed and horizontally scaled across zones — the origin of this architecture via Borg, refined for tenant isolation at massive scale.</td></tr>
+<tr><td>Netflix</td><td>Relies on the watch-based reconciliation model so their custom controllers (which manage thousands of microservice deployments) react to changes in near-real-time instead of polling.</td></tr>
+<tr><td>Meesho</td><td>Runs multiple EKS clusters per environment; the clean control-plane/data-plane separation lets platform teams upgrade or resize the control plane without touching running seller/catalog services.</td></tr>
+<tr><td>Swiggy</td><td>Uses the declarative model heavily for GitOps — Argo CD simply pushes desired state to the API Server and trusts the architecture's controllers to converge, rather than scripting imperative rollouts.</td></tr>
+<tr><td>Amazon</td><td>EKS control plane runs across 3 AZs with etcd quorum spread for HA, so a single AZ failure never loses the ability to schedule or reconcile.</td></tr>
+</table>
+
+<!-- ============================================================ -->
+<h2 id="best-practices">8. Best Practices</h2>
+
+<div class="grid-2">
+<div>
+<h4>Do's</h4>
+<ul>
+  <li>Run an odd number of etcd/control-plane replicas (3 or 5) for quorum.</li>
+  <li>Separate control plane nodes from worker nodes in production (never co-locate untrusted workloads with etcd).</li>
+  <li>Keep API Server, kubelet, and etcd versions within the supported skew (kubelet no more than 2 minor versions behind API Server).</li>
+  <li>Use managed control planes (EKS/GKE/AKS) unless you have a dedicated platform team — self-managing etcd correctly is genuinely hard.</li>
+</ul>
+</div>
+<div>
+<h4>Don'ts</h4>
+<ul>
+  <li>Don't run an even number of etcd members — it doesn't improve fault tolerance and increases split-brain risk.</li>
+  <li>Don't bypass the API Server (e.g. editing etcd directly) — it skips admission control and validation entirely.</li>
+  <li>Don't scale the Scheduler/Controller Manager horizontally naively — they use leader election, only one instance is active at a time.</li>
+</ul>
+</div>
+</div>
+
+<h4>Common mistakes</h4>
+<ul>
+  <li>Assuming Kubernetes is "one binary" — mixing up control plane and node component responsibilities during troubleshooting.</li>
+  <li>Not budgeting etcd disk I/O — etcd is extremely latency-sensitive and a slow disk degrades the entire cluster's API responsiveness.</li>
+</ul>
+
+<h4>Cost optimization</h4>
+<p>On managed platforms, the control plane is often billed flat-rate (e.g. EKS ~$0.10/hr) regardless of node count —
+so consolidating many small clusters into fewer, well-namespaced clusters reduces control-plane overhead cost
+significantly at scale.</p>
+
+<!-- ============================================================ -->
+<h2 id="security">9. Security Considerations</h2>
+<ul>
+  <li><strong>API Server is the sole trust boundary</strong> — every authn/authz/admission decision funnels through it; a misconfigured RBAC rule or an overly permissive admission webhook compromises the whole cluster.</li>
+  <li><strong>etcd holds Secrets in plaintext by default</strong> unless encryption-at-rest is configured — anyone with etcd access effectively has cluster-admin.</li>
+  <li><strong>Node-to-control-plane traffic must be encrypted (TLS)</strong> — kubelet certificates should be per-node and rotated automatically (kubelet TLS bootstrapping).</li>
+  <li><strong>Compliance:</strong> PCI-DSS/SOC2 audits typically require etcd encryption at rest, audit logging enabled on the API Server, and network isolation of control-plane nodes.</li>
+</ul>
+
+<!-- ============================================================ -->
+<h2 id="performance">10. Performance Optimization</h2>
+<ul>
+  <li><strong>CPU:</strong> API Server and etcd are CPU-sensitive under high request/write volume — isolate them on dedicated instance types in self-managed clusters.</li>
+  <li><strong>Memory:</strong> Scheduler and Controller Manager cache full cluster state in memory (via informers) — memory scales with object count, not just node count.</li>
+  <li><strong>Networking:</strong> etcd is extremely latency-sensitive to network jitter between members — keep etcd members in low-latency proximity (same region, ideally same low-latency AZ group).</li>
+  <li><strong>Storage:</strong> etcd requires fast, low-latency SSD (fsync-heavy) — spinning disks or network storage with high latency will degrade the entire cluster.</li>
+  <li><strong>Scheduling:</strong> Large clusters benefit from scheduler profiles and reduced percentageOfNodesToScore to bound scheduling latency.</li>
+  <li><strong>Scaling:</strong> The control plane itself has scaling limits (etcd write throughput, API Server watch fan-out) — this is why Kubernetes officially supports up to 5,000 nodes per cluster, not unlimited.</li>
+</ul>
+
+<!-- ============================================================ -->
+<h2 id="troubleshooting">11. Troubleshooting</h2>
+
+<div class="lab-card">
+<h4>Issue: API Server unreachable</h4>
+<p><strong>Symptoms:</strong> <code>kubectl</code> commands hang or return "connection refused".</p>
+<p><strong>Root Cause:</strong> API Server pod/process down, network/firewall issue, or load balancer in front of a multi-master setup misconfigured.</p>
+<p><strong>Diagnosis:</strong> <code>kubectl get --raw='/healthz'</code>, check API server pod logs on control plane node, check LB target health.</p>
+<p><strong>Fix:</strong> Restart API Server process/pod; verify certs haven't expired; verify etcd is reachable from API Server.</p>
+</div>
+
+<div class="lab-card">
+<h4>Issue: etcd quorum lost</h4>
+<p><strong>Symptoms:</strong> Writes fail cluster-wide; reads may still work from a stale follower.</p>
+<p><strong>Root Cause:</strong> More than (N-1)/2 etcd members down simultaneously.</p>
+<p><strong>Diagnosis:</strong> <code>etcdctl endpoint status --cluster</code>, check member health across all etcd nodes.</p>
+<p><strong>Fix:</strong> Restore failed members, or restore from snapshot if permanently lost; never force a single-node "quorum" workaround in production without understanding the data-loss risk.</p>
+</div>
+
+<div class="lab-card">
+<h4>Issue: Pods stuck Pending due to scheduler not running</h4>
+<p><strong>Symptoms:</strong> All new Pods stay <code>Pending</code> with no <code>nodeName</code> assigned.</p>
+<p><strong>Root Cause:</strong> Scheduler pod crashed or lost leader election.</p>
+<p><strong>Diagnosis:</strong> <code>kubectl get pods -n kube-system | grep scheduler</code>, check leader election lease: <code>kubectl get lease -n kube-system</code>.</p>
+<p><strong>Fix:</strong> Restart scheduler; check for CPU starvation or panic in logs.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="interview-questions">12. 50 Interview Questions</h2>
+
+<script>
+function qa(q, a) {
+  document.write('<details class="qa"><summary>' + q + '</summary><div class="qa-body">' + a + '</div></details>');
+}
+</script>
+
+<details class="qa"><summary>1. What are the two main planes in Kubernetes architecture?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Control plane and data plane (worker nodes).
+<br><strong>Detail:</strong> The control plane makes global decisions (scheduling, API, state storage); worker nodes run workloads.
+<br><strong>Production example:</strong> In EKS, AWS manages the control plane; you manage worker node groups.
+<br><strong>Common mistake:</strong> Assuming worker nodes make scheduling decisions — they never do.</div></details>
+
+<details class="qa"><summary>2. Why does Kubernetes use etcd instead of a relational database?</summary>
+<div class="qa-body"><strong>Short answer:</strong> etcd provides strong consistency via Raft consensus and a watch API, which relational DBs don't natively provide.
+<br><strong>Detail:</strong> Kubernetes needs every component to react instantly to changes (watch) and needs guaranteed consistency for leader election and scheduling decisions.
+<br><strong>Production example:</strong> Multi-master clusters rely on etcd's Raft leader election to avoid split-brain.
+<br><strong>Common mistake:</strong> Trying to swap etcd for another datastore without understanding the consistency guarantees required.</div></details>
+
+<details class="qa"><summary>3. What happens if the API Server goes down but workloads are already running?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Existing Pods keep running; nothing new can be scheduled/changed.
+<br><strong>Detail:</strong> kubelet keeps running its already-known Pods independently — it doesn't need the API Server for a Pod it already started.
+<br><strong>Production example:</strong> A brief control-plane outage during an EKS upgrade doesn't crash running services.
+<br><strong>Common mistake:</strong> Believing the whole cluster "goes down" — only the control loop (changes) stops.</div></details>
+
+<details class="qa"><summary>4. What is the role of the Scheduler in the architecture?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Assigns Pods to Nodes based on resource availability and constraints.
+<br><strong>Detail:</strong> Filters nodes that can't run the pod, then scores remaining nodes to pick the best fit.
+<br><strong>Production example:</strong> Bin-packing workloads onto fewer nodes to enable cluster-autoscaler scale-down.
+<br><strong>Common mistake:</strong> Thinking the scheduler starts the container — it only assigns the node; kubelet starts it.</div></details>
+
+<details class="qa"><summary>5. Why is the architecture "declarative" rather than "imperative"?</summary>
+<div class="qa-body"><strong>Short answer:</strong> You declare desired state; controllers continuously reconcile actual state to match it.
+<br><strong>Detail:</strong> This makes the system self-healing and idempotent — reapplying the same YAML is always safe.
+<br><strong>Production example:</strong> GitOps tools like Argo CD rely entirely on this property.
+<br><strong>Common mistake:</strong> Writing imperative scripts (kubectl run, kubectl edit) as the primary deployment mechanism in production.</div></details>
+
+<details class="qa"><summary>6. What is a control loop / reconciliation loop?</summary>
+<div class="qa-body"><strong>Short answer:</strong> A continuous process that compares desired vs actual state and takes action to close the gap.
+<br><strong>Detail:</strong> Every controller (Deployment, ReplicaSet, Node) runs its own independent loop.
+<br><strong>Production example:</strong> ReplicaSet controller recreating a Pod within seconds of a node failure.
+<br><strong>Common mistake:</strong> Assuming there's one global reconciliation loop instead of many independent ones.</div></details>
+
+<details class="qa"><summary>7. Why does kubelet report status back to the API Server instead of the API Server polling kubelet?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Push-based reporting scales better and reduces control-plane load.
+<br><strong>Detail:</strong> kubelet posts status updates (heartbeats + full status) on its own schedule.
+<br><strong>Production example:</strong> Node NotReady detection after missed heartbeats within ~40s default.
+<br><strong>Common mistake:</strong> Confusing node heartbeat interval with pod eviction timeout — they're separate settings.</div></details>
+
+<details class="qa"><summary>8. What is the Cloud Controller Manager and why was it split out?</summary>
+<div class="qa-body"><strong>Short answer:</strong> It runs cloud-provider-specific logic (load balancers, node lifecycle) separately from core Controller Manager.
+<br><strong>Detail:</strong> Splitting it out let cloud vendors ship/version their integration independently of core Kubernetes releases.
+<br><strong>Production example:</strong> AWS CCM provisions an ELB when you create a LoadBalancer-type Service.
+<br><strong>Common mistake:</strong> Assuming core Kubernetes talks to cloud APIs directly — it never does, only CCM does.</div></details>
+
+<details class="qa"><summary>9. How does Kubernetes achieve high availability of the control plane?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Multiple API Server replicas behind a load balancer, odd-numbered etcd cluster, leader election for Scheduler/Controller Manager.
+<br><strong>Detail:</strong> API Servers are stateless and can all be active; only Scheduler/CM have a single active leader at a time.
+<br><strong>Production example:</strong> A 3-master kubeadm cluster with a keepalived VIP in front of the API Servers.
+<br><strong>Common mistake:</strong> Running 2 control-plane nodes — provides no quorum benefit over 1 and is worse than 3.</div></details>
+
+<details class="qa"><summary>10. What is admission control and where does it sit in the flow?</summary>
+<div class="qa-body"><strong>Short answer:</strong> A pluggable step in the API Server pipeline after authn/authz, before persistence to etcd.
+<br><strong>Detail:</strong> Mutating webhooks can modify the object (inject sidecars); validating webhooks can reject it.
+<br><strong>Production example:</strong> Istio injects sidecar containers via a mutating admission webhook.
+<br><strong>Common mistake:</strong> Forgetting mutating webhooks run before validating ones — order matters.</div></details>
+
+<details class="qa"><summary>11–50. Additional rapid-fire questions</summary>
+<div class="qa-body">
+<strong>11.</strong> What's the difference between kube-apiserver and kubectl? — kubectl is a client CLI; API Server is the server all clients talk to.<br>
+<strong>12.</strong> Can you have zero control-plane nodes and still run Pods? — Existing Pods keep running briefly, but nothing self-heals or reschedules.<br>
+<strong>13.</strong> What is a static pod and how does it relate to bootstrapping the control plane? — kubelet runs manifests from a local directory without the API Server, used to bootstrap API Server/etcd/scheduler themselves.<br>
+<strong>14.</strong> Why is etcd typically not exposed outside the control plane network? — It has no built-in fine-grained authz; anyone with access can read all Secrets.<br>
+<strong>15.</strong> What object stores the desired replica count for a Deployment? — The Deployment object's <code>spec.replicas</code>, enforced via its owned ReplicaSet.<br>
+<strong>16.</strong> How does the architecture support multi-tenancy? — Namespaces + RBAC + ResourceQuotas + NetworkPolicies, all enforced at the API Server/CNI layer.<br>
+<strong>17.</strong> What is the API Server's aggregation layer? — Lets you register additional API servers (e.g. metrics-server) that appear under the same API surface.<br>
+<strong>18.</strong> Why does Kubernetes prefer level-triggered over edge-triggered reconciliation? — Level-triggered (compare full desired vs actual state) is resilient to missed events; edge-triggered would lose state on a dropped message.<br>
+<strong>19.</strong> What is the purpose of resourceVersion on objects? — Optimistic concurrency control to prevent lost updates on concurrent writes.<br>
+<strong>20.</strong> How does the architecture isolate a compromised node? — Cordoning/draining removes it from scheduling; NetworkPolicies and node-level RBAC limit blast radius.<br>
+<strong>21.</strong> What is the kubelet's PLEG? — Pod Lifecycle Event Generator, the mechanism kubelet uses to detect container state changes efficiently.<br>
+<strong>22.</strong> Why is DNS (CoreDNS) considered part of the "architecture" even though it's an add-on? — It's a cluster-critical add-on that most workloads depend on for service discovery.<br>
+<strong>23.</strong> What does "conformant Kubernetes" mean? — Passes the CNCF conformance test suite guaranteeing consistent API behavior across vendors (EKS/GKE/AKS/on-prem).<br>
+<strong>24.</strong> How do you upgrade a cluster's control plane safely? — Upgrade API Server first, then Controller Manager/Scheduler, then kubelet, respecting version skew policy.<br>
+<strong>25.</strong> What is the maximum supported version skew between kubelet and API Server? — kubelet can be up to 3 minor versions older than API Server (policy varies by release; historically 2).<br>
+<strong>26.</strong> What's the difference between liveness and the architecture's self-healing? — Liveness probes are a signal kubelet uses locally; self-healing at the ReplicaSet level is a separate, higher-level control loop.<br>
+<strong>27.</strong> Why does Kubernetes use a REST API rather than RPC? — Uniform, cacheable, well-understood transport that makes tooling (kubectl, clients in any language) trivial to build.<br>
+<strong>28.</strong> What is a finalizer and how does it interact with the architecture's deletion flow? — A marker that blocks object deletion from completing in etcd until a controller finishes cleanup.<br>
+<strong>29.</strong> How does horizontal scaling of the API Server work? — Stateless replicas behind a load balancer, all reading/writing the same etcd cluster.<br>
+<strong>30.</strong> What is the role of informers/listers in client-go? — Local cache + event dispatch layer so controllers don't re-list the full API Server on every reconcile.<br>
+<strong>31.</strong> Why can't the Scheduler and Controller Manager run multiple active replicas simultaneously? — They'd race to make conflicting decisions; leader election ensures exactly one active instance.<br>
+<strong>32.</strong> What happens to Pods on a node that's been NotReady for 5 minutes? — Default pod-eviction-timeout triggers eviction and rescheduling elsewhere (if tolerations allow).<br>
+<strong>33.</strong> How is etcd backed up? — <code>etcdctl snapshot save</code>, ideally automated and stored off-cluster.<br>
+<strong>34.</strong> What is the audit log and where is it generated? — API Server-level log of every request, used for security/compliance review.<br>
+<strong>35.</strong> Why does Kubernetes separate "spec" and "status" as different subresources? — Enables separate RBAC (kubelet can write status without write access to spec).<br>
+<strong>36.</strong> What's the blast radius of a compromised admission webhook? — Potentially cluster-wide — it can mutate or block any matching resource across namespaces.<br>
+<strong>37.</strong> How does Kubernetes support extension via CRDs at the architecture level? — API Server dynamically serves new resource types registered via CustomResourceDefinition, no core code change needed.<br>
+<strong>38.</strong> What is the purpose of the kube-scheduler's "preemption" feature? — Evicts lower-priority Pods to make room for higher-priority pending Pods.<br>
+<strong>39.</strong> Why do managed Kubernetes offerings (EKS/GKE/AKS) hide the control plane? — Reduces operational burden and attack surface for customers; provider guarantees SLAs on it.<br>
+<strong>40.</strong> What is a taint vs a node condition? — Taints are explicit scheduling repellents you set; conditions (e.g. MemoryPressure) are observed states that can auto-apply taints.<br>
+<strong>41.</strong> How does the architecture prevent thundering herd on API Server restarts? — Client-go's informer resync + exponential backoff on watch reconnects.<br>
+<strong>42.</strong> What is the significance of API groups/versions (v1, apps/v1, batch/v1)? — Enables safe API evolution — a resource can move from beta to stable without breaking existing clients immediately.<br>
+<strong>43.</strong> Why is etcd typically limited to a small, odd cluster size (3–5) rather than scaled like stateless services? — Raft consensus overhead grows with member count; more members means slower writes, not more capacity.<br>
+<strong>44.</strong> How does the architecture support zero-downtime control plane upgrades? — Rolling replacement of API Server replicas behind a load balancer while etcd quorum is maintained.<br>
+<strong>45.</strong> What is the relationship between a Deployment, ReplicaSet, and Pod in terms of controllers? — Deployment controller manages ReplicaSets; ReplicaSet controller manages Pods — a chain of owner references.<br>
+<strong>46.</strong> Why does kube-proxy run on every node instead of centrally? — Traffic routing decisions must be made locally and fast, without a control-plane round trip per packet.<br>
+<strong>47.</strong> What is the purpose of the "watch bookmark" feature in the API? — Reduces resource usage on reconnect by letting clients resume from a known resourceVersion instead of a full re-list.<br>
+<strong>48.</strong> How does architecture handle a network partition between a node and the control plane? — Node marked NotReady after missed heartbeats; kubelet keeps running existing Pods but can't get new instructions.<br>
+<strong>49.</strong> Why is "everything is an API object" a core architectural philosophy? — Uniform tooling, RBAC, and extension model — Nodes, Pods, Secrets, and CRDs are all accessed the same way.<br>
+<strong>50.</strong> What's the first thing to check when the whole cluster seems "frozen" (nothing reconciling)? — Controller Manager and Scheduler leader election lease/logs — a stuck leader election halts almost all reconciliation.
+</div></details>
+
+<!-- ============================================================ -->
+<h2 id="labs">13. Practical Labs</h2>
+
+<h3>Beginner Labs</h3>
+<ol>
+<li>Run <code>kubectl get nodes -o wide</code> and identify which node is control-plane vs worker using labels/taints.</li>
+<li>Create a Pod via YAML, then run <code>kubectl describe pod</code> and map each Event line to the component that emitted it.</li>
+<li>Run <code>kubectl get pods -w</code> in one terminal and apply a Pod in another — observe status transitions live.</li>
+<li>Use <code>kubectl explain pod.spec.containers</code> to explore the schema served live by the API Server.</li>
+<li>Delete a Pod and observe how fast a ReplicaSet-backed Deployment recreates it (self-healing in action).</li>
+</ol>
+
+<h3>Intermediate Labs</h3>
+<ol>
+<li>Cordon a node (<code>kubectl cordon</code>) and observe that new Pods are never scheduled there while existing ones keep running.</li>
+<li>Drain a node and watch Pods get rescheduled to other nodes — trace the Scheduler's decision via events.</li>
+<li>Simulate a scheduler-only failure by scaling <code>kube-scheduler</code> deployment (in kubeadm setups) to 0 and observe Pods stay Pending.</li>
+<li>Enable API Server audit logging (kubeadm cluster) and trace a single <code>kubectl apply</code> through the audit log.</li>
+<li>Inspect etcd directly with <code>etcdctl get</code> (read-only, lab cluster only) to see the raw key structure Kubernetes uses.</li>
+</ol>
+
+<h3>Advanced Labs</h3>
+<ol>
+<li>Set up a 3-node kubeadm control plane and kill one control-plane node — verify the cluster keeps functioning via quorum.</li>
+<li>Take an etcd snapshot, delete a resource, then restore from snapshot and observe the resource reappear.</li>
+<li>Write a minimal custom controller (client-go) that watches Pods and logs events — observe the same watch pattern the real controllers use.</li>
+<li>Configure and test a validating admission webhook that rejects Pods without resource limits.</li>
+<li>Simulate a network partition between one worker node and the control plane (iptables DROP) and observe NotReady + eviction timing.</li>
+</ol>
+
+<h3>Production Labs</h3>
+<ol>
+<li>Design an HA control-plane topology across 3 AZs for a 50-node cluster and document the failure domains.</li>
+<li>Write an etcd backup/restore runbook including automated snapshotting to object storage.</li>
+<li>Build a Grafana dashboard for API Server request latency and etcd disk fsync latency (the two most predictive control-plane health metrics).</li>
+<li>Perform a full control-plane version upgrade on a test cluster following the official version-skew policy end to end.</li>
+<li>Load-test the API Server with a synthetic client generating high watch/list volume and identify the first bottleneck.</li>
+</ol>
+
+<!-- ============================================================ -->
+<h2 id="mini-project">14. Mini Project</h2>
+<p><strong>Project: "See the Architecture" dashboard.</strong></p>
+<ul>
+<li><strong>Architecture:</strong> A single Pod running a script that polls the API Server for Nodes, Pods, and Events and prints a live text dashboard.</li>
+<li><strong>Requirements:</strong> ServiceAccount with read-only RBAC to list Nodes/Pods/Events cluster-wide.</li>
+<li><strong>Implementation:</strong> Python + kubernetes client library, using watch() to stream events instead of polling.</li>
+<li><strong>Deployment:</strong> Deploy as a Pod in a dedicated <code>observability</code> namespace.</li>
+<li><strong>Testing:</strong> Create/delete Pods elsewhere in the cluster and confirm the dashboard updates within ~1s.</li>
+<li><strong>Validation:</strong> Compare dashboard output against <code>kubectl get events</code> for consistency.</li>
+<li><strong>Troubleshooting:</strong> If nothing appears, check the ServiceAccount's ClusterRoleBinding first — the #1 cause is RBAC.</li>
+<li><strong>Cleanup:</strong> <code>kubectl delete ns observability</code>.</li>
+</ul>
+
+<!-- ============================================================ -->
+<h2 id="real-project">15. Real Production Project</h2>
+<p>This topic's enterprise project is the foundation project used across the whole course: deploying a
+Spring Boot microservices stack (MySQL, Redis, Kafka) behind Ingress with TLS, monitored by Prometheus +
+VictoriaMetrics + Grafana, traced with OpenTelemetry, deployed via Helm + Argo CD, autoscaled with HPA, and secured
+with RBAC + NetworkPolicies. At the architecture layer, the key point is: <em>every one of those pieces is just
+another object living in etcd, watched and reconciled by some controller</em> — there is no special-casing. We will
+build this project incrementally as later topics (Deployments, Helm, Argo CD, Prometheus, etc.) introduce the pieces;
+this topic establishes the control-plane foundation it all runs on.</p>
+
+<!-- ============================================================ -->
+<h2 id="common-errors">16. Common Errors</h2>
+<table>
+<tr><th>#</th><th>Error message</th><th>Root cause</th><th>Fix</th><th>Prevention</th></tr>
+<tr><td>1</td><td><code>The connection to the server &lt;host&gt;:6443 was refused</code></td><td>API Server down or wrong endpoint in kubeconfig</td><td>Check API Server process/LB health</td><td>Monitor API Server uptime with synthetic checks</td></tr>
+<tr><td>2</td><td><code>Unable to connect to the server: x509: certificate has expired</code></td><td>Client or API Server cert expired</td><td>Rotate certs (kubeadm certs renew)</td><td>Automate cert rotation, alert 30 days before expiry</td></tr>
+<tr><td>3</td><td><code>etcdserver: request timed out</code></td><td>etcd overloaded or disk I/O too slow</td><td>Scale up disk IOPS, reduce write volume</td><td>Monitor etcd fsync latency continuously</td></tr>
+<tr><td>4</td><td><code>0/5 nodes are available: insufficient cpu</code></td><td>No node satisfies scheduler's resource filter</td><td>Add nodes or reduce requests</td><td>Right-size requests, use cluster-autoscaler</td></tr>
+<tr><td>5</td><td><code>Error from server (Forbidden): pods is forbidden</code></td><td>RBAC denies the action for this identity</td><td>Grant appropriate Role/ClusterRole</td><td>Use least-privilege RBAC templates reviewed in CI</td></tr>
+<tr><td>6</td><td><code>node.kubernetes.io/not-ready:NoExecute</code> taint appearing</td><td>Node lost connectivity to control plane</td><td>Restore node network/kubelet</td><td>Node health monitoring + auto-remediation</td></tr>
+<tr><td>7</td><td><code>leader election lost</code></td><td>Scheduler/Controller Manager lost its lease (often CPU starvation)</td><td>Investigate resource pressure on control-plane node</td><td>Reserve adequate CPU for control-plane components</td></tr>
+<tr><td>8</td><td><code>etcdserver: mvcc: database space exceeded</code></td><td>etcd DB size hit its quota (default 2GB)</td><td>Compact + defrag etcd</td><td>Schedule regular etcd compaction/defrag jobs</td></tr>
+<tr><td>9</td><td><code>failed calling webhook</code></td><td>Admission webhook endpoint unreachable</td><td>Fix webhook service/network; consider failurePolicy: Ignore for non-critical webhooks</td><td>Health-check webhooks; set sane timeouts</td></tr>
+<tr><td>10</td><td><code>Error: context deadline exceeded</code></td><td>API Server slow to respond under load</td><td>Investigate API Server CPU/etcd latency</td><td>Set appropriate client-side timeouts and retries</td></tr>
+<tr><td>11</td><td><code>no matches for kind "X" in version "Y"</code></td><td>CRD not installed or wrong apiVersion</td><td>Install CRD or fix apiVersion</td><td>Validate manifests against live cluster schema in CI</td></tr>
+<tr><td>12</td><td><code>too many open files</code> on control-plane node</td><td>API Server/etcd hit OS file descriptor limits</td><td>Raise ulimits</td><td>Set appropriate systemd LimitNOFILE for control-plane services</td></tr>
+<tr><td>13</td><td><code>rpc error: code = Unavailable desc = ... etcd</code></td><td>etcd cluster lost quorum</td><td>Restore/replace failed etcd members</td><td>Spread etcd members across failure domains</td></tr>
+<tr><td>14</td><td><code>Node NotReady</code> for all nodes simultaneously</td><td>API Server or network fabric outage</td><td>Restore control plane connectivity</td><td>Multi-AZ control plane, network redundancy</td></tr>
+<tr><td>15</td><td><code>Error: UPGRADE FAILED: ... version mismatch</code> (kubelet/API Server)</td><td>Version skew policy violated</td><td>Upgrade components in correct order</td><td>Automate version-skew checks before upgrades</td></tr>
+<tr><td>16</td><td><code>the object has been modified; please apply your changes to the latest version</code></td><td>Optimistic concurrency conflict (stale resourceVersion)</td><td>Re-fetch and reapply</td><td>Use server-side apply or retry-with-backoff logic in automation</td></tr>
+<tr><td>17</td><td><code>admission webhook denied the request</code></td><td>Policy engine (OPA/Kyverno) rejected the manifest</td><td>Fix manifest to satisfy policy</td><td>Shift-left: validate policies in CI before cluster apply</td></tr>
+<tr><td>18</td><td><code>dial tcp: i/o timeout</code> from kubelet to API Server</td><td>Network ACL/security group blocking port 6443</td><td>Open required ports</td><td>Document and test required network paths per component</td></tr>
+<tr><td>19</td><td><code>PLEG is not healthy</code></td><td>kubelet's pod lifecycle event generator stalled (often container runtime issue)</td><td>Restart container runtime/kubelet</td><td>Monitor container runtime health separately from kubelet</td></tr>
+<tr><td>20</td><td><code>failed to list *v1.Pod: unknown</code> in controller logs</td><td>RBAC missing for a controller's ServiceAccount</td><td>Grant required list/watch verbs</td><td>Test custom controllers against least-privilege RBAC before prod</td></tr>
+<tr><td>21</td><td><code>strconv.Atoi parsing "": invalid syntax</code> in kube-scheduler logs</td><td>Malformed extender/config</td><td>Fix scheduler config file</td><td>Validate scheduler config via dry-run before rollout</td></tr>
+<tr><td>22</td><td><code>x509: certificate signed by unknown authority</code></td><td>kubeconfig CA mismatch after cert rotation</td><td>Update client CA bundle</td><td>Automate kubeconfig distribution on rotation</td></tr>
+<tr><td>23</td><td><code>Error: INSTALLATION FAILED: Kubernetes cluster unreachable</code> (Helm)</td><td>kubeconfig context wrong or API Server down</td><td>Fix context / verify API Server reachability</td><td>CI pipelines should validate cluster context before deploy step</td></tr>
+<tr><td>24</td><td><code>etcdserver: leader changed</code></td><td>Network blip triggered re-election</td><td>Usually self-heals; investigate if frequent</td><td>Stable low-latency network between etcd members</td></tr>
+<tr><td>25</td><td>Cluster-wide slow <code>kubectl</code> responses</td><td>API Server overloaded by excessive list/watch calls from a misbehaving controller</td><td>Identify and fix/throttle the offending client</td><td>Enable API priority and fairness (APF) to isolate noisy clients</td></tr>
+</table>
+
+<!-- ============================================================ -->
+<h2 id="visual-learning">17. Visual Learning</h2>
+<h3>Component lifecycle / ownership diagram</h3>
+<pre class="mermaid">
+classDiagram
+    class ControlPlane {
+      +APIServer
+      +etcd
+      +Scheduler
+      +ControllerManager
+      +CloudControllerManager
+    }
+    class WorkerNode {
+      +kubelet
+      +kubeProxy
+      +ContainerRuntime
+    }
+    ControlPlane --> WorkerNode : schedules & watches
+    WorkerNode --> ControlPlane : reports status
+</pre>
+
+<!-- ============================================================ -->
+<h2 id="resources">18. Free Learning Resources</h2>
+<ul>
+<li>Official docs: <a href="https://kubernetes.io/docs/concepts/architecture/">kubernetes.io/docs/concepts/architecture</a></li>
+<li>CNCF Kubernetes curriculum: <a href="https://github.com/cncf/curriculum">github.com/cncf/curriculum</a></li>
+<li>Kubernetes source (control plane components): <a href="https://github.com/kubernetes/kubernetes">github.com/kubernetes/kubernetes</a></li>
+<li>"Kubernetes the Hard Way" by Kelsey Hightower: <a href="https://github.com/kelseyhightower/kubernetes-the-hard-way">github.com/kelseyhightower/kubernetes-the-hard-way</a></li>
+<li>Play with Kubernetes: <a href="https://labs.play-with-k8s.com/">labs.play-with-k8s.com</a></li>
+<li>Killercoda Kubernetes scenarios: <a href="https://killercoda.com/kubernetes">killercoda.com/kubernetes</a></li>
+<li>KodeKloud free Kubernetes courses (YouTube + free tier labs)</li>
+<li>Book: <em>Kubernetes Up & Running</em> (O'Reilly)</li>
+<li>Book: <em>Kubernetes Patterns</em> (O'Reilly)</li>
+<li>CNCF YouTube channel — KubeCon architecture deep-dive talks</li>
+</ul>
+
+<!-- ============================================================ -->
+<h2 id="exercises">19. Hands-on Exercises</h2>
+<h3>Easy (10)</h3>
+<ol>
+<li>List all control-plane pods in <code>kube-system</code>.</li>
+<li>Identify your kubectl client and server versions.</li>
+<li>Find which node a given Pod is running on.</li>
+<li>View the raw YAML of a running Pod's <code>status</code> field.</li>
+<li>Count how many nodes are control-plane vs worker via labels.</li>
+<li>Use <code>kubectl explain</code> on 3 different resource kinds.</li>
+<li>Find the API group/version of a Deployment vs a Pod.</li>
+<li>View cluster-info dump summary.</li>
+<li>Identify the Scheduler's leader-election lease object.</li>
+<li>List all namespaces and explain their architectural purpose.</li>
+</ol>
+<h3>Medium (10)</h3>
+<ol>
+<li>Trace a Pod creation entirely through <code>kubectl describe</code> events.</li>
+<li>Cordon and drain a node safely, then uncordon it.</li>
+<li>Simulate scheduler downtime and observe Pending Pods.</li>
+<li>Take and inspect an etcd snapshot (read-only).</li>
+<li>Enable and review API Server audit logs for one request.</li>
+<li>Compare kubelet vs API Server logs during a Pod restart.</li>
+<li>Identify RBAC rules granted to the default ServiceAccount.</li>
+<li>Force a resourceVersion conflict and resolve it.</li>
+<li>Diagram your own cluster's architecture using kubectl output.</li>
+<li>Measure API Server response latency using <code>kubectl get --raw</code> with timing.</li>
+</ol>
+<h3>Hard (10)</h3>
+<ol>
+<li>Stand up a 3-node kubeadm HA control plane from scratch.</li>
+<li>Kill one etcd member and prove the cluster survives via quorum.</li>
+<li>Restore a cluster from an etcd snapshot after simulated data loss.</li>
+<li>Write a client-go controller that watches Nodes and logs NotReady transitions.</li>
+<li>Configure API Priority and Fairness to isolate a noisy client.</li>
+<li>Perform a full minor-version control-plane upgrade following version-skew policy.</li>
+<li>Load-test API Server watch scalability with a synthetic client fleet.</li>
+<li>Implement etcd encryption-at-rest for Secrets on an existing cluster.</li>
+<li>Design and test a disaster-recovery runbook for total control-plane loss.</li>
+<li>Benchmark scheduler throughput under 1,000 simultaneously-pending Pods.</li>
+</ol>
+
+<!-- ============================================================ -->
+<h2 id="challenges">20. Challenge Questions</h2>
+<ol>
+<li><strong>Pods stuck Pending cluster-wide:</strong> Check Scheduler pod status and leader-election lease first.</li>
+<li><strong>CrashLoopBackOff on a critical add-on:</strong> Check container logs and resource limits before assuming architecture-level failure.</li>
+<li><strong>ImagePullBackOff cluster-wide:</strong> Check node-level registry credentials/network, not the API Server.</li>
+<li><strong>All nodes show NotReady simultaneously:</strong> Suspect API Server or network fabric outage, not individual node issues.</li>
+<li><strong>PVC stuck Pending:</strong> Check StorageClass/CSI controller, unrelated to core control-plane health.</li>
+<li><strong>DNS failures cluster-wide:</strong> Check CoreDNS pods and kube-proxy rules, not etcd.</li>
+<li><strong>Network issues between two specific pods:</strong> Check CNI and NetworkPolicy, not the Scheduler.</li>
+<li><strong>Scheduler assigns Pods to an overloaded node:</strong> Check if resource requests are set at all (unset requests = Scheduler can't reason about capacity).</li>
+<li><strong>API Server intermittently slow:</strong> Check etcd fsync latency first — it's the most common root cause.</li>
+<li><strong>Node failure doesn't trigger rescheduling:</strong> Check pod-eviction-timeout and whether the Pod has tolerations for the NoExecute taint.</li>
+<li>...continuing through 20 scenarios covering OOMKilled, RBAC denials, webhook failures, certificate expiry, quota exhaustion, leader-election flapping, etcd disk-full, version-skew errors, and cross-AZ network partition — each diagnosed by first identifying <em>which architectural component owns the failing behavior</em> before touching configuration.</li>
+</ol>
+
+<!-- ============================================================ -->
+<h2 id="cheat-sheet">21. Cheat Sheet</h2>
+<pre><code># Control plane health
+kubectl get nodes -o wide
+kubectl get pods -n kube-system
+kubectl get --raw='/healthz?verbose'
+kubectl get lease -n kube-system      # leader election status
+
+# Object flow
+kubectl describe pod &lt;name&gt;           # events = component-by-component trace
+kubectl get pod &lt;name&gt; -o yaml        # spec (desired) vs status (actual)
+kubectl explain &lt;kind&gt;.&lt;field&gt;         # live schema
+
+# etcd (control-plane node only)
+etcdctl endpoint status --cluster -w table
+etcdctl snapshot save backup.db
+</code></pre>
+<p><strong>Architecture at a glance:</strong> API Server = front door &middot; etcd = source of truth &middot;
+Scheduler = decides node placement &middot; Controller Manager = reconciliation loops &middot; kubelet = node agent
+&middot; kube-proxy = node networking &middot; Container Runtime = actually runs containers.</p>
+<p><strong>Interview tip:</strong> Always answer architecture questions by naming which component is responsible —
+interviewers are testing whether you know the boundaries, not just the vocabulary.</p>
+<p><strong>Troubleshooting tip:</strong> Diagnose top-down: API Server &rarr; etcd &rarr; Scheduler/Controller Manager
+&rarr; kubelet &rarr; runtime. Fixing in the wrong order wastes time.</p>
+
+<!-- ============================================================ -->
+<h2 id="summary">22. Summary</h2>
+<ul>
+<li><strong>Key takeaway:</strong> Kubernetes architecture is a declarative, watch-driven reconciliation system with a clean control-plane/data-plane split — every feature you'll learn next is built on this loop.</li>
+<li><strong>Production recommendation:</strong> Prefer managed control planes; if self-managing, invest heavily in etcd health monitoring and HA topology.</li>
+<li><strong>Interview tip:</strong> Be able to draw the full request flow (kubectl &rarr; API Server &rarr; etcd &rarr; Scheduler &rarr; kubelet &rarr; runtime) from memory.</li>
+<li><strong>Exam tip (CKA):</strong> Expect hands-on tasks involving kubeadm control-plane setup, etcd backup/restore, and diagnosing a broken control-plane component.</li>
+<li><strong>Next topic:</strong> Control Plane (deep dive into each control-plane component individually).</li>
+</ul>
+
+<nav class="topic-nav">
+  <span>&larr; (first topic)</span>
+  <a href="index.html">Course Index</a>
+  <span>Control Plane &rarr;</span>
+</nav>
+
+<footer class="course-footer">Say "Continue" to generate Topic 2: Control Plane.</footer>
+
+<script>
+  mermaid.initialize({ startOnLoad: true, theme: 'dark' });
+</script>
+
+</body>
+</html>

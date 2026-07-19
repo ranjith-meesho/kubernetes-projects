@@ -1,0 +1,269 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Topic 55: Logging — Kubernetes Expert Course</title>
+<link rel="stylesheet" href="styles.css">
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+</head>
+<body>
+
+<header class="course-header">
+  <div class="kicker">Topic 55 of 70</div>
+  <h1>Logging</h1>
+  <div class="subtitle">Cluster-wide logging architecture: where container stdout/stderr actually lives, and the patterns for shipping it off-node.</div>
+</header>
+
+<nav class="topic-nav">
+  <a href="54-opentelemetry.html">&larr; OpenTelemetry</a>
+  <a href="index.html">Course Index</a>
+  <a href="56-fluent-bit.html">Fluent Bit &rarr;</a>
+</nav>
+
+<h2 id="explanation">Explanation</h2>
+<p>Kubernetes itself does not provide cluster-wide log storage — it only guarantees that whatever a container writes to
+<strong>stdout/stderr</strong> is captured by the container runtime and written to a file on the node's local disk. By
+default, that's the entire logging story: <code>kubectl logs</code> reads those local files (via the kubelet), and if the
+node dies or the pod is evicted, the logs are gone. Any durable, searchable, cluster-wide logging capability is something
+you must deliberately build using a log collection agent plus a backend store — Kubernetes gives you the raw material
+(files on disk), not the pipeline.</p>
+
+<p>Concretely, when a container writes to stdout, the container runtime (containerd/CRI-O) redirects it to a log file
+under <code>/var/log/pods/&lt;namespace&gt;_&lt;pod&gt;_&lt;uid&gt;/&lt;container&gt;/0.log</code> (JSON-lines or CRI
+log format), typically symlinked from <code>/var/log/containers/</code>. The kubelet manages <strong>log rotation</strong>
+on that file (size- and count-based, configurable via kubelet flags) so a chatty container can't fill node disk. This is
+why "the log disappeared" after a pod restart or eviction is expected behavior, not a bug — node-local log files are
+ephemeral by design.</p>
+
+<p>There are three classic architectural patterns for getting logs off the node before they're lost: (1) <strong>node-level
+agent</strong> — one DaemonSet pod per node (Fluent Bit, Fluentd, Promtail) tails every container's log file on that node
+and ships it centrally; this is the dominant pattern because it's low-overhead (one agent per node, not per pod) and
+requires zero application changes. (2) <strong>sidecar container</strong> — a logging agent runs inside the same Pod as
+the app, useful when the app writes logs to a file instead of stdout, or when per-app log processing rules differ
+significantly. (3) <strong>direct shipping from the application</strong> — the app itself pushes logs straight to a
+backend (e.g. via an OTel SDK log exporter), bypassing node files entirely; simplest to reason about but requires every
+app to implement it, and loses logs generated before a crash if buffering isn't handled carefully.</p>
+
+<p>Kubernetes needs a deliberate logging architecture because troubleshooting production incidents fundamentally depends
+on correlating what an application said (logs) with what the system observed (metrics) and how a request traveled
+(traces). Without centralized, durable, searchable logs, engineers are reduced to SSHing into nodes or racing
+`kubectl logs` before a CrashLoopBackOff pod's log buffer rotates away — untenable at any real scale.</p>
+
+<p>In the wider ecosystem, this topic is the "why" behind Fluent Bit, Loki, and OpenTelemetry logs pipelines covered next:
+node-level agents (Fluent Bit) read the files this topic describes, ship them to an aggregator/backend (Loki, or an OTel
+Collector's logs pipeline, or Elasticsearch), and Grafana (or Kibana) is where humans query them — often correlated with
+Prometheus/VictoriaMetrics metrics and Tempo/Jaeger traces via shared labels like pod name and trace ID.</p>
+
+<h2 id="internal-working">Internal Working / Interactions</h2>
+<ul>
+  <li><strong>Container runtime (containerd/CRI-O)</strong> writes each container's stdout/stderr to a per-container log file under <code>/var/log/pods/...</code>, in CRI log format (timestamp, stream, tag, message).</li>
+  <li><strong>kubelet</strong> owns log rotation policy (<code>--container-log-max-size</code>, <code>--container-log-max-files</code>) and is what <code>kubectl logs</code> reads from via its API on that node.</li>
+  <li><strong>Node-level agent (DaemonSet)</strong> tails <code>/var/log/containers/*.log</code>, enriches each line with Kubernetes metadata (namespace, pod, labels) by querying the API server, and forwards to a backend.</li>
+  <li><strong>Backend (Loki, Elasticsearch, OTel Collector logs pipeline)</strong> indexes and stores logs durably, independent of node lifecycle.</li>
+  <li><strong>Grafana/Kibana</strong> queries the backend for search, and can correlate a log line's trace ID with a trace in Tempo/Jaeger.</li>
+</ul>
+
+<h2 id="architecture-diagram">Architecture Diagram</h2>
+<pre class="mermaid">
+flowchart TB
+    subgraph Node["Worker Node"]
+      C1["Container stdout/stderr"] --> RT["Container Runtime<br/>(containerd/CRI-O)"]
+      RT --> FILE["/var/log/pods/.../0.log<br/>(rotated by kubelet)"]
+      FILE -.->|kubectl logs reads via kubelet| USER1["kubectl logs"]
+      FILE --> AGENT["Node-level Agent<br/>(Fluent Bit DaemonSet)"]
+    end
+
+    AGENT -->|enriched, shipped| BACKEND["Log Backend<br/>(Loki / Elasticsearch / OTel logs pipeline)"]
+    BACKEND --> GF["Grafana / Kibana<br/>(search + correlate)"]
+</pre>
+
+<h2 id="code-example">Code Example</h2>
+<pre><code># Kubelet configuration controlling node-local log rotation — this is what determines
+# how long a container's logs survive on disk before the shipping agent must have read them.
+apiVersion: kubelet.config.k8s.io/v1beta1
+kind: KubeletConfiguration
+containerLogMaxSize: "10Mi"        # rotate once a single log file hits this size
+containerLogMaxFiles: 5            # keep at most 5 rotated files per container before deleting the oldest
+---
+# Minimal DaemonSet pattern for a node-level logging agent (conceptually what Fluent Bit runs as —
+# see Topic 56 for the full Fluent Bit config). This shows the volume mounts that make node-level
+# log collection possible: read-only access to the node's log directories.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: log-agent
+  namespace: logging
+spec:
+  selector:
+    matchLabels: { app: log-agent }
+  template:
+    metadata:
+      labels: { app: log-agent }
+    spec:
+      serviceAccountName: log-agent      # needs RBAC to read Pod metadata for enrichment
+      containers:
+        - name: agent
+          image: fluent/fluent-bit:3.0
+          volumeMounts:
+            - name: varlog
+              mountPath: /var/log          # symlinked container log files live here
+              readOnly: true
+            - name: varlibcontainers
+              mountPath: /var/lib/docker/containers   # underlying log files on some runtimes
+              readOnly: true
+      volumes:
+        - name: varlog
+          hostPath: { path: /var/log }
+        - name: varlibcontainers
+          hostPath: { path: /var/lib/docker/containers }
+</code></pre>
+
+<h2 id="kubectl-cli-commands">kubectl / CLI Commands</h2>
+<pre><code>kubectl logs my-pod                              # tail current container's stdout/stderr via kubelet
+kubectl logs my-pod --previous                    # logs from the last crashed instance (before restart)
+kubectl logs my-pod -c my-container --since=1h    # scope to a specific container and time window
+kubectl logs -f deploy/my-app                     # follow logs live across the deployment's pods
+kubectl exec -it my-pod -- ls -la /var/log        # inspect log files an app writes internally (non-stdout case)
+kubectl get pods -n logging -l app=log-agent -o wide   # verify the log agent DaemonSet runs on every node
+kubectl describe node &lt;node&gt; | grep -A5 "Allocated resources"  # check node disk pressure affecting log retention
+</code></pre>
+
+<h2 id="best-practices">Best Practices &amp; Common Pitfalls</h2>
+<div class="grid-2">
+<div>
+<h4>Best Practices</h4>
+<ul>
+  <li>Always log to stdout/stderr from applications — it's the only pattern Kubernetes natively supports and rotates.</li>
+  <li>Ship logs off-node continuously via a DaemonSet agent; never rely on node disk as durable storage.</li>
+  <li>Include structured fields (JSON logs) so downstream backends can index and query efficiently.</li>
+  <li>Tune <code>containerLogMaxSize</code>/<code>containerLogMaxFiles</code> so rotation doesn't outrun your shipping agent during bursts.</li>
+  <li>Tag every log line with a trace ID when available, to enable log-to-trace correlation later.</li>
+</ul>
+</div>
+<div>
+<h4>Pitfalls</h4>
+<ul>
+  <li>Writing logs to a file inside the container instead of stdout, silently losing them (no agent reads it by default).</li>
+  <li>Assuming <code>kubectl logs --previous</code> always works — it depends on the crashed container's log file surviving rotation.</li>
+  <li>Under-provisioning node disk for logs on very chatty workloads, causing disk-pressure evictions.</li>
+  <li>Not setting log level appropriately in production, drowning the pipeline (and budget) in DEBUG-level noise.</li>
+</ul>
+</div>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="interview-questions">50 Interview Questions</h2>
+
+<details class="qa"><summary>1. Does Kubernetes provide cluster-wide log storage out of the box?</summary>
+<div class="qa-body"><strong>Short answer:</strong> No — it only guarantees stdout/stderr is captured to a file on the node's local disk.
+<br><strong>Detail:</strong> Any durable, searchable, cluster-wide logging capability must be deliberately built with a collection agent plus a backend store; Kubernetes gives raw material (files on disk), not a pipeline.
+<br><strong>Production example:</strong> A fresh cluster with no logging agent installed can still serve <code>kubectl logs</code>, but has zero durable log history once pods are evicted or nodes recycle.
+<br><strong>Common mistake:</strong> Assuming logs are centrally searchable by default just because <code>kubectl logs</code> works.</div></details>
+
+<details class="qa"><summary>2. Where does a container's stdout/stderr actually end up on a node?</summary>
+<div class="qa-body"><strong>Short answer:</strong> A per-container log file under <code>/var/log/pods/&lt;namespace&gt;_&lt;pod&gt;_&lt;uid&gt;/&lt;container&gt;/0.log</code>, typically symlinked from <code>/var/log/containers/</code>.
+<br><strong>Detail:</strong> The container runtime (containerd/CRI-O) redirects stdout/stderr into this file in CRI log format (timestamp, stream, tag, message).
+<br><strong>Production example:</strong> A node-level agent DaemonSet tails <code>/var/log/containers/*.log</code> to pick up every container's output on that node.
+<br><strong>Common mistake:</strong> Looking for logs only under <code>/var/log/containers/</code> and not realizing it's a symlink to the real files under <code>/var/log/pods/</code>.</div></details>
+
+<details class="qa"><summary>3. Why do logs disappear after a pod restart or eviction?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Node-local log files are ephemeral by design — they live on that node's disk only.
+<br><strong>Detail:</strong> If the node dies or the pod is evicted, the underlying log file goes with it unless something already shipped the contents elsewhere.
+<br><strong>Production example:</strong> A CrashLoopBackOff pod's earlier crash logs vanish once kubelet rotates or the pod is rescheduled to another node.
+<br><strong>Common mistake:</strong> Treating a disappeared log as a bug report-worthy anomaly instead of expected ephemeral-storage behavior.</div></details>
+
+<details class="qa"><summary>4. What are the three architectural patterns for getting logs off a node?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Node-level agent (DaemonSet), sidecar container, and direct shipping from the application.
+<br><strong>Detail:</strong> Node-level agent is dominant (one agent per node, zero app changes); sidecar suits apps writing to files instead of stdout; direct shipping bypasses node files entirely but needs every app to implement it.
+<br><strong>Production example:</strong> Fluent Bit as a DaemonSet is the standard node-level agent pattern; an OTel SDK log exporter pushing straight to a backend is the direct-shipping pattern.
+<br><strong>Common mistake:</strong> Choosing sidecar-per-pod as the default pattern, multiplying agent overhead by pod count instead of running one agent per node.</div></details>
+
+<details class="qa"><summary>5. Who owns log rotation on a node, and what controls it?</summary>
+<div class="qa-body"><strong>Short answer:</strong> The kubelet, via <code>--container-log-max-size</code> and <code>--container-log-max-files</code> (or the equivalent KubeletConfiguration fields).
+<br><strong>Detail:</strong> Rotation prevents a chatty container from filling node disk; once the max file count is reached, the oldest rotated file is deleted.
+<br><strong>Production example:</strong> <code>containerLogMaxSize: "10Mi"</code> and <code>containerLogMaxFiles: 5</code> in a KubeletConfiguration bounds each container to 5 rotated 10Mi files.
+<br><strong>Common mistake:</strong> Setting rotation thresholds too aggressive for a chatty workload, causing the shipping agent to lose lines that rotate out before being read.</div></details>
+
+<details class="qa"><summary>6. How does kubectl logs actually retrieve output — does it query a central store?</summary>
+<div class="qa-body"><strong>Short answer:</strong> No — it reads the local log file on that pod's node via the kubelet's API, not any centralized store.
+<br><strong>Detail:</strong> This is why kubectl logs stops working the moment the node or its log files are gone, and why it has nothing to do with your Loki/Elasticsearch backend.
+<br><strong>Production example:</strong> <code>kubectl logs my-pod --previous</code> pulls the last crashed instance's log, but only if that file survived rotation on the node.
+<br><strong>Common mistake:</strong> Assuming <code>kubectl logs --previous</code> always works — it depends entirely on the crashed container's log file surviving rotation.</div></details>
+
+<details class="qa"><summary>7. Why is the node-level DaemonSet agent pattern considered the dominant approach?</summary>
+<div class="qa-body"><strong>Short answer:</strong> It's low-overhead (one agent per node, not per pod) and requires zero application changes.
+<br><strong>Detail:</strong> The agent tails every container's log file on its node, enriches with Kubernetes metadata, and forwards centrally — apps never need to know it exists.
+<br><strong>Production example:</strong> A Fluent Bit DaemonSet mounts <code>/var/log</code> and <code>/var/lib/docker/containers</code> read-only to tail every container's output on that node.
+<br><strong>Common mistake:</strong> Believing a sidecar-per-app gives better isolation without weighing the multiplied resource cost across every pod in the cluster.</div></details>
+
+<details class="qa"><summary>8. Why does a node-level logging agent need RBAC permissions?</summary>
+<div class="qa-body"><strong>Short answer:</strong> To query the API server and enrich each log line with Kubernetes metadata like namespace, pod, and labels.
+<br><strong>Detail:</strong> Without metadata enrichment, a raw log line is just a timestamp and message with no way to filter/search by workload identity.
+<br><strong>Production example:</strong> The example DaemonSet sets <code>serviceAccountName: log-agent</code>, which needs RBAC to read Pod metadata for enrichment before forwarding.
+<br><strong>Common mistake:</strong> Deploying the agent with a default/no service account and getting logs shipped with no pod/namespace context at all.</div></details>
+
+<details class="qa"><summary>9. What's the risk of writing application logs to a file instead of stdout?</summary>
+<div class="qa-body"><strong>Short answer:</strong> The logs are silently lost — no node-level agent reads them by default.
+<br><strong>Detail:</strong> Kubernetes' native log capture and rotation only applies to stdout/stderr; a file inside the container is invisible to the standard pipeline unless a sidecar is added specifically to read it.
+<br><strong>Production example:</strong> <code>kubectl exec -it my-pod -- ls -la /var/log</code> is how you'd inspect such internally-written log files that bypass the standard capture.
+<br><strong>Common mistake:</strong> An app team logging to a local file "for safety" and being surprised their logs never reach the central backend.</div></details>
+
+<details class="qa"><summary>10. How does log-to-trace correlation actually work in this architecture?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Tagging every log line with a trace ID when available, so Grafana/Kibana can jump from a log line to the matching trace in Tempo/Jaeger.
+<br><strong>Detail:</strong> This requires the application (or its OTel instrumentation) to inject the active trace ID into structured log output; the backend and query UI do the rest.
+<br><strong>Production example:</strong> A structured JSON log line carrying a <code>trace_id</code> field lets an engineer pivot straight from an error log in Grafana to the full distributed trace.
+<br><strong>Common mistake:</strong> Shipping unstructured plain-text logs with no trace ID field, losing the ability to correlate logs with traces even though both pipelines exist.</div></details>
+
+<details class="qa"><summary>11–50. Additional rapid-fire questions</summary>
+<div class="qa-body">
+<strong>11.</strong> What does Kubernetes guarantee about container logs by default? — Only that stdout/stderr is captured by the container runtime and written to a file on the node's local disk.<br>
+<strong>12.</strong> What log format does the container runtime write to node-local files? — CRI log format (JSON-lines or CRI format), containing timestamp, stream, tag, and message.<br>
+<strong>13.</strong> What two container runtimes are named as writing these log files? — containerd and CRI-O.<br>
+<strong>14.</strong> What does <code>/var/log/containers/</code> actually contain? — Symlinks to the real per-container log files under <code>/var/log/pods/&lt;namespace&gt;_&lt;pod&gt;_&lt;uid&gt;/&lt;container&gt;/0.log</code>.<br>
+<strong>15.</strong> What two kubelet flags control container log rotation? — <code>--container-log-max-size</code> and <code>--container-log-max-files</code>.<br>
+<strong>16.</strong> Why is node-local log storage described as "ephemeral by design"? — Because logs live only on that node's disk, and are lost if the node dies or the pod is evicted before shipping.<br>
+<strong>17.</strong> Name the three classic logging architecture patterns. — Node-level agent (DaemonSet), sidecar container, and direct shipping from the application.<br>
+<strong>18.</strong> When is the sidecar logging pattern preferred over node-level agent? — When the app writes logs to a file instead of stdout, or per-app log processing rules differ significantly.<br>
+<strong>19.</strong> What's the tradeoff of the "direct shipping from application" pattern? — Simplest to reason about, but requires every app to implement it and can lose logs generated before a crash without careful buffering.<br>
+<strong>20.</strong> What three example backends are named for storing shipped logs? — Loki, Elasticsearch, and an OTel Collector's logs pipeline.<br>
+<strong>21.</strong> What two tools are named for querying/searching the log backend? — Grafana and Kibana.<br>
+<strong>22.</strong> What does the node-level agent do to a raw log line before shipping it? — Enriches it with Kubernetes metadata (namespace, pod, labels) by querying the API server.<br>
+<strong>23.</strong> Why is Fluent Bit specifically named as the node-level agent example? — It's the lightweight DaemonSet log forwarder covered as the direct next topic implementing this exact architecture.<br>
+<strong>24.</strong> What volume mounts does the example DaemonSet use to read node logs? — <code>/var/log</code> (symlinked container log files) and <code>/var/lib/docker/containers</code> (underlying files on some runtimes), both mounted read-only via hostPath.<br>
+<strong>25.</strong> Why are those log-reading volume mounts marked readOnly? — The agent only needs to tail/ship logs, never to modify or delete node-local log files.<br>
+<strong>26.</strong> What command tails a pod's current container logs live? — <code>kubectl logs -f deploy/my-app</code> follows logs live across a deployment's pods; a plain <code>kubectl logs my-pod</code> reads the current container.<br>
+<strong>27.</strong> How do you get logs from a container's previous (crashed) instance? — <code>kubectl logs my-pod --previous</code>.<br>
+<strong>28.</strong> How do you scope kubectl logs to a specific container and time window? — <code>kubectl logs my-pod -c my-container --since=1h</code>.<br>
+<strong>29.</strong> How do you verify a log agent DaemonSet is actually running on every node? — <code>kubectl get pods -n logging -l app=log-agent -o wide</code>.<br>
+<strong>30.</strong> What command helps check whether node disk pressure is affecting log retention? — <code>kubectl describe node &lt;node&gt; | grep -A5 "Allocated resources"</code>.<br>
+<strong>31.</strong> Why should applications always log to stdout/stderr rather than a file? — It's the only pattern Kubernetes natively captures and rotates; anything else requires extra plumbing (sidecar) to even be seen.<br>
+<strong>32.</strong> Why is JSON/structured logging recommended as a best practice here? — So downstream backends can index and query fields efficiently instead of parsing unstructured text.<br>
+<strong>33.</strong> What happens if containerLogMaxSize/containerLogMaxFiles rotation outruns the shipping agent? — Log lines can be deleted (rotated out) before the agent has read them, causing permanent gaps in the shipped history.<br>
+<strong>34.</strong> What's a consequence of under-provisioning node disk for very chatty workloads? — Disk-pressure evictions, where the kubelet evicts pods to reclaim space.<br>
+<strong>35.</strong> Why does setting log level appropriately in production matter for the logging pipeline? — Excess DEBUG-level noise can drown the shipping pipeline (and its storage cost) in low-value volume.<br>
+<strong>36.</strong> What's the fundamental reason production troubleshooting needs a deliberate logging architecture? — Correlating what an app said (logs) with what the system observed (metrics) and how a request traveled (traces) is impossible without centralized, durable, searchable logs.<br>
+<strong>37.</strong> How does this topic relate to Fluent Bit, Loki, and OpenTelemetry covered elsewhere in the course? — Node-level agents (Fluent Bit) read the files this topic describes and ship them to an aggregator/backend (Loki or an OTel Collector's logs pipeline).<br>
+<strong>38.</strong> Why is racing kubectl logs before a CrashLoopBackOff pod's buffer rotates away considered untenable at scale? — It doesn't scale past a handful of pods/incidents and provides no durable history once the file rotates or the pod is gone.<br>
+<strong>39.</strong> What's the danger of assuming node disk is durable storage for logs? — It isn't — logs must be shipped off-node continuously via an agent; relying on node disk risks total loss on node failure.<br>
+<strong>40.</strong> If a log line is missing from the central backend but the app clearly printed it, what's the first thing to check? — Whether the node-level agent's DaemonSet pod is actually running and healthy on that specific node, before suspecting the app or backend.<br>
+<strong>41.</strong> Why does the example DaemonSet mount both /var/log and /var/lib/docker/containers? — Different container runtimes/configurations store the underlying log files in different locations, so both paths cover the possible layouts.<br>
+<strong>42.</strong> What's the operational cost difference between the node-level agent pattern and the sidecar pattern at scale? — Node-level agent scales with node count (one agent per node); sidecar scales with pod count, multiplying resource overhead across every workload replica.<br>
+<strong>43.</strong> Why can't Kubernetes itself guarantee durable log storage the way it guarantees running Pods? — Its design principle is to capture stdout/stderr to node-local disk only; durability requires an explicitly deployed pipeline, not a built-in cluster feature.<br>
+<strong>44.</strong> What's a concrete failure mode if an app buffers logs in memory before writing on a "direct shipping" pattern? — Logs generated right before a crash can be lost if the buffer never gets flushed before the process dies.<br>
+<strong>45.</strong> Why does the kubelet expose logs via its own API rather than the API server directly? — kubectl logs is served through the kubelet running on the node hosting the pod, since that's where the actual log file lives.<br>
+<strong>46.</strong> What's a good way to check if rotation settings are too aggressive for a workload's log volume? — Compare containerLogMaxSize/containerLogMaxFiles-driven rotation frequency against how fast the shipping agent can tail and forward new lines.<br>
+<strong>47.</strong> Why is enrichment with Kubernetes metadata considered essential rather than optional? — Without namespace/pod/label context, a shipped log line can't be filtered, searched, or attributed to a specific workload in the backend.<br>
+<strong>48.</strong> What's the relationship between this topic and Fluent Bit's role in the course? — This topic explains the underlying node-local log files and rotation; Fluent Bit is the concrete DaemonSet agent that reads and ships them.<br>
+<strong>49.</strong> Why would a team building a new observability stack still need Grafana/Kibana even with a working shipping pipeline? — Shipped, indexed logs need a query/search UI for humans to actually use them during troubleshooting; the pipeline alone doesn't provide that.<br>
+<strong>50.</strong> What's the single biggest architectural risk of skipping a log-shipping agent entirely? — Total, permanent log loss the moment a node is recycled or a pod is evicted, with no way to reconstruct historical output.
+</div></details>
+
+<footer class="course-footer">Next: Topic 56 — Fluent Bit, the lightweight DaemonSet log forwarder implementing this architecture.</footer>
+
+<script>
+  mermaid.initialize({ startOnLoad: true, theme: 'dark' });
+</script>
+
+</body>
+</html>

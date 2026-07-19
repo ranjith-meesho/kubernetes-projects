@@ -1,0 +1,286 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Topic 11: Pods — Kubernetes Expert Course</title>
+<link rel="stylesheet" href="styles.css">
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+</head>
+<body>
+
+<header class="course-header">
+  <div class="kicker">Topic 11 of 70</div>
+  <h1>Pods</h1>
+  <div class="subtitle">The smallest deployable unit: spec anatomy, multi-container patterns (sidecar/init), and the pod lifecycle phases.</div>
+</header>
+
+<nav class="topic-nav">
+  <a href="10-container-runtime.html">&larr; Container Runtime</a>
+  <a href="index.html">Course Index</a>
+  <a href="12-replicasets.html">ReplicaSets &rarr;</a>
+</nav>
+
+<h2 id="explanation">Explanation</h2>
+<p>A <strong>Pod</strong> is the smallest deployable unit in Kubernetes — never a single container. A Pod is a group
+of one or more containers that share a network namespace (same IP, same localhost) and can share storage volumes,
+scheduled together onto the same node as an atomic unit. You never schedule a bare container in Kubernetes; the Pod
+is the abstraction the Scheduler places, kubelet runs, and Services route to.</p>
+
+<p>Kubernetes needs this grouping because real applications often need tightly-coupled helper processes co-located
+with the main process — a log shipper, a proxy, a config-reloader — and those helpers need to share the same network
+identity and sometimes a filesystem with the main container, without the complexity of manually wiring up shared
+namespaces yourself. The Pod is Kubernetes' answer to "what is the unit of co-location and shared fate."</p>
+
+<p>Every Pod actually starts with a hidden, first container: the <strong>pause container</strong> (sandbox), created
+by the runtime to hold the shared Linux namespaces (network, IPC, sometimes PID) before any of your containers start.
+All your containers then join those same namespaces — this is the literal mechanism behind "containers in a Pod
+share localhost."</p>
+
+<p>Pods support two important multi-container patterns. <strong>Init containers</strong> run sequentially to
+completion <em>before</em> any main container starts — used for setup tasks like waiting on a dependency or seeding
+config, and if one fails, the Pod restarts from the first init container (per the Pod's restart policy). <strong>Sidecar
+containers</strong> (including native sidecars since 1.28, marked via <code>restartPolicy: Always</code> inside
+<code>initContainers</code>) run alongside the main container for the Pod's entire lifetime — a service mesh proxy
+(Envoy/Istio) is the canonical production example, injected automatically via a mutating admission webhook.</p>
+
+<p>A Pod moves through defined lifecycle <strong>phases</strong>: <code>Pending</code> (accepted but not yet fully
+running — includes scheduling and image pull time), <code>Running</code> (bound to a node, at least one container
+running or starting), <code>Succeeded</code>/<code>Failed</code> (terminal, all containers exited — relevant for
+Jobs), and <code>Unknown</code> (kubelet lost contact with the node). Pods are also fundamentally
+<strong>ephemeral and disposable</strong> by design — they are never rescheduled onto a different node once bound;
+if a Pod dies, a controller (like ReplicaSet) creates an entirely new Pod object with a new identity, rather than the
+old one being "moved."</p>
+
+<h2 id="internal-working">Internal Working / Interactions</h2>
+<ul>
+  <li><strong>Pod &harr; Scheduler:</strong> Pods with empty <code>nodeName</code> are the Scheduler's entire input; it writes the binding once.</li>
+  <li><strong>Pod &harr; kubelet:</strong> kubelet on the bound node drives sandbox creation, init container sequencing, and main/sidecar container startup via the CRI.</li>
+  <li><strong>Pod &harr; ReplicaSet/Deployment/Job:</strong> most Pods are owned by a higher-level controller via <code>ownerReferences</code> — direct "naked" Pods have no self-healing.</li>
+  <li><strong>Pod &harr; Service/EndpointSlice:</strong> a Pod's IP is added to a Service's EndpointSlice only once it passes its readiness probe.</li>
+  <li><strong>Pod &harr; Volumes:</strong> volumes are defined at the Pod level and mounted into one or more containers, enabling shared filesystem state (e.g. sidecar reading logs the main container writes).</li>
+</ul>
+
+<h2 id="architecture-diagram">Architecture Diagram</h2>
+<pre class="mermaid">
+flowchart TB
+    subgraph POD["Pod (one network namespace, shared IP)"]
+        SANDBOX["pause container (sandbox, holds namespaces)"]
+        INIT["Init Container(s) — run sequentially, then exit"]
+        MAIN["Main Container"]
+        SIDE["Sidecar Container (e.g. Envoy proxy)"]
+    end
+    SCHED["Scheduler"] -->|bind nodeName| POD
+    KL["kubelet"] -->|create sandbox first| SANDBOX
+    KL -->|run to completion| INIT
+    INIT -->|then start| MAIN
+    INIT -->|then start| SIDE
+    MAIN <-.->|shared localhost + volumes| SIDE
+</pre>
+
+<pre class="mermaid">
+stateDiagram-v2
+    [*] --> Pending: Created, awaiting scheduling
+    Pending --> Pending: Scheduled, image pulling
+    Pending --> Running: All init containers done, main container started
+    Running --> Succeeded: All containers exited 0 (Job-style Pod)
+    Running --> Failed: A container exited non-zero, restartPolicy=Never
+    Running --> Running: Container restarted (restartPolicy=Always/OnFailure)
+    Running --> Unknown: kubelet lost contact with node
+    Succeeded --> [*]
+    Failed --> [*]
+</pre>
+
+<h2 id="code-example">Code Example</h2>
+<pre><code># A realistic multi-container Pod: init container + main container + sidecar,
+# demonstrating shared network/volume and lifecycle ordering.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: checkout-with-sidecar
+  labels:
+    app: checkout
+spec:
+  initContainers:
+    - name: wait-for-db                # runs to completion BEFORE main containers start
+      image: busybox:1.36
+      command: ["sh", "-c", "until nc -z postgres 5432; do sleep 2; done"]
+  containers:
+    - name: checkout                    # main application container
+      image: registry.internal/checkout:2.4.1
+      ports:
+        - containerPort: 8080
+      volumeMounts:
+        - name: shared-logs
+          mountPath: /var/log/app
+      readinessProbe:
+        httpGet: { path: /healthz, port: 8080 }
+    - name: log-shipper                  # sidecar: runs for the Pod's entire lifetime
+      image: fluent-bit:2.2
+      volumeMounts:
+        - name: shared-logs              # shares the SAME volume to read what checkout writes
+          mountPath: /var/log/app
+          readOnly: true
+  volumes:
+    - name: shared-logs
+      emptyDir: {}                       # ephemeral, Pod-lifetime-scoped shared storage
+</code></pre>
+
+<h2 id="kubectl-commands">kubectl Commands</h2>
+<pre><code># Inspect Pod phase and per-container status
+kubectl get pod checkout-with-sidecar -o wide
+kubectl get pod checkout-with-sidecar -o jsonpath='{.status.phase}'
+
+# See init container progress explicitly
+kubectl describe pod checkout-with-sidecar | grep -A10 "Init Containers"
+
+# View logs from a specific container within a multi-container Pod
+kubectl logs checkout-with-sidecar -c checkout
+kubectl logs checkout-with-sidecar -c log-shipper
+
+# Exec into one specific container
+kubectl exec -it checkout-with-sidecar -c checkout -- /bin/sh
+
+# Watch the full lifecycle transition live
+kubectl get pod checkout-with-sidecar -w
+
+# See owner references (which controller, if any, owns this Pod)
+kubectl get pod checkout-with-sidecar -o jsonpath='{.metadata.ownerReferences}'
+</code></pre>
+
+<h2 id="best-practices">Best Practices &amp; Common Pitfalls</h2>
+<div class="grid-2">
+<div>
+<h4>Best Practices</h4>
+<ul>
+  <li>Never deploy bare/naked Pods in production — always through a Deployment/StatefulSet/Job for self-healing.</li>
+  <li>Use init containers for genuine sequential setup, not as a substitute for readiness probes.</li>
+  <li>Set resource requests/limits on every container in the Pod, including sidecars.</li>
+  <li>Prefer native sidecar containers (1.28+) over ad-hoc background processes in the main container.</li>
+</ul>
+</div>
+<div>
+<h4>Pitfalls</h4>
+<ul>
+  <li>Forgetting a sidecar's resource usage counts toward the Pod's total scheduling footprint.</li>
+  <li>Assuming a "restarted" Pod kept its IP or identity — a new Pod object may be created entirely by its controller.</li>
+  <li>Using <code>emptyDir</code> for data that must survive a Pod restart/reschedule (it's ephemeral, node-local).</li>
+  <li>Not setting <code>terminationGracePeriodSeconds</code> appropriately for containers needing clean shutdown.</li>
+</ul>
+</div>
+</div>
+
+<h2 id="interview-questions">50 Interview Questions</h2>
+
+<details class="qa"><summary>1. Why is a Pod, not a container, the smallest deployable unit in Kubernetes?</summary>
+<div class="qa-body"><strong>Short answer:</strong> A Pod groups one or more containers that share a network namespace and can share storage, scheduled together as an atomic unit — you never schedule a bare container directly.
+<br><strong>Detail:</strong> Real applications often need tightly-coupled helper processes (log shippers, proxies, config-reloaders) co-located with the main process, sharing the same network identity and sometimes a filesystem, without manually wiring shared namespaces yourself.
+<br><strong>Production example:</strong> A checkout service container and its Fluent Bit log-shipper sidecar run in the same Pod, sharing localhost and a volume, scheduled together on the same node.
+<br><strong>Common mistake:</strong> Treating "Pod" and "container" as interchangeable terms — a Pod is the scheduling/networking abstraction; it may contain multiple containers.</div></details>
+
+<details class="qa"><summary>2. What is the pause container/sandbox, and why does every Pod start with one?</summary>
+<div class="qa-body"><strong>Short answer:</strong> A hidden first container created by the runtime to hold the shared Linux namespaces (network, IPC, sometimes PID) before any of your actual containers start.
+<br><strong>Detail:</strong> All your containers then join those same namespaces — this is the literal mechanism behind "containers in a Pod share localhost," since the pause container's namespaces persist even if application containers restart.
+<br><strong>Production example:</strong> If the main container in a Pod crashes and restarts, it rejoins the same network namespace held open by the pause container, so the Pod IP doesn't change.
+<br><strong>Common mistake:</strong> Being confused by an unfamiliar "pause" container showing up in <code>crictl ps -a</code> output and assuming it's an application bug.</div></details>
+
+<details class="qa"><summary>3. What is the difference between init containers and sidecar containers?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Init containers run sequentially to completion before any main container starts; sidecar containers run alongside the main container for the Pod's entire lifetime.
+<br><strong>Detail:</strong> Init containers are for setup tasks (waiting on a dependency, seeding config) and if one fails, the Pod restarts from the first init container per its restart policy. Sidecars, including native sidecars since 1.28 (marked via <code>restartPolicy: Always</code> inside <code>initContainers</code>), coexist with the main container throughout.
+<br><strong>Production example:</strong> A <code>wait-for-db</code> init container blocks until Postgres is reachable, then a Fluent Bit sidecar runs continuously alongside the main <code>checkout</code> container.
+<br><strong>Common mistake:</strong> Using an init container as a substitute for a readiness probe — init containers gate startup ordering, not ongoing health.</div></details>
+
+<details class="qa"><summary>4. What is a native sidecar (1.28+) and how does it differ from an old-style "sidecar" container?</summary>
+<div class="qa-body"><strong>Short answer:</strong> A native sidecar is declared inside <code>initContainers</code> but marked with <code>restartPolicy: Always</code>, so it starts before the main container but keeps running for the Pod's entire life instead of exiting.
+<br><strong>Detail:</strong> Before this feature, "sidecars" were just regular containers in the <code>containers</code> list with no special startup ordering guarantee — native sidecars solve the problem of ensuring a proxy/mesh sidecar is ready before the main container starts, and stays running until the Pod terminates.
+<br><strong>Production example:</strong> A service mesh proxy (Envoy/Istio) injected as a native sidecar guarantees traffic interception is ready before the main application container begins accepting connections.
+<br><strong>Common mistake:</strong> Assuming any container alongside the main one is automatically a "sidecar" in the native sense — without the native sidecar restart policy, there's no startup-ordering guarantee.</div></details>
+
+<details class="qa"><summary>5. List the Pod lifecycle phases and what each one means.</summary>
+<div class="qa-body"><strong>Short answer:</strong> Pending (accepted but not fully running, includes scheduling/image pull), Running (bound to a node with at least one container running/starting), Succeeded/Failed (terminal, all containers exited), Unknown (kubelet lost contact with the node).
+<br><strong>Detail:</strong> Succeeded/Failed are primarily relevant for Job-style Pods that are expected to terminate; a long-running Deployment Pod normally lives in Running until deleted.
+<br><strong>Production example:</strong> A batch Job Pod transitions Pending &rarr; Running &rarr; Succeeded once its container exits 0, and the Job controller considers that completion satisfied.
+<br><strong>Common mistake:</strong> Treating <code>Pending</code> as always meaning "scheduling problem" — it also legitimately covers image pull time, which can dominate for large images.</div></details>
+
+<details class="qa"><summary>6. Why are Pods described as "ephemeral and disposable," and what does that mean operationally?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Pods are never rescheduled onto a different node once bound — if a Pod dies, a controller creates an entirely new Pod object with a new identity rather than "moving" the old one.
+<br><strong>Detail:</strong> This means Pod IPs, names (unless a controller reuses a naming pattern), and any node-local state (like <code>emptyDir</code>) are not preserved across a Pod's death and replacement.
+<br><strong>Production example:</strong> When a node fails, the ReplicaSet controller creates a brand-new Pod object on a different node — it is not the "same" Pod resurrected, it's a new one with a new IP.
+<br><strong>Common mistake:</strong> Assuming a Pod that gets recreated after a failure retains its original IP or identity — Services rely on EndpointSlice updates precisely because this isn't true.</div></details>
+
+<details class="qa"><summary>7. Why should you avoid deploying "naked" Pods directly in production?</summary>
+<div class="qa-body"><strong>Short answer:</strong> A Pod with no owning controller has no self-healing — if it dies, nothing recreates it.
+<br><strong>Detail:</strong> Most Pods should be owned by a higher-level controller (ReplicaSet, Deployment, Job, StatefulSet) via <code>ownerReferences</code>, which is what actually watches for Pod death and creates replacements.
+<br><strong>Production example:</strong> A manually created Pod (<code>kubectl run</code> without a controller) that gets OOMKilled simply stays dead — no ReplicaSet exists to notice and replace it.
+<br><strong>Common mistake:</strong> Using bare Pods for anything beyond quick, disposable debugging/testing purposes.</div></details>
+
+<details class="qa"><summary>8. How does a Pod's IP become eligible to receive Service traffic?</summary>
+<div class="qa-body"><strong>Short answer:</strong> A Pod's IP is only added to a Service's EndpointSlice once it passes its readiness probe.
+<br><strong>Detail:</strong> Being in the Running phase is not sufficient — the Pod must also report Ready via its readiness probe before kube-proxy's watched EndpointSlice includes it as a valid routing target.
+<br><strong>Production example:</strong> A Pod that's Running but still initializing a cache on startup won't receive Service traffic until its readiness probe explicitly passes.
+<br><strong>Common mistake:</strong> Assuming Running phase alone means a Pod is receiving traffic — readiness is a separate, additional gate.</div></details>
+
+<details class="qa"><summary>9. How do containers within the same Pod share storage, and what's a common pitfall with emptyDir?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Volumes are defined at the Pod level and mounted into one or more containers; <code>emptyDir</code> is a common choice but is ephemeral and node-local.
+<br><strong>Detail:</strong> This enables patterns like a sidecar reading logs the main container writes to a shared volume, but <code>emptyDir</code> data does not survive a Pod restart/reschedule — it's tied to that specific Pod instance on that specific node.
+<br><strong>Production example:</strong> The <code>checkout</code> container writes logs to a shared <code>emptyDir</code> volume mounted read-only by the <code>log-shipper</code> sidecar, which forwards them elsewhere before the Pod terminates.
+<br><strong>Common mistake:</strong> Using <code>emptyDir</code> for data that must survive a Pod restart or reschedule — it's explicitly ephemeral, not a persistence mechanism.</div></details>
+
+<details class="qa"><summary>10. What happens during Pod termination, and why does terminationGracePeriodSeconds matter?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Containers receive a termination signal and get a grace period to shut down cleanly before being forcibly killed; <code>terminationGracePeriodSeconds</code> controls how long that window is.
+<br><strong>Detail:</strong> Containers needing to drain in-flight connections, flush buffers, or close database connections cleanly require enough grace period to actually finish that work before the kernel sends a forceful kill.
+<br><strong>Production example:</strong> A checkout container handling long-lived requests sets a longer <code>terminationGracePeriodSeconds</code> to allow in-flight checkouts to complete before shutdown.
+<br><strong>Common mistake:</strong> Leaving the default grace period for containers that need meaningful clean-shutdown time, causing abrupt connection drops during rolling updates.</div></details>
+
+<details class="qa"><summary>11–50. Additional rapid-fire questions</summary>
+<div class="qa-body">
+<strong>11.</strong> Do containers in the same Pod share the same IP address? — Yes, because they all join the same network namespace held by the pause/sandbox container.<br>
+<strong>12.</strong> Can containers in a Pod communicate over localhost? — Yes, since they share one network namespace, localhost works between them directly.<br>
+<strong>13.</strong> What creates the pause container? — The container runtime, during CRI sandbox creation (RunPodSandbox).<br>
+<strong>14.</strong> What happens if an init container fails? — The Pod restarts from the first init container, subject to the Pod's restart policy.<br>
+<strong>15.</strong> Do init containers run in parallel or sequentially? — Sequentially, one completes before the next starts.<br>
+<strong>16.</strong> Can a Pod have multiple init containers? — Yes, they run one after another in listed order.<br>
+<strong>17.</strong> What restartPolicy value marks a native sidecar inside initContainers? — <code>restartPolicy: Always</code>.<br>
+<strong>18.</strong> What's the canonical production example of a sidecar container? — A service mesh proxy like Envoy or Istio's sidecar.<br>
+<strong>19.</strong> How is a service mesh sidecar typically injected? — Automatically, via a mutating admission webhook.<br>
+<strong>20.</strong> What Pod phase covers image pull time? — Pending.<br>
+<strong>21.</strong> Which phases are terminal (Pod won't transition further)? — Succeeded and Failed.<br>
+<strong>22.</strong> What causes phase Unknown? — kubelet losing contact with the node the Pod is bound to.<br>
+<strong>23.</strong> Are Pod phases the same as container-level restart counts? — No, phase reflects the overall Pod, while individual containers can restart independently within the Running phase.<br>
+<strong>24.</strong> Once a Pod is bound to a node, can the Scheduler move it to another node? — No, binding is one-time; a new Pod object is required to run elsewhere.<br>
+<strong>25.</strong> What field indicates which controller owns a Pod? — <code>metadata.ownerReferences</code>.<br>
+<strong>26.</strong> What happens to a naked Pod (no owner) if its node fails? — It is simply gone — nothing recreates it.<br>
+<strong>27.</strong> Does deleting a ReplicaSet-owned Pod manually cause it to come back? — Yes, the ReplicaSet controller notices the missing replica and creates a new Pod.<br>
+<strong>28.</strong> What kubectl flag views logs from one specific container in a multi-container Pod? — <code>-c &lt;container-name&gt;</code>, e.g. <code>kubectl logs pod -c checkout</code>.<br>
+<strong>29.</strong> What kubectl flag execs into a specific container? — <code>-c &lt;container-name&gt;</code> with <code>kubectl exec</code>.<br>
+<strong>30.</strong> How would you watch a Pod's lifecycle transitions live? — <code>kubectl get pod &lt;name&gt; -w</code>.<br>
+<strong>31.</strong> What field shows a Pod's current phase directly? — <code>status.phase</code>, viewable via <code>kubectl get pod -o jsonpath='{.status.phase}'</code>.<br>
+<strong>32.</strong> Do sidecar containers count toward the Pod's total scheduling resource footprint? — Yes, their resource requests/limits are added to the Pod's overall footprint the Scheduler considers.<br>
+<strong>33.</strong> What's a risk of not setting resource requests/limits on sidecar containers? — Sidecars can silently consume disproportionate node resources, affecting the main container and other Pods on the node.<br>
+<strong>34.</strong> Can two containers in the same Pod use different images/versions? — Yes, each container has its own image, independently versioned.<br>
+<strong>35.</strong> Is a Pod's storage volume automatically shared with every container? — No, each container must explicitly declare a <code>volumeMount</code> for a given Pod-level volume.<br>
+<strong>36.</strong> What Pod-level construct enables a sidecar to read logs the main container writes? — A shared volume (e.g. <code>emptyDir</code>) mounted into both containers.<br>
+<strong>37.</strong> Does an emptyDir volume survive a Pod restart on the same node? — No, it is tied to that specific Pod instance and is deleted when the Pod is removed.<br>
+<strong>38.</strong> What happens to init container resources after the Pod reaches Running? — Init containers have already exited; their resources are no longer consumed once the main containers start.<br>
+<strong>39.</strong> Why is "restartPolicy" a Pod-level (not container-level) field for regular containers? — Because it governs how the whole Pod's containers are restarted on exit, applied uniformly per Pod semantics (Always/OnFailure/Never).<br>
+<strong>40.</strong> What Kubernetes object is the Scheduler's entire input regarding Pods? — Pods with an empty <code>nodeName</code> field, i.e. unscheduled Pods.<br>
+<strong>41.</strong> Does the Pod spec or the controller spec define replica count? — The controller (ReplicaSet/Deployment) defines replica count; the Pod spec only describes a single Pod template.<br>
+<strong>42.</strong> What's a key difference between Job-owned Pods and Deployment-owned Pods regarding phase? — Job Pods are expected to reach Succeeded/Failed as a terminal outcome; Deployment Pods are expected to stay Running indefinitely.<br>
+<strong>43.</strong> Why must a sidecar reading shared logs mount its volume readOnly in good practice? — To avoid the sidecar accidentally corrupting or interfering with data the main container is actively writing.<br>
+<strong>44.</strong> What happens if you don't declare a readiness probe at all? — The container is considered Ready as soon as it starts (default), which may add it to Service routing before it's actually able to serve traffic.<br>
+<strong>45.</strong> Does deleting a Pod object guarantee the underlying container process stops immediately? — No, there's a grace period (<code>terminationGracePeriodSeconds</code>) before a forceful kill.<br>
+<strong>46.</strong> Can a sidecar container observe the main container's process directly (PID namespace)? — Only if the Pod explicitly enables a shared PID namespace (<code>shareProcessNamespace: true</code>); by default PID namespaces aren't shared.<br>
+<strong>47.</strong> What's the significance of "one network namespace" for port conflicts within a Pod? — Containers in the same Pod cannot bind the same port simultaneously since they share one network namespace/IP.<br>
+<strong>48.</strong> Why is a Pod described as the "unit of co-location and shared fate"? — Because all its containers are scheduled together, live/die together as one unit, and share networking/storage — not independently placed or recovered.<br>
+<strong>49.</strong> What's the practical effect of a sidecar crashing repeatedly in a Pod? — It can trigger restart-policy-driven container restarts and CrashLoopBackOff status for that container, potentially affecting overall Pod readiness depending on how readiness is configured.<br>
+<strong>50.</strong> Why do interviewers commonly ask "what is a Pod" as a first Kubernetes question? — Because nearly every other concept (Services, controllers, scheduling, probes, volumes) is defined in terms of the Pod abstraction, making it the foundational building block to understand first.
+</div></details>
+
+<footer class="course-footer">Next: Topic 12 — ReplicaSets, the controller that keeps a set of identical Pods running.</footer>
+
+<script>
+  mermaid.initialize({ startOnLoad: true, theme: 'dark' });
+</script>
+
+</body>
+</html>

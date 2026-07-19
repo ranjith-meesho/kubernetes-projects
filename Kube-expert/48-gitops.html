@@ -1,0 +1,261 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Topic 48: GitOps — Kubernetes Expert Course</title>
+<link rel="stylesheet" href="styles.css">
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+</head>
+<body>
+
+<header class="course-header">
+  <div class="kicker">Topic 48 of 70</div>
+  <h1>GitOps</h1>
+  <div class="subtitle">Git as the single source of truth, with a pull-based reconciler — not a CI pipeline pushing kubectl commands.</div>
+</header>
+
+<nav class="topic-nav">
+  <a href="47-crds.html">&larr; CRDs</a>
+  <a href="index.html">Course Index</a>
+  <a href="49-argocd.html">Argo CD &rarr;</a>
+</nav>
+
+<h2 id="explanation">Explanation</h2>
+
+<p>Traditional CI/CD "pushes" changes to a cluster: a pipeline runs <code>kubectl apply</code> or <code>helm upgrade</code>
+against production credentials at the end of a build. This works, but it has a structural weakness — the CI system
+needs standing write credentials to every cluster it deploys to, there's no single durable record of what's actually
+supposed to be running, and if someone manually <code>kubectl edit</code>s something in prod, nothing notices or
+corrects it. <strong>GitOps</strong> inverts this: a Git repository holds the declarative desired state of the
+cluster, and an in-cluster agent <strong>pulls</strong> from Git and continuously reconciles the live cluster to
+match it — the same watch/reconcile pattern Kubernetes uses internally, just with Git as the upstream "desired state"
+instead of etcd being edited directly by a human.</p>
+
+<p>Kubernetes is uniquely suited to GitOps because its entire object model is already declarative YAML with a
+built-in reconciliation mindset — a GitOps agent doesn't need to invent a new execution model, it just needs to diff
+"what's in Git" against "what's in the cluster" (via the API Server) and apply the difference, exactly like a
+controller diffs desired vs. actual state for any other resource.</p>
+
+<p>The core properties GitOps buys you: <strong>auditability</strong> (every change is a git commit with an author,
+timestamp, and PR review trail — no more "who ran that kubectl command"), <strong>drift detection</strong> (the agent
+constantly compares live cluster state to Git and flags — or auto-corrects — anything that diverges, whether from a
+manual edit or an external system), and <strong>reduced credential exposure</strong> (the CI system never needs
+cluster-admin; only the in-cluster agent, running with tightly scoped RBAC, has apply rights, and it pulls rather
+than being pushed to).</p>
+
+<p>Drift and reconciliation deserve emphasis: a GitOps agent doesn't just deploy once and stop — it runs a continuous
+loop (often every few minutes, or via webhook-triggered refresh) that re-diffs Git against the live cluster forever.
+If a Deployment's replica count is manually changed via <code>kubectl scale</code>, the next reconciliation cycle
+detects that "live" no longer matches "desired per Git" and — depending on configuration — either flags it as
+<code>OutOfSync</code> for a human to review, or automatically reverts it ("self-heal"). This turns configuration
+drift from a silent, accumulating risk into something actively surfaced or actively corrected.</p>
+
+<p>GitOps is a pattern, not a single tool — <strong>Argo CD</strong> and <strong>Flux</strong> are the two dominant
+implementations, both built as Kubernetes controllers with their own CRDs (Argo CD's <code>Application</code>, Flux's
+<code>Kustomization</code>/<code>HelmRelease</code>) representing "this Git path should be reconciled into this
+cluster/namespace."</p>
+
+<h2 id="internal-working">Internal Working / Interactions</h2>
+<ul>
+  <li><strong>Git repository:</strong> the single source of truth — holds rendered manifests, Helm charts, or Kustomize overlays describing desired state.</li>
+  <li><strong>GitOps controller (in-cluster):</strong> polls or is webhook-notified of Git changes, renders the manifests (Helm/Kustomize if needed), and diffs them against live objects via the API Server.</li>
+  <li><strong>API Server:</strong> the only thing the GitOps controller ever writes to directly — it applies the diff using a ServiceAccount scoped via RBAC, never touching etcd or nodes directly.</li>
+  <li><strong>Kubernetes controllers:</strong> once the GitOps agent applies manifests, ordinary reconciliation (Deployment, ReplicaSet, etc.) takes over exactly as with any other apply.</li>
+  <li><strong>Drift detection loop:</strong> runs independently of Git changes too — even with zero new commits, the agent periodically re-compares live vs. Git and reports/corrects divergence.</li>
+</ul>
+
+<h2 id="architecture-diagram">Architecture Diagram</h2>
+<pre class="mermaid">
+sequenceDiagram
+    participant Dev as Developer
+    participant Git as Git Repo (desired state)
+    participant Agent as GitOps Controller (in-cluster)
+    participant API as API Server
+
+    Dev->>Git: git push (merge PR changing replicas: 3 -> 5)
+    Agent->>Git: Poll / webhook notification of new commit
+    Agent->>API: Get live Deployment state
+    API-->>Agent: replicas: 3 (current)
+    Agent->>Agent: Diff: Git wants 5, live has 3 -> OutOfSync
+    Agent->>API: Apply Deployment (replicas: 5)
+    API-->>Agent: Applied
+    Note over Agent,API: Independently, every reconcile cycle:<br/>re-diff live vs Git even with no new commits
+    Agent->>API: Get live state (drift check)
+    API-->>Agent: Someone manually kubectl-scaled to 10
+    Agent->>API: Revert to Git's desired value (self-heal) or flag OutOfSync
+</pre>
+
+<h2 id="code-example">Code Example</h2>
+<pre><code># Example Git repo layout a GitOps controller reconciles from
+# infra-gitops/
+#   apps/
+#     checkout-service/
+#       base/
+#         deployment.yaml
+#         service.yaml
+#       overlays/
+#         prod/
+#           kustomization.yaml   <- patches replicas/resources for prod
+
+# overlays/prod/kustomization.yaml — Kustomize overlay, a common GitOps rendering approach
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../../base                      # Pulls in the shared base manifests...
+patches:
+  - target:
+      kind: Deployment
+      name: checkout-service
+    patch: |-
+      - op: replace                  # ...then patches just what's different for prod.
+        path: /spec/replicas
+        value: 8
+namespace: payments-prod
+</code></pre>
+
+<h2 id="kubectl-commands">kubectl Commands</h2>
+<pre><code>kubectl kustomize overlays/prod                       # Render final manifests locally before they're pushed to Git
+git log --oneline -- apps/checkout-service              # Audit trail: every change to this app, ever, with author
+git diff HEAD~1 -- apps/checkout-service/overlays/prod   # Exactly what changed in the last deploy-relevant commit
+kubectl diff -f <(kubectl kustomize overlays/prod)       # Compare rendered desired state against the live cluster manually
+kubectl get deployment checkout-service -n payments-prod -o yaml   # Inspect live state a GitOps agent would compare against
+kubectl rollout history deployment/checkout-service -n payments-prod  # Cross-reference with Kubernetes' own revision history
+</code></pre>
+
+<h2 id="best-practices">Best Practices &amp; Common Pitfalls</h2>
+<div class="grid-2">
+<div>
+<h4>Best Practices</h4>
+<ul>
+  <li>Require PR review on the GitOps repo — it's now your deployment approval gate, treat it with the same rigor as application code review.</li>
+  <li>Give the in-cluster GitOps agent scoped RBAC per environment/namespace, never one cluster-admin identity for everything.</li>
+  <li>Enable drift detection/self-heal for production so manual out-of-band changes don't silently persist.</li>
+  <li>Keep rendered-manifest logic (Helm/Kustomize) in the same repo structure so "what's deployed" is always traceable to a commit.</li>
+</ul>
+</div>
+<div>
+<h4>Pitfalls</h4>
+<ul>
+  <li>Still granting CI pipelines direct cluster-admin "just in case" — this defeats the credential-isolation benefit GitOps is meant to provide.</li>
+  <li>Storing plaintext secrets in the GitOps repo — use Sealed Secrets/SOPS/external-secrets, never raw Secret manifests in Git.</li>
+  <li>Treating GitOps as "just automated kubectl apply" and skipping drift detection — that's the whole point CI-push deployment lacks.</li>
+  <li>Letting the Git repo and the cluster's actual API objects diverge silently because reconciliation is disabled or paused indefinitely.</li>
+</ul>
+</div>
+</div>
+
+<h2 id="interview-questions">50 Interview Questions</h2>
+
+<details class="qa"><summary>1. What's the core structural difference between traditional CI-push deployment and GitOps?</summary>
+<div class="qa-body"><strong>Short answer:</strong> CI-push has the pipeline push changes to the cluster with standing write credentials; GitOps has an in-cluster agent pull from Git and reconcile continuously.
+<br><strong>Detail:</strong> Pushing requires the CI system to hold cluster-admin-level credentials to every cluster it deploys to; pulling means only the in-cluster agent, with tightly scoped RBAC, ever writes to the API Server.
+<br><strong>Production example:</strong> A GitHub Actions pipeline that used to run `kubectl apply` directly against prod now only merges a PR; Argo CD in-cluster picks up the change and applies it itself.
+<br><strong>Common mistake:</strong> Calling any automated `kubectl apply` from CI "GitOps" — the push/pull distinction is what actually defines it.</div></details>
+
+<details class="qa"><summary>2. Why is Kubernetes uniquely well-suited to the GitOps pattern?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Its entire object model is already declarative YAML with a built-in reconciliation mindset — GitOps just swaps Git in as the upstream "desired state" instead of a human editing etcd via kubectl.
+<br><strong>Detail:</strong> A GitOps agent doesn't need to invent a new execution model; it diffs "what's in Git" against "what's in the cluster" (via the API Server) exactly like any controller diffs desired vs actual state.
+<br><strong>Production example:</strong> Argo CD's reconciliation loop is structurally identical to a ReplicaSet controller's loop, just with Git as the source of desired state instead of a Deployment object's spec.
+<br><strong>Common mistake:</strong> Treating GitOps as a Kubernetes-specific invention rather than recognizing it as Kubernetes' own reconciliation philosophy applied one layer up, at the deployment-source level.</div></details>
+
+<details class="qa"><summary>3. What are the three core properties GitOps buys you over CI-push?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Auditability (every change is a reviewed git commit), drift detection (continuous comparison of live vs Git), and reduced credential exposure (CI never needs cluster-admin).
+<br><strong>Detail:</strong> Auditability replaces "who ran that kubectl command" with a PR trail; drift detection catches manual out-of-band changes or external system interference; credential isolation means a compromised CI pipeline can't directly write to the cluster.
+<br><strong>Production example:</strong> An incident review pulling up exactly which commit changed a Deployment's replica count and who approved the PR.
+<br><strong>Common mistake:</strong> Adopting GitOps tooling but still granting the CI pipeline cluster-admin "just in case," which defeats the credential-isolation benefit entirely.</div></details>
+
+<details class="qa"><summary>4. What does "drift" mean in a GitOps context, and how is it detected?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Drift is any divergence between the live cluster state and what's declared in Git; it's detected by the GitOps agent's continuous re-diffing, independent of new commits.
+<br><strong>Detail:</strong> The agent runs a loop (often every few minutes, or webhook-triggered) that re-compares Git against the live cluster forever, not just at deploy time — this is what separates GitOps from "just automated kubectl apply."
+<br><strong>Production example:</strong> A manual `kubectl scale` to 10 replicas is flagged OutOfSync (or auto-reverted with self-heal) at the very next reconciliation cycle, even with zero new Git commits.
+<br><strong>Common mistake:</strong> Assuming a GitOps tool only acts at deploy time and won't notice manual changes made afterward.</div></details>
+
+<details class="qa"><summary>5. What's the difference between a GitOps agent flagging drift versus "self-healing" it?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Flagging (OutOfSync) surfaces the divergence for a human to review; self-heal actively reverts the live state back to match Git automatically.
+<br><strong>Detail:</strong> Which behavior is used is a configuration choice per environment — some teams want prod auto-corrected instantly, others want a human to review why drift occurred before reverting it.
+<br><strong>Production example:</strong> A staging environment flags OutOfSync for review, while a production environment has self-heal enabled to instantly revert any manual `kubectl edit`.
+<br><strong>Common mistake:</strong> Enabling self-heal everywhere without considering that some intentional emergency hotfixes might get silently reverted before a proper Git-based fix lands.</div></details>
+
+<details class="qa"><summary>6. Why does GitOps reduce the credential exposure surface compared to CI-push?</summary>
+<div class="qa-body"><strong>Short answer:</strong> The CI system never needs cluster-write credentials at all; only the in-cluster agent (with scoped RBAC) has apply rights, and it pulls rather than being pushed to.
+<br><strong>Detail:</strong> This shrinks the attack surface significantly — compromising the CI pipeline no longer means an attacker gets direct write access to production clusters, since CI's job stops at merging to Git.
+<br><strong>Production example:</strong> A leaked CI secret can, at worst, let an attacker push a malicious commit for review — not directly execute changes against the live cluster.
+<br><strong>Common mistake:</strong> Still storing cluster kubeconfig credentials in CI secrets "as a fallback" even after adopting GitOps, re-introducing the exposure GitOps was meant to close.</div></details>
+
+<details class="qa"><summary>7. What's the role of Kustomize (or Helm) inside a GitOps repository?</summary>
+<div class="qa-body"><strong>Short answer:</strong> They render environment-specific manifests (patches/overlays or templated values) that the GitOps agent then diffs and applies against the live cluster.
+<br><strong>Detail:</strong> The GitOps agent isn't limited to raw plain YAML — it typically supports rendering via Kustomize overlays or Helm charts as part of its reconciliation, so "what's in Git" can still be parameterized per environment.
+<br><strong>Production example:</strong> A base/ directory of shared manifests with an overlays/prod/kustomization.yaml patching just the replica count for production.
+<br><strong>Common mistake:</strong> Assuming GitOps requires committing fully-expanded, non-templated manifests for every single environment separately.</div></details>
+
+<details class="qa"><summary>8. Why is the GitOps repository itself treated as a critical deployment approval gate?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Because merging to the tracked path is functionally equivalent to deploying — PR review on that repo is now your production change-control process.
+<br><strong>Detail:</strong> Unlike CI-push where a pipeline step might have additional manual approval gates bolted on, in GitOps the moment a commit lands on the reconciled path/branch, the agent will apply it on its next cycle.
+<br><strong>Production example:</strong> Requiring two approvers and a passing CI check before merging any change to the prod overlay path in the infra-gitops repo.
+<br><strong>Common mistake:</strong> Treating the GitOps repo with looser review standards than application code, when it has equal or greater blast radius.</div></details>
+
+<details class="qa"><summary>9. Why should secrets never be stored in plaintext in a GitOps repository?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Anyone with repo read access (and anyone who ever had it, via git history) can read plaintext secrets, and Git history is effectively permanent.
+<br><strong>Detail:</strong> The standard pattern is to store only encrypted or externally-referenced secret material (Sealed Secrets, SOPS-encrypted values, or an external-secrets operator pulling from a vault at reconcile time) rather than raw Secret manifests.
+<br><strong>Production example:</strong> A GitOps repo containing a SealedSecret object that only the target cluster's controller can decrypt, instead of a plaintext Secret.
+<br><strong>Common mistake:</strong> Committing a raw Kubernetes Secret manifest "temporarily" during a rushed deploy, leaving it permanently in git history even after later removal.</div></details>
+
+<details class="qa"><summary>10. What's the fundamental limitation of relying purely on webhook-triggered sync without periodic reconciliation?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Webhook-only triggers only fire on new Git commits, missing drift caused by out-of-band changes made directly to the cluster.
+<br><strong>Detail:</strong> The independent periodic re-diff loop is what catches manual edits or external system interference that never touched Git at all — webhooks alone only solve "deploy faster after a commit," not "notice unauthorized drift."
+<br><strong>Production example:</strong> A rogue `kubectl edit` bypassing Git entirely would go undetected forever under webhook-only triggering, but gets caught on the next periodic reconcile cycle.
+<br><strong>Common mistake:</strong> Disabling or lengthening the periodic reconciliation interval to "save resources," inadvertently widening the drift-detection blind spot.</div></details>
+
+<details class="qa"><summary>11–50. Additional rapid-fire questions</summary>
+<div class="qa-body">
+<strong>11.</strong> What are the two dominant GitOps tool implementations mentioned? — Argo CD and Flux.<br>
+<strong>12.</strong> What CRD does Argo CD use to represent "this Git path reconciles into this cluster"? — Application.<br>
+<strong>13.</strong> What CRDs does Flux use for the same purpose? — Kustomization and HelmRelease.<br>
+<strong>14.</strong> Is GitOps a specific tool or a pattern? — A pattern — implemented by multiple tools, not owned by one.<br>
+<strong>15.</strong> What does the GitOps agent write to directly? — Only the API Server, via a scoped ServiceAccount — never etcd or nodes directly.<br>
+<strong>16.</strong> What kubectl command renders a Kustomize overlay locally before it's committed? — <code>kubectl kustomize overlays/prod</code>.<br>
+<strong>17.</strong> How would you audit every historical change to one app's manifests? — <code>git log --oneline -- apps/&lt;app&gt;</code>.<br>
+<strong>18.</strong> What command compares rendered desired state against the live cluster manually? — <code>kubectl diff -f &lt;(kubectl kustomize overlays/prod)</code>.<br>
+<strong>19.</strong> Does GitOps eliminate the need for Kubernetes' own rollout history? — No, they're complementary — Kubernetes' rollout history cross-references the same changes tracked in Git.<br>
+<strong>20.</strong> What's the risk of pausing a GitOps agent's reconciliation indefinitely? — The Git repo and live cluster can silently diverge with no detection until reconciliation resumes.<br>
+<strong>21.</strong> What's a common reason to temporarily pause reconciliation? — An emergency manual hotfix that needs time before its proper Git-based fix is prepared and merged.<br>
+<strong>22.</strong> Why is scoped per-environment RBAC recommended for the GitOps agent? — Prevents one compromised or misconfigured environment's reconciliation from affecting unrelated environments.<br>
+<strong>23.</strong> What's the typical trigger mechanism besides periodic polling? — A webhook notification from the Git provider on push.<br>
+<strong>24.</strong> Can a GitOps agent manage multiple clusters from one instance? — Yes, depending on the tool's architecture (e.g. Argo CD supports multiple registered destination clusters).<br>
+<strong>25.</strong> What happens if the rendered manifests (Helm/Kustomize) are non-deterministic? — The agent may perpetually report OutOfSync even with no real intended change, since each render differs slightly.<br>
+<strong>26.</strong> Why does "Git as source of truth" imply avoiding manual kubectl edits in prod? — Any out-of-band edit becomes drift that the next reconciliation will flag or revert.<br>
+<strong>27.</strong> What's a good practice for reviewing GitOps repo changes? — Require PR review with the same rigor as application code, since it's a deployment gate.<br>
+<strong>28.</strong> Does GitOps require a specific rendering technology (Helm vs Kustomize vs plain YAML)? — No, it's rendering-technology agnostic — any of them can feed the reconciliation loop.<br>
+<strong>29.</strong> What's the benefit of keeping rendered-manifest logic in the same repo structure as the tracked desired state? — "What's deployed" stays traceable to a specific commit without hunting across multiple disconnected sources.<br>
+<strong>30.</strong> Can GitOps be used to manage cluster-level resources, not just application workloads? — Yes, CRDs, RBAC, and even cluster add-ons are commonly managed the same GitOps way.<br>
+<strong>31.</strong> What's a risk of granting the GitOps agent overly broad RBAC across all namespaces? — Undermines the credential-isolation benefit — one compromised agent identity could affect everything.<br>
+<strong>32.</strong> How does GitOps typically handle rollback? — Reverting the Git commit and letting the agent reconcile the cluster back to the prior state.<br>
+<strong>33.</strong> Is a GitOps rollback different from `kubectl rollout undo`? — Conceptually similar outcome, but GitOps rollback happens via Git revert plus automatic reconciliation rather than a direct imperative command.<br>
+<strong>34.</strong> What's a common failure mode when a Git repo access token expires? — The GitOps agent stops picking up new commits entirely until the credential is refreshed, silently halting deployments.<br>
+<strong>35.</strong> Why is "no standing write credentials in CI" considered a major security win? — It removes an entire class of high-value credential targets from CI systems, which are often less tightly secured than the cluster itself.<br>
+<strong>36.</strong> What's the interaction between GitOps and canary/progressive delivery? — GitOps tools often integrate with progressive delivery controllers (e.g. Argo Rollouts) to manage staged rollouts declaratively via Git too.<br>
+<strong>37.</strong> Does GitOps replace the need for CI entirely? — No, CI still builds/tests/produces artifacts and updates image tags in Git; GitOps only replaces the deployment/apply step.<br>
+<strong>38.</strong> What's the typical boundary between "CI" and "CD" in a GitOps setup? — CI ends at updating a manifest/image-tag reference in Git; CD (the actual deployment) is entirely owned by the GitOps agent from that point.<br>
+<strong>39.</strong> Can GitOps agents detect drift caused by another controller (not a human)? — Yes, drift detection compares live state regardless of what caused the divergence, human or automated.<br>
+<strong>40.</strong> What's a good way to test a GitOps change before merging? — Render locally (`kubectl kustomize` or `helm template`) and review the diff against the live cluster before merging the PR.<br>
+<strong>41.</strong> Why might self-heal be undesirable for very high-change-frequency resources like HPA-managed replica counts? — Self-heal could fight with the HPA controller's own legitimate scaling decisions if replicas is naively tracked in Git as a fixed value.<br>
+<strong>42.</strong> How do teams typically avoid GitOps fighting with HPA over replica count? — Excluding the replicas field from GitOps-managed diffing/ignoring it for resources under HPA control.<br>
+<strong>43.</strong> What's the audit value of a Git-based deployment history versus CI pipeline logs? — Git history is durable, structured, and tied to reviewed commits, whereas pipeline logs can be more ephemeral and less rigorously reviewed.<br>
+<strong>44.</strong> Does GitOps require the target cluster to be reachable at all times for changes to eventually apply? — Yes, reconciliation can only happen once the agent can reach the API Server; disconnected clusters queue drift until reconnected.<br>
+<strong>45.</strong> What's a reasonable default reconciliation interval for a busy production environment? — Commonly a few minutes, balanced against control-plane load and desired drift-detection speed.<br>
+<strong>46.</strong> Why is "one repo, one source of truth" emphasized in GitOps practice? — Multiple disconnected sources of truth reintroduce the ambiguity GitOps is meant to eliminate about "what's actually supposed to be running."<br>
+<strong>47.</strong> What's the risk of manually running `helm upgrade` alongside a GitOps agent also managing the same release? — The two can conflict, each seeing the other's changes as drift to revert, causing a fight over desired state.<br>
+<strong>48.</strong> How does GitOps interact with multi-tenant clusters? — Each tenant's namespace/path is typically tracked by its own Application/Kustomization object with scoped RBAC, keeping tenants isolated.<br>
+<strong>49.</strong> What's a good incident-response step when a GitOps agent seems to be applying the wrong version? — Check which commit/revision it's currently tracking and whether the target path or branch reference is misconfigured.<br>
+<strong>50.</strong> What's the first thing to check when a change merged to the GitOps repo never shows up in the cluster? — Whether the GitOps agent's sync/poll is actually running and reaching the repo, and whether the reconciled path matches where the change was committed.
+</div></details>
+
+<footer class="course-footer">Next: Topic 49 — Argo CD, the most widely used GitOps controller for Kubernetes.</footer>
+
+<script>
+  mermaid.initialize({ startOnLoad: true, theme: 'dark' });
+</script>
+
+</body>
+</html>

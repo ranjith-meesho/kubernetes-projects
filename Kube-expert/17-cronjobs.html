@@ -1,0 +1,287 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Topic 17: CronJobs — Kubernetes Expert Course</title>
+<link rel="stylesheet" href="styles.css">
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+</head>
+<body>
+
+<header class="course-header">
+  <div class="kicker">Topic 17 of 70</div>
+  <h1>CronJobs</h1>
+  <div class="subtitle">Time-based scheduling for Jobs — cron syntax, concurrency control, and missed-schedule handling.</div>
+</header>
+
+<nav class="topic-nav">
+  <a href="16-jobs.html">&larr; Jobs</a>
+  <a href="index.html">Course Index</a>
+  <a href="18-services.html">Services &rarr;</a>
+</nav>
+
+<h2 id="explanation">Explanation</h2>
+<p>A <strong>CronJob</strong> creates <strong>Jobs</strong> on a recurring time-based schedule, using standard cron
+syntax. It is not a workload type of its own — it is purely a scheduling wrapper: at each tick that matches its
+schedule, the CronJob controller stamps out a new Job object from its embedded <code>jobTemplate</code>, and that
+Job then runs exactly like any other Job (completions, parallelism, backoffLimit all apply the same way).</p>
+
+<p>Kubernetes needs this because a huge share of batch/operational work is inherently periodic — nightly backups,
+hourly cache warmups, daily report emails, periodic cleanup of stale data. Without CronJobs, you'd need an external
+scheduler (a cron daemon somewhere, or a CI pipeline) just to call <code>kubectl create job</code> on a timer, adding
+an extra system and failure domain outside Kubernetes' own reconciliation model. A CronJob keeps scheduling
+itself as just another declarative object living in etcd, reconciled the same way as everything else.</p>
+
+<p>The schedule is a standard 5-field cron expression (<code>minute hour day-of-month month day-of-week</code>),
+evaluated in the CronJob controller's configured time zone (settable per-CronJob since <code>spec.timeZone</code>
+was added, avoiding the classic "cluster is UTC but ops team is IST" confusion). Because a controller could miss a
+tick (was down, cluster was under load), <code>startingDeadlineSeconds</code> bounds how late a missed run is still
+allowed to start — beyond that window, it's simply skipped and counted as a missed schedule rather than an infinite
+pile-up of catch-up runs.</p>
+
+<p><code>concurrencyPolicy</code> governs what happens if a previous run's Job is still active when the next
+scheduled time arrives: <code>Allow</code> (default — let them run concurrently), <code>Forbid</code> (skip the new
+run entirely if the old one is still active — critical for tasks that must never overlap, like a report that reads
+and rewrites the same file), or <code>Replace</code> (kill the still-running old Job and start the new one). Getting
+this setting wrong is one of the most common production CronJob bugs — e.g. an <code>Allow</code> nightly backup job
+whose runs occasionally overlap and corrupt a shared destination.</p>
+
+<p><code>successfulJobsHistoryLimit</code> / <code>failedJobsHistoryLimit</code> bound how many completed Job objects
+are kept around for inspection (defaults 3 and 1) — old ones beyond the limit are garbage collected automatically.</p>
+
+<h2 id="internal-working">Internal Working / Interactions</h2>
+<ul>
+  <li><strong>CronJob controller</strong> (in kube-controller-manager) — on every reconcile tick, computes whether
+  the schedule has fired since the last recorded run, and if so (and within <code>startingDeadlineSeconds</code> if
+  set), creates a new Job from <code>spec.jobTemplate</code>.</li>
+  <li><strong>Job controller</strong> — takes over from there exactly as with any manually created Job: creates
+  Pods, tracks completions/retries.</li>
+  <li><strong>API Server / etcd</strong> — CronJob spec/status, each generated Job, and their Pods are all ordinary
+  watched/persisted objects.</li>
+  <li><strong>concurrencyPolicy enforcement</strong> — the CronJob controller lists currently-active Jobs it owns
+  before creating a new one, and applies Allow/Forbid/Replace logic accordingly.</li>
+  <li><strong>History garbage collection</strong> — the controller deletes old completed/failed Job objects beyond
+  the configured history limits on each reconcile.</li>
+</ul>
+
+<h2 id="architecture-diagram">Architecture Diagram</h2>
+<pre class="mermaid">
+flowchart TB
+    CJ["CronJob: nightly-backup\nschedule: 0 2 * * *\nconcurrencyPolicy: Forbid"]
+    CJ -->|02:00 tick, no active Job| J1["Job: nightly-backup-28470870"]
+    J1 --> P1["Pod (runs backup script)"]
+    CJ -.->|02:00 next day, checks for active Jobs first| Check{Job still\nrunning?}
+    Check -->|Yes -> Forbid: skip| Skip["Run skipped, logged as missed"]
+    Check -->|No| J2["Job: nightly-backup-28486230"]
+</pre>
+
+<pre class="mermaid">
+sequenceDiagram
+    participant CJC as CronJob Controller
+    participant A as API Server
+    participant JC as Job Controller
+
+    loop Every reconcile tick
+        CJC->>CJC: Compare current time to cron schedule
+        alt Schedule fired & within startingDeadlineSeconds
+            CJC->>A: List active Jobs owned by this CronJob
+            alt concurrencyPolicy=Forbid & Job still active
+                CJC->>CJC: Skip this run, record missed schedule
+            else
+                CJC->>A: Create new Job from jobTemplate
+                A-->>JC: New Job object
+                JC->>A: Create Pods, track completions
+            end
+        end
+        CJC->>A: Garbage collect Jobs beyond history limits
+    end
+</pre>
+
+<h2 id="code-example">Code Example</h2>
+<pre><code>apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: nightly-backup
+spec:
+  schedule: "0 2 * * *"           # Standard cron: 02:00 every day.
+  timeZone: "Asia/Kolkata"        # Evaluate the schedule in IST, not cluster default (UTC).
+  concurrencyPolicy: Forbid       # Never run two backups concurrently — protects the shared destination.
+  startingDeadlineSeconds: 300    # If controller was down, only start a missed run within 5 minutes of schedule.
+  successfulJobsHistoryLimit: 3   # Keep last 3 successful Jobs for inspection.
+  failedJobsHistoryLimit: 5       # Keep more failed ones — useful for debugging.
+  jobTemplate:                    # Everything below is a normal Job spec.
+    spec:
+      backoffLimit: 2
+      activeDeadlineSeconds: 1800
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: backup
+              image: registry.internal/db-backup:1.0
+              command: ["/scripts/backup.sh"]
+              resources:
+                requests: { cpu: "250m", memory: "256Mi" }
+                limits:   { cpu: "500m", memory: "512Mi" }
+</code></pre>
+
+<h2 id="kubectl-commands">kubectl Commands</h2>
+<pre><code># List CronJobs and their schedule/last-run status
+kubectl get cronjobs
+
+# Show recent scheduling decisions and events
+kubectl describe cronjob nightly-backup
+
+# Manually trigger one run immediately, outside the schedule (great for testing)
+kubectl create job --from=cronjob/nightly-backup manual-test-run
+
+# See the Jobs a CronJob has created
+kubectl get jobs -l app.kubernetes.io/managed-by=cronjob-controller
+
+# Temporarily disable a CronJob without deleting it
+kubectl patch cronjob nightly-backup -p '{"spec":{"suspend":true}}'
+
+# Re-enable it
+kubectl patch cronjob nightly-backup -p '{"spec":{"suspend":false}}'
+
+# Tail logs of the most recent run's Pod
+kubectl logs -l job-name=$(kubectl get jobs -l app.kubernetes.io/managed-by=cronjob-controller -o jsonpath='{.items[-1:].metadata.name}')
+</code></pre>
+
+<h2 id="best-practices">Best Practices &amp; Common Pitfalls</h2>
+<div class="grid-2">
+<div>
+<h4>Best Practices</h4>
+<ul>
+  <li>Set <code>concurrencyPolicy: Forbid</code> for anything that mutates shared state — most backup/report jobs.</li>
+  <li>Always set <code>startingDeadlineSeconds</code> to avoid a storm of catch-up runs after a controller outage.</li>
+  <li>Set explicit <code>timeZone</code> rather than relying on cluster-default UTC for business-hour-sensitive jobs.</li>
+  <li>Use <code>spec.suspend: true</code> to pause a CronJob during maintenance instead of deleting it.</li>
+</ul>
+</div>
+<div>
+<h4>Pitfalls</h4>
+<ul>
+  <li>Leaving <code>concurrencyPolicy: Allow</code> (the default) on jobs that must never overlap.</li>
+  <li>Forgetting the underlying Job's <code>backoffLimit</code>/<code>activeDeadlineSeconds</code> still apply — a stuck CronJob run can block the next schedule under Forbid.</li>
+  <li>Not setting history limits, letting hundreds of old completed Jobs accumulate in etcd over months.</li>
+  <li>Assuming exactly-once execution — clock skew or controller restarts can occasionally cause a missed or (with Allow) overlapping run.</li>
+</ul>
+</div>
+</div>
+
+<h2 id="interview-questions">50 Interview Questions</h2>
+
+<details class="qa"><summary>1. What exactly does a CronJob object manage, and what doesn't it manage?</summary>
+<div class="qa-body"><strong>Short answer:</strong> It manages the schedule and creation of Job objects from a template — it is not itself a workload type, and it does not run containers directly.
+<br><strong>Detailed explanation:</strong> At each tick matching its cron schedule, the CronJob controller stamps out a new Job from <code>spec.jobTemplate</code>; from that point on, the ordinary Job controller and all Job semantics (completions, parallelism, backoffLimit) take over completely.
+<br><strong>Production example:</strong> A <code>nightly-backup</code> CronJob at 02:00 creates a Job named something like <code>nightly-backup-28470870</code>, which then behaves exactly like any manually created Job.
+<br><strong>Common mistake:</strong> Debugging a failed scheduled run by only looking at the CronJob object instead of inspecting the generated Job and its Pods.</div></details>
+
+<details class="qa"><summary>2. Why does Kubernetes need CronJobs instead of relying on an external cron daemon calling kubectl create job?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Keeping scheduling inside Kubernetes avoids introducing an extra system and failure domain outside the platform's own reconciliation model.
+<br><strong>Detailed explanation:</strong> An external scheduler would need its own credentials, availability guarantees, and monitoring — entirely separate from etcd/API Server state — whereas a CronJob is just another declarative object reconciled the same way as everything else.
+<br><strong>Production example:</strong> A CI pipeline calling <code>kubectl create job</code> on a timer would need its own uptime monitoring independent of the cluster; a CronJob's reliability is instead tied to kube-controller-manager's own HA.
+<br><strong>Common mistake:</strong> Building an external triggering system for periodic Kubernetes tasks when a CronJob already solves it natively.</div></details>
+
+<details class="qa"><summary>3. What problem does concurrencyPolicy: Forbid solve, and what commonly goes wrong without it?</summary>
+<div class="qa-body"><strong>Short answer:</strong> It prevents a new scheduled run from starting while a previous run's Job is still active — critical for tasks that must never overlap.
+<br><strong>Detailed explanation:</strong> The default policy, Allow, lets runs overlap freely; for a task that reads and rewrites a shared destination (like a backup or report file), overlapping runs can corrupt that shared state.
+<br><strong>Production example:</strong> A nightly-backup CronJob set to Forbid simply skips a run (and logs it as missed) if the previous night's backup Job hasn't finished yet, rather than running two backups concurrently against the same destination.
+<br><strong>Common mistake:</strong> Leaving the default Allow policy on a job that mutates shared state, only discovering the corruption after overlapping runs occur in production.</div></details>
+
+<details class="qa"><summary>4. What's the difference between concurrencyPolicy Forbid and Replace?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Forbid skips the new run entirely if the old one is still active; Replace kills the still-running old Job and starts the new one instead.
+<br><strong>Detailed explanation:</strong> Forbid preserves the in-progress work but sacrifices timeliness (the new schedule tick is simply missed); Replace prioritizes running the latest scheduled version but discards whatever progress the previous run had made.
+<br><strong>Production example:</strong> A cache-warmup CronJob might use Replace since only the freshest run matters, while a backup CronJob uses Forbid since a half-finished backup being killed mid-write would be worse than a skipped run.
+<br><strong>Common mistake:</strong> Using Replace for a task where a partially-completed previous run leaves the system in a bad intermediate state when killed.</div></details>
+
+<details class="qa"><summary>5. Why does startingDeadlineSeconds exist, and what happens without it?</summary>
+<div class="qa-body"><strong>Short answer:</strong> It bounds how late a missed scheduled run is still allowed to start; without it, a controller outage could otherwise cause an unbounded pile-up of catch-up runs once it recovers.
+<br><strong>Detailed explanation:</strong> If the CronJob controller itself was down or the cluster was under load for hours, on recovery it needs a rule for how many "missed" ticks to still honor versus simply skip — startingDeadlineSeconds is that rule.
+<br><strong>Production example:</strong> <code>startingDeadlineSeconds: 300</code> means if the controller was down for 3 hours, only a run within the last 5 minutes of the outage's end is still attempted — the rest are logged as missed schedules, not queued up.
+<br><strong>Common mistake:</strong> Leaving it unset and assuming Kubernetes automatically avoids catch-up storms — behavior without an explicit deadline can still result in unexpected missed/skipped run handling depending on version and load.</div></details>
+
+<details class="qa"><summary>6. Why is spec.timeZone important, and what problem did it solve?</summary>
+<div class="qa-body"><strong>Short answer:</strong> It lets a CronJob's schedule be evaluated in a specific time zone rather than the cluster's default (commonly UTC), avoiding the classic "cluster is UTC but ops team is IST" confusion.
+<br><strong>Detailed explanation:</strong> Before per-CronJob timeZone existed, teams had to manually offset cron expressions to account for UTC, which was error-prone and broke silently across daylight-saving transitions in some regions.
+<br><strong>Production example:</strong> <code>timeZone: "Asia/Kolkata"</code> on a nightly-backup CronJob ensures "02:00" genuinely means 2 AM IST, not 2 AM UTC (7:30 AM IST).
+<br><strong>Common mistake:</strong> Writing a schedule assuming local business hours without setting timeZone, causing the job to run at an unintended UTC-shifted time.</div></details>
+
+<details class="qa"><summary>7. What do successfulJobsHistoryLimit and failedJobsHistoryLimit control, and why keep more failed history than successful?</summary>
+<div class="qa-body"><strong>Short answer:</strong> They bound how many completed Job objects are retained for inspection; failed runs are often worth keeping longer for debugging than routine successes.
+<br><strong>Detailed explanation:</strong> Old Jobs beyond these limits are automatically garbage collected by the CronJob controller on each reconcile, preventing unbounded accumulation of historical Job objects in etcd.
+<br><strong>Production example:</strong> <code>successfulJobsHistoryLimit: 3, failedJobsHistoryLimit: 5</code> keeps more failure evidence around since failures are rarer and more valuable to investigate than routine successful runs.
+<br><strong>Common mistake:</strong> Not setting history limits at all, letting hundreds of old completed Jobs accumulate in etcd over months of daily runs.</div></details>
+
+<details class="qa"><summary>8. How would you manually trigger an out-of-schedule run of a CronJob for testing?</summary>
+<div class="qa-body"><strong>Short answer:</strong> <code>kubectl create job --from=cronjob/&lt;name&gt; &lt;manual-run-name&gt;</code>, which copies the jobTemplate into a fresh, immediately-created Job.
+<br><strong>Detailed explanation:</strong> This is the standard way to test a CronJob's actual behavior without waiting for its schedule to fire, and it produces an ordinary Job indistinguishable in behavior from a normally-scheduled one.
+<br><strong>Production example:</strong> Before trusting a new nightly-backup CronJob's first scheduled run, an engineer manually triggers it once during business hours to verify it succeeds and inspect the resulting Job's logs.
+<br><strong>Common mistake:</strong> Editing the CronJob's schedule temporarily to "run soon" for testing instead of just using the --from=cronjob shortcut.</div></details>
+
+<details class="qa"><summary>9. What's the effect of spec.suspend: true on a CronJob, and how does it differ from deleting it?</summary>
+<div class="qa-body"><strong>Short answer:</strong> It pauses future scheduled runs without deleting the CronJob object, its configuration, or its history — deleting would remove all of that permanently.
+<br><strong>Detailed explanation:</strong> Suspend is the correct mechanism for temporarily halting a CronJob during a maintenance window, since the object (and any already-running Jobs) remains intact and can be un-suspended instantly.
+<br><strong>Production example:</strong> <code>kubectl patch cronjob nightly-backup -p '{"spec":{"suspend":true}}'</code> pauses backups during a planned database migration, then <code>suspend:false</code> resumes the normal schedule afterward.
+<br><strong>Common mistake:</strong> Deleting and later recreating a CronJob to "pause" it, losing its Job history and needing to redefine it from scratch.</div></details>
+
+<details class="qa"><summary>10. Why does the CronJob controller need to list currently-active Jobs before creating a new one?</summary>
+<div class="qa-body"><strong>Short answer:</strong> To correctly enforce concurrencyPolicy — it must know whether a previous run is still active before deciding to Allow, Forbid, or Replace the new one.
+<br><strong>Detailed explanation:</strong> This list operation happens on every reconcile tick where the schedule has fired, since the concurrency decision fundamentally depends on real-time knowledge of currently-running Jobs the CronJob owns.
+<br><strong>Production example:</strong> With Forbid set, the controller's list-then-decide step is exactly what causes a skipped (not queued) run when the prior night's Job is still executing at the next scheduled tick.
+<br><strong>Common mistake:</strong> Assuming concurrencyPolicy is enforced by some separate locking mechanism rather than a straightforward "check active Jobs, then decide" step inside the controller's own reconcile loop.</div></details>
+
+<details class="qa"><summary>11–50. Additional rapid-fire questions</summary>
+<div class="qa-body">
+<strong>11.</strong> What API group/version is CronJob under? — <code>batch/v1</code>.<br>
+<strong>12.</strong> What's the standard cron expression field order? — minute hour day-of-month month day-of-week.<br>
+<strong>13.</strong> What does the schedule "0 2 * * *" mean? — Every day at 02:00.<br>
+<strong>14.</strong> Does concurrencyPolicy Allow guarantee overlapping runs never cause problems? — No — it just permits overlap; correctness depends entirely on the workload tolerating concurrent execution.<br>
+<strong>15.</strong> What's the default concurrencyPolicy if unset? — Allow.<br>
+<strong>16.</strong> Can a suspended CronJob still be manually triggered via --from=cronjob? — Yes — suspend only blocks the automatic schedule, not manual Job creation from its template.<br>
+<strong>17.</strong> What happens to already-running Jobs when you suspend a CronJob? — They continue running to completion; suspend only prevents new scheduled runs from starting.<br>
+<strong>18.</strong> How do you find the Jobs a specific CronJob created? — <code>kubectl get jobs -l app.kubernetes.io/managed-by=cronjob-controller</code> or by checking ownerReferences.<br>
+<strong>19.</strong> Is CronJob namespaced or cluster-scoped? — Namespaced.<br>
+<strong>20.</strong> What happens if you delete a CronJob? — By default its owned Jobs (and their Pods) are cascade-deleted too.<br>
+<strong>21.</strong> Does a CronJob support activeDeadlineSeconds? — Indirectly — it's set inside jobTemplate.spec, applying to each generated Job individually.<br>
+<strong>22.</strong> Can startingDeadlineSeconds and concurrencyPolicy interact in a confusing way? — Yes — a missed run within the deadline might still be skipped anyway if concurrencyPolicy is Forbid and a prior run is active.<br>
+<strong>23.</strong> What's a subtle gotcha with concurrencyPolicy: Forbid and a stuck previous Job? — A hung Job blocks every subsequent scheduled run indefinitely until its own backoffLimit/activeDeadlineSeconds finally ends it.<br>
+<strong>24.</strong> Why is it important to set activeDeadlineSeconds on the underlying Job template for Forbid CronJobs? — Without it, one stuck run can silently block all future scheduled runs with no automatic recovery.<br>
+<strong>25.</strong> What's the risk of setting failedJobsHistoryLimit to 0? — You lose all evidence of failed runs immediately after they're garbage collected, hampering debugging.<br>
+<strong>26.</strong> Does CronJob support the same restartPolicy rules as Job? — Yes — the jobTemplate.spec.template.spec.restartPolicy must still be OnFailure or Never.<br>
+<strong>27.</strong> Can you change a CronJob's schedule without recreating it? — Yes — <code>spec.schedule</code> is mutable; the next reconcile picks up the new schedule going forward.<br>
+<strong>28.</strong> What happens to already-scheduled-but-not-yet-fired ticks when you change the schedule? — They're simply recalculated based on the new schedule from that point forward — no special migration needed.<br>
+<strong>29.</strong> Is there a way to see a CronJob's "last successful run" time? — Yes — <code>status.lastSuccessfulTime</code> (and <code>status.lastScheduleTime</code> for the last scheduling attempt).<br>
+<strong>30.</strong> What's a good practice before relying on a new CronJob in production? — Manually trigger it once via --from=cronjob to validate the jobTemplate actually succeeds end to end.<br>
+<strong>31.</strong> Why might clock skew across nodes matter for CronJob scheduling? — The CronJob controller's own clock (in kube-controller-manager) drives scheduling decisions — skew there, not on worker nodes, is what could cause off-schedule runs.<br>
+<strong>32.</strong> Can two CronJobs share the same jobTemplate content safely? — Yes — they're independent objects; sharing template content causes no conflict since each generates its own separately-named Jobs.<br>
+<strong>33.</strong> What field would tell you if a CronJob missed its schedule due to controller downtime? — Comparing <code>status.lastScheduleTime</code> against the expected schedule times reveals gaps.<br>
+<strong>34.</strong> Does a CronJob retry a missed schedule automatically once startingDeadlineSeconds passes? — No — once beyond the deadline, that specific missed run is simply skipped, not queued for later.<br>
+<strong>35.</strong> What's the interaction between CronJob and leader election in kube-controller-manager? — Only the active (elected leader) controller-manager instance evaluates and fires CronJob schedules, avoiding duplicate-run races across HA control planes.<br>
+<strong>36.</strong> Why would a team choose an external workflow engine (e.g. Argo Workflows) over CronJob for complex batch pipelines? — CronJob only creates one Job per tick with no built-in multi-step dependency/DAG orchestration between steps.<br>
+<strong>37.</strong> What's a realistic incident caused by Allow concurrencyPolicy on a report job? — Two concurrent runs both read-modify-write the same output file, corrupting or truncating the final report.<br>
+<strong>38.</strong> How would you debug a CronJob that never seems to fire? — Check <code>kubectl describe cronjob</code> for schedule parsing errors, confirm it isn't suspended, and check controller-manager logs for the leader's health.<br>
+<strong>39.</strong> Can a CronJob's jobTemplate reference a ConfigMap for its schedule-sensitive config? — Yes — same as any Job, via volume mounts or env vars in the Pod template.<br>
+<strong>40.</strong> What's the effect of a very tight schedule (e.g. every minute) combined with a slow job and Forbid? — Most ticks get skipped since the previous run is almost always still active when the next one would fire.<br>
+<strong>41.</strong> Why should ttlSecondsAfterFinished still be considered on the jobTemplate even with history limits set? — History limits bound Job *object* count, but TTL provides faster, time-based cleanup independent of run frequency.<br>
+<strong>42.</strong> What happens to in-flight Jobs if the whole CronJob controller crashes mid-tick? — Already-created Jobs continue running under the ordinary Job controller; only the CronJob's own scheduling/bookkeeping is paused until the controller recovers.<br>
+<strong>43.</strong> Is a CronJob's schedule field validated at creation time? — Yes — the API Server validates cron syntax and rejects malformed expressions immediately.<br>
+<strong>44.</strong> What's a good monitoring signal specifically for CronJobs? — Alerting on <code>status.lastScheduleTime</code> falling too far behind the expected interval, indicating missed or stuck runs.<br>
+<strong>45.</strong> Can a CronJob's generated Job names collide? — No — each generated Job gets a unique, timestamp-derived suffix appended to the CronJob name.<br>
+<strong>46.</strong> What's the difference between a "missed schedule" and a "failed Job" from a CronJob's perspective? — A missed schedule means no Job was even created for that tick (deadline/concurrency skip); a failed Job means one was created but its Pods ultimately failed.<br>
+<strong>47.</strong> Why is Forbid often the safer default for unfamiliar/new batch workloads? — It fails safe by skipping rather than risking silent data corruption from unexpected overlap, until the workload's concurrency-safety is proven.<br>
+<strong>48.</strong> Does suspending a CronJob affect its history/garbage collection? — No — history limits and TTL cleanup for already-completed Jobs continue to apply normally even while suspended.<br>
+<strong>49.</strong> What's a common mistake when migrating an existing cron-based script into a CronJob? — Forgetting the script needs to tolerate at-least-once execution (Job semantics), same idempotency concern as plain Jobs.<br>
+<strong>50.</strong> What's the first thing to check when a CronJob appears to have stopped running entirely? — Confirm <code>spec.suspend</code> is false, then check <code>status.lastScheduleTime</code> and controller-manager health/leader election.
+</div></details>
+
+<footer class="course-footer">Next: Topic 18 — Services, for stable networking to a dynamic set of Pods.</footer>
+
+<script>
+  mermaid.initialize({ startOnLoad: true, theme: 'dark' });
+</script>
+
+</body>
+</html>

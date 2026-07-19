@@ -1,0 +1,328 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Topic 37: Horizontal Pod Autoscaler (HPA) — Kubernetes Expert Course</title>
+<link rel="stylesheet" href="styles.css">
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+</head>
+<body>
+
+<header class="course-header">
+  <div class="kicker">Topic 37 of 70</div>
+  <h1>Horizontal Pod Autoscaler (HPA)</h1>
+  <div class="subtitle">Automatically scaling replica count up and down based on observed metrics, closing the loop between load and capacity.</div>
+</header>
+
+<nav class="topic-nav">
+  <a href="36-resource-management.html">&larr; Resource Management</a>
+  <a href="index.html">Course Index</a>
+  <a href="38-vpa.html">VPA &rarr;</a>
+</nav>
+
+<h2 id="explanation">Explanation</h2>
+<p>The <strong>Horizontal Pod Autoscaler (HPA)</strong> is a control loop that automatically adjusts the
+<code>replicas</code> count of a Deployment, ReplicaSet, or StatefulSet based on observed metrics — most commonly CPU
+or memory utilization, but also custom and external metrics (queue depth, requests-per-second, etc.). It is
+"horizontal" because it scales by adding/removing whole Pod replicas, in contrast to the Vertical Pod Autoscaler
+(topic 38), which resizes the resources of existing Pods.</p>
+
+<p>Kubernetes needs HPA because static replica counts are either wasteful (provisioned for peak load, idle most of the
+time) or risky (provisioned for average load, falls over during spikes). HPA closes the loop: it continuously
+compares current metric values against a target, computes how many replicas would be needed to bring the metric back
+to target, and updates the workload's replica count — turning capacity planning from a manual, reactive process into
+an automatic, continuous one.</p>
+
+<p>Architecturally, HPA is itself just a controller — <code>HorizontalPodAutoscaler</code> is a Kubernetes API object,
+and the control loop runs inside the Controller Manager (or as a separate controller in some distributions), polling
+on a fixed interval (default 15s, controlled by <code>--horizontal-pod-autoscaler-sync-period</code>). It does not
+collect metrics itself — it depends entirely on the <strong>metrics APIs</strong>: the resource metrics API
+(<code>metrics.k8s.io</code>, served by <strong>metrics-server</strong>) for CPU/memory, and the custom/external
+metrics APIs (typically backed by Prometheus Adapter or a cloud provider's metrics adapter) for anything else. Without
+metrics-server installed, HPA cannot function at all for CPU/memory-based scaling — this is one of the most common
+"HPA shows &lt;unknown&gt; targets" support issues.</p>
+
+<p>The core scaling formula HPA uses is: <code>desiredReplicas = ceil(currentReplicas * (currentMetricValue / desiredMetricValue))</code>.
+For example, if 4 replicas are averaging 80% CPU against a target of 50%, HPA computes <code>ceil(4 * (80/50)) = 7</code>
+replicas. HPA also applies stabilization windows and scale-up/scale-down policies (<code>behavior</code> field) to
+avoid flapping — rapidly scaling up and down in response to noisy, short-lived metric spikes.</p>
+
+<p>In production, HPA is almost always paired with well-set <strong>resource requests</strong> (topic 36) — CPU-based
+HPA computes utilization as a percentage of the Pod's <em>request</em>, not its limit, so an incorrectly-set request
+directly skews scaling decisions. It's also common to combine HPA with the Cluster Autoscaler (topic 39): HPA decides
+how many Pods are needed, Cluster Autoscaler decides whether the cluster has enough nodes to actually place them.</p>
+
+<div class="callout warn">
+  <strong>Common trap:</strong> HPA cannot scale a workload with no resource requests set for CPU — it has nothing to
+  compute a percentage against, and the target shows <code>&lt;unknown&gt;</code> forever. Always set CPU requests on
+  any Deployment you intend to autoscale.
+</div>
+
+<h2 id="internal-working">Internal Working / Interactions</h2>
+<ul>
+  <li><strong>metrics-server:</strong> scrapes kubelet's <code>/stats/summary</code> (cAdvisor-derived) endpoint on every node every ~15-60s and exposes aggregated CPU/memory usage via the <code>metrics.k8s.io</code> API — the resource metrics API HPA queries for CPU/memory targets.</li>
+  <li><strong>Prometheus Adapter (or similar):</strong> exposes custom (<code>custom.metrics.k8s.io</code>) and external (<code>external.metrics.k8s.io</code>) metrics APIs backed by Prometheus queries, for non-resource metrics like queue length or request rate.</li>
+  <li><strong>HPA controller:</strong> polls the relevant metrics API on its sync period, computes desired replicas per the scaling formula, and applies stabilization/behavior policies before acting.</li>
+  <li><strong>API Server:</strong> HPA controller PATCHes the target Deployment/StatefulSet's <code>spec.replicas</code> via the API Server, exactly like a human running <code>kubectl scale</code>.</li>
+  <li><strong>Deployment/ReplicaSet controller:</strong> reacts to the new replica count exactly as it would to a manual scale — creates or deletes Pods, which then flow through the normal Scheduler/kubelet pipeline.</li>
+  <li><strong>Cluster Autoscaler:</strong> if new HPA-triggered Pods can't fit on existing nodes, they go Pending, which triggers Cluster Autoscaler to add capacity (topic 39) — the two systems are decoupled but chained.</li>
+</ul>
+
+<h2 id="architecture-diagram">Architecture Diagram</h2>
+<pre class="mermaid">
+flowchart LR
+    KL["kubelet / cAdvisor\n(per-node CPU & memory stats)"] --> MS["metrics-server"]
+    PROM["Prometheus"] --> PA["Prometheus Adapter"]
+    MS -->|"metrics.k8s.io"| HPA["HPA Controller"]
+    PA -->|"custom.metrics.k8s.io"| HPA
+    HPA -->|"1. Read current metric value"| HPA
+    HPA -->|"2. Compute desiredReplicas"| HPA
+    HPA -->|"3. PATCH spec.replicas"| API["API Server"]
+    API --> DEP["Deployment Controller"]
+    DEP -->|"Create/delete pods"| SCHED["Scheduler"]
+</pre>
+
+<pre class="mermaid">
+sequenceDiagram
+    participant K as kubelet/cAdvisor
+    participant M as metrics-server
+    participant H as HPA Controller
+    participant A as API Server
+    participant D as Deployment Controller
+
+    loop every 15s (sync period)
+        H->>M: GET metrics.k8s.io (CPU usage for target pods)
+        M->>K: Scrape /stats/summary
+        K-->>M: Usage data
+        M-->>H: Aggregated CPU utilization = 80%
+        H->>H: desiredReplicas = ceil(4 * 80/50) = 7
+        H->>A: PATCH deployment/checkout replicas=7
+        A->>D: Watch fires - reconcile to 7 replicas
+        D->>A: Create 3 new pod objects
+    end
+</pre>
+
+<h2 id="code-example">Code Example</h2>
+<pre><code>apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: checkout-hpa
+  namespace: payments
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: checkout-service        # must have CPU requests set on its pod template
+  minReplicas: 3                  # never scale below this, even at zero load
+  maxReplicas: 20                 # hard ceiling regardless of metric pressure
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 50   # target 50% of requested CPU across all pods
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 70
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300   # wait 5 min of sustained low usage before scaling down
+      policies:
+        - type: Pods
+          value: 2                        # remove at most 2 pods per step
+          periodSeconds: 60
+    scaleUp:
+      stabilizationWindowSeconds: 0       # scale up immediately, no delay
+      policies:
+        - type: Percent
+          value: 100                      # can double replica count per step
+          periodSeconds: 60
+</code></pre>
+
+<pre><code>apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: checkout-hpa-custom
+  namespace: payments
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: checkout-service
+  minReplicas: 3
+  maxReplicas: 30
+  metrics:
+    - type: External                       # external metric from Prometheus Adapter, e.g. SQS queue depth
+      external:
+        metric:
+          name: sqs_queue_messages_visible
+          selector:
+            matchLabels:
+              queue: checkout-orders
+        target:
+          type: AverageValue
+          averageValue: "30"                # aim for ~30 messages per replica
+</code></pre>
+
+<h2 id="kubectl-commands">kubectl Commands</h2>
+<pre><code># Create an HPA imperatively (quick testing)
+kubectl autoscale deployment checkout-service --cpu-percent=50 --min=3 --max=20
+
+# View current HPA status - current vs target metric, replica count
+kubectl get hpa -n payments
+
+# Detailed view including scaling events
+kubectl describe hpa checkout-hpa -n payments
+
+# Check whether metrics-server is installed and reporting
+kubectl top pods -n payments
+kubectl get apiservices | grep metrics
+
+# Watch replica count change live during a load test
+kubectl get deployment checkout-service -n payments -w
+
+# List available custom/external metrics (if Prometheus Adapter installed)
+kubectl get --raw "/apis/custom.metrics.k8s.io/v1beta1" | jq .
+</code></pre>
+
+<h2 id="best-practices">Best Practices &amp; Common Pitfalls</h2>
+<div class="grid-2">
+<div>
+<h4>Do's</h4>
+<ul>
+  <li>Always set CPU requests on any workload targeted by HPA — utilization is computed as a percentage of the request.</li>
+  <li>Set sensible <code>minReplicas</code> for baseline availability, not 1, for anything customer-facing.</li>
+  <li>Use <code>behavior</code> stabilization windows to prevent flapping on noisy metrics.</li>
+  <li>Prefer external/custom metrics (queue depth, RPS) over CPU alone for workloads where CPU doesn't correlate well with load.</li>
+</ul>
+</div>
+<div>
+<h4>Don'ts</h4>
+<ul>
+  <li>Don't set <code>maxReplicas</code> without checking cluster/node-group capacity — HPA will happily request more pods than the cluster can schedule.</li>
+  <li>Don't combine HPA and VPA on the same metric (e.g. both managing CPU) without care — they can fight each other.</li>
+  <li>Don't forget HPA needs metrics-server (or an adapter) running and healthy — silent <code>&lt;unknown&gt;</code> targets mean no scaling happens at all.</li>
+  <li>Don't set overly aggressive scale-down stabilization windows for cost-sensitive batch-like workloads — you'll pay for idle capacity longer than necessary.</li>
+</ul>
+</div>
+</div>
+
+<h2 id="interview-questions">50 Interview Questions</h2>
+
+<details class="qa"><summary>1. What is HPA and why is it called "horizontal"?</summary>
+<div class="qa-body"><strong>Short answer:</strong> A control loop that adjusts a workload's replica count based on observed metrics — "horizontal" because it scales by adding/removing whole Pod replicas, not resizing existing ones.
+<br><strong>Detailed explanation:</strong> This contrasts with VPA (topic 38), which is "vertical" — it resizes the resource requests/limits of existing Pods instead of changing how many there are.
+<br><strong>Production example:</strong> checkout-hpa scales the checkout-service Deployment between 3 and 20 replicas based on CPU utilization.
+<br><strong>Common mistake:</strong> Confusing HPA and VPA's axes of scaling — one changes Pod count, the other changes Pod size.</div></details>
+
+<details class="qa"><summary>2. Why can't HPA function for CPU/memory scaling without metrics-server?</summary>
+<div class="qa-body"><strong>Short answer:</strong> HPA doesn't collect metrics itself — it depends entirely on the resource metrics API (<code>metrics.k8s.io</code>), which is served by metrics-server.
+<br><strong>Detailed explanation:</strong> Without metrics-server installed and healthy, HPA has no data source for CPU/memory targets, resulting in the classic "<unknown>" target symptom.
+<br><strong>Production example:</strong> A fresh cluster without metrics-server showed every HPA's current CPU value as <code>&lt;unknown&gt;</code> until it was installed.
+<br><strong>Common mistake:</strong> Assuming HPA has some built-in metrics collection — it's purely a consumer of the metrics APIs, never a producer.</div></details>
+
+<details class="qa"><summary>3. Walk through the HPA scaling formula with an example.</summary>
+<div class="qa-body"><strong>Short answer:</strong> <code>desiredReplicas = ceil(currentReplicas * (currentMetricValue / desiredMetricValue))</code>.
+<br><strong>Detailed explanation:</strong> With 4 replicas averaging 80% CPU against a 50% target: <code>ceil(4 * (80/50)) = 7</code> replicas — the formula scales proportionally to how far current usage is from target.
+<br><strong>Production example:</strong> checkout-hpa recomputes this every 15s (the default sync period) against live metrics-server data.
+<br><strong>Common mistake:</strong> Assuming HPA scales by a fixed step count rather than proportionally to the ratio between current and target metric value.</div></details>
+
+<details class="qa"><summary>4. Why does CPU-based HPA require accurate resource requests to work correctly?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Utilization is computed as a percentage of the Pod's *request*, not its limit — an incorrectly-set request directly skews scaling decisions.
+<br><strong>Detailed explanation:</strong> If the request is set too low, a small absolute usage increase appears as a huge percentage spike, causing premature/excessive scale-up; too high, and real load never appears to cross the target.
+<br><strong>Production example:</strong> A Deployment with an artificially low CPU request scaled to maxReplicas almost immediately under modest load because utilization percentage was distorted.
+<br><strong>Common mistake:</strong> Deploying HPA on a workload without first validating its CPU request reflects realistic baseline usage.</div></details>
+
+<details class="qa"><summary>5. What's the difference between resource, custom, and external metrics in HPA?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Resource metrics (CPU/memory) come from metrics-server via <code>metrics.k8s.io</code>; custom and external metrics come from an adapter (typically Prometheus Adapter) via <code>custom.metrics.k8s.io</code>/<code>external.metrics.k8s.io</code>.
+<br><strong>Detailed explanation:</strong> Custom metrics are tied to a Kubernetes object (e.g. Pod-level requests-per-second); external metrics originate outside the cluster entirely (e.g. an SQS queue depth).
+<br><strong>Production example:</strong> checkout-hpa-custom scales on <code>sqs_queue_messages_visible</code>, an external metric from Prometheus Adapter reflecting queue backlog, not CPU at all.
+<br><strong>Common mistake:</strong> Assuming all non-CPU/memory metrics are automatically available — they require deploying and correctly configuring an adapter first.</div></details>
+
+<details class="qa"><summary>6. How does the <code>behavior</code> field prevent flapping?</summary>
+<div class="qa-body"><strong>Short answer:</strong> It defines separate stabilization windows and scale-up/scale-down policies so HPA doesn't rapidly oscillate replica count in response to noisy, short-lived metric spikes.
+<br><strong>Detailed explanation:</strong> A scale-down stabilization window (e.g. 300s) requires sustained low usage before removing replicas, while scale-up can be configured to react immediately since under-provisioning is usually riskier than over-provisioning briefly.
+<br><strong>Production example:</strong> checkout-hpa sets <code>scaleDown.stabilizationWindowSeconds: 300</code> with a max of 2 pods removed per 60s, but <code>scaleUp.stabilizationWindowSeconds: 0</code> for immediate response to spikes.
+<br><strong>Common mistake:</strong> Setting overly aggressive scale-down stabilization windows for cost-sensitive batch-like workloads, paying for idle capacity longer than necessary.</div></details>
+
+<details class="qa"><summary>7. How do HPA and Cluster Autoscaler interact in production?</summary>
+<div class="qa-body"><strong>Short answer:</strong> HPA decides how many Pods are needed; Cluster Autoscaler decides whether the cluster has enough nodes to place them — they're chained, not directly coupled.
+<br><strong>Detailed explanation:</strong> If HPA-triggered Pods can't fit on existing nodes, they go Pending, which is the signal Cluster Autoscaler reacts to by adding capacity (topic 39). This chain has real latency — cloud instance boot time is often the dominant factor (1-3 minutes), motivating headroom buffers or placeholder Pods.
+<br><strong>Production example:</strong> A load spike triggered HPA to request 10 more replicas; 4 went Pending until Cluster Autoscaler added 2 nodes roughly 90 seconds later.
+<br><strong>Common mistake:</strong> Assuming HPA scaling is instantaneous end-to-end when the cluster lacks headroom — the Cluster Autoscaler chain adds real, sometimes multi-minute, latency.</div></details>
+
+<details class="qa"><summary>8. What is the risk of running HPA and VPA on the same metric for the same workload?</summary>
+<div class="qa-body"><strong>Short answer:</strong> They can fight each other — VPA changing a Pod's CPU request changes the denominator HPA uses for utilization, causing instability.
+<br><strong>Detailed explanation:</strong> This is why the best-practice pattern is to have HPA scale on CPU/memory OR let VPA manage sizing while HPA scales on an unrelated custom/external metric — never both governing the same resource dimension simultaneously.
+<br><strong>Production example:</strong> A workload with both HPA (CPU) and VPA (CPU, Auto mode) enabled churned replicas erratically until VPA was switched to Off mode.
+<br><strong>Common mistake:</strong> Enabling VPA in Auto mode on a workload already scaled by CPU-based HPA without redesigning which controller owns which dimension.</div></details>
+
+<details class="qa"><summary>9. Where does the HPA control loop actually run, and how often does it evaluate?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Inside the Controller Manager (or a separate controller in some distributions), polling on a fixed interval — default 15s via <code>--horizontal-pod-autoscaler-sync-period</code>.
+<br><strong>Detailed explanation:</strong> HorizontalPodAutoscaler is itself just a Kubernetes API object; the controller watches it, queries the relevant metrics API each sync period, and PATCHes the target's <code>spec.replicas</code> exactly like a manual <code>kubectl scale</code>.
+<br><strong>Production example:</strong> Lowering the sync period cluster-wide would make every HPA in the cluster react faster, at the cost of more frequent metrics API load.
+<br><strong>Common mistake:</strong> Assuming HPA reacts instantly to metric changes rather than on its fixed sync-period cadence.</div></details>
+
+<details class="qa"><summary>10. How would you troubleshoot an HPA stuck showing "<unknown>" for its target metric?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Check whether metrics-server (or the relevant adapter) is installed and healthy, and confirm the target Deployment has resource requests set.
+<br><strong>Detailed explanation:</strong> <code>kubectl describe hpa</code> shows the exact metric and its current status; <code>kubectl top pods</code> and <code>kubectl get apiservices | grep metrics</code> confirm whether the underlying metrics pipeline is even functioning.
+<br><strong>Production example:</strong> An HPA showed <unknown> targets for a week because metrics-server's pod was CrashLoopBackOff from a resource limit misconfiguration.
+<br><strong>Common mistake:</strong> Debugging the HPA object itself first instead of first verifying the metrics pipeline it depends on is healthy.</div></details>
+
+<details class="qa"><summary>11–50. Additional rapid-fire questions</summary>
+<div class="qa-body">
+<strong>11.</strong> What API version is used for a modern HPA object with multiple metric types? — <code>autoscaling/v2</code>.<br>
+<strong>12.</strong> What field sets the absolute floor on replica count? — <code>minReplicas</code>.<br>
+<strong>13.</strong> What field sets the absolute ceiling on replica count? — <code>maxReplicas</code>.<br>
+<strong>14.</strong> What's the risk of setting maxReplicas without checking cluster capacity? — HPA will happily request more Pods than the cluster can schedule, leaving many Pending.<br>
+<strong>15.</strong> What's the quick imperative way to create an HPA for testing? — <code>kubectl autoscale deployment &lt;name&gt; --cpu-percent=50 --min=3 --max=20</code>.<br>
+<strong>16.</strong> What command shows current vs target metric and replica count? — <code>kubectl get hpa</code>.<br>
+<strong>17.</strong> What command shows detailed scaling event history for an HPA? — <code>kubectl describe hpa &lt;name&gt;</code>.<br>
+<strong>18.</strong> What API group serves custom metrics? — <code>custom.metrics.k8s.io</code>.<br>
+<strong>19.</strong> What API group serves external metrics? — <code>external.metrics.k8s.io</code>.<br>
+<strong>20.</strong> What's the recommended minReplicas for a customer-facing service instead of 1? — A value providing baseline availability across failure domains, not just 1.<br>
+<strong>21.</strong> Why should you prefer external/custom metrics over CPU for some workloads? — Because CPU doesn't always correlate well with real load (e.g. I/O-bound or queue-driven workloads).<br>
+<strong>22.</strong> What happens if the target Deployment has no CPU request set at all? — HPA can't compute a percentage against it — the target shows <unknown> forever.<br>
+<strong>23.</strong> What's the default HPA sync period? — 15 seconds.<br>
+<strong>24.</strong> What flag controls the HPA sync period? — <code>--horizontal-pod-autoscaler-sync-period</code>.<br>
+<strong>25.</strong> Does HPA collect metrics itself? — No, it queries the metrics APIs; it has no built-in scraping mechanism.<br>
+<strong>26.</strong> What component actually scrapes kubelet's stats for metrics-server? — metrics-server itself, hitting kubelet's <code>/stats/summary</code> (cAdvisor-derived) endpoint.<br>
+<strong>27.</strong> How does the Deployment controller react to an HPA-driven replica change? — Exactly as it would to a manual scale — creating or deleting Pods through the normal pipeline.<br>
+<strong>28.</strong> What's the relationship between HPA and StatefulSets? — HPA can target StatefulSets too, not just Deployments/ReplicaSets.<br>
+<strong>29.</strong> What's a realistic external metric example for a queue-based worker? — SQS queue depth (<code>sqs_queue_messages_visible</code>), scaling replicas to match backlog per worker.<br>
+<strong>30.</strong> What does <code>averageValue</code> mean in an External metric target? — The target average value per Pod (e.g. "aim for ~30 messages per replica").<br>
+<strong>31.</strong> Why is CPU-based HPA sometimes a poor fit for I/O-bound services? — Because CPU usage may stay flat even under heavy real load (e.g. waiting on network/disk), masking the actual need to scale.<br>
+<strong>32.</strong> What's the interaction between HPA and rolling updates? — HPA can scale a Deployment mid-rollout; the Deployment controller reconciles both the replica count and the rollout strategy simultaneously.<br>
+<strong>33.</strong> How do you check if metrics-server's API is registered? — <code>kubectl get apiservices | grep metrics</code>.<br>
+<strong>34.</strong> What's a sign that an HPA is flapping? — Rapid alternating scale-up/scale-down events visible in <code>kubectl describe hpa</code>'s event history.<br>
+<strong>35.</strong> What's the purpose of separate scaleUp and scaleDown behavior blocks? — To apply different aggressiveness/stabilization to growing vs shrinking replica count, since the risk profiles differ.<br>
+<strong>36.</strong> What's a common cost-optimization tradeoff with scale-down stabilization windows? — Longer windows avoid flapping but pay for idle capacity longer; shorter windows save cost but risk premature scale-down on noisy metrics.<br>
+<strong>37.</strong> Does HPA work without any resource requests set, using only external metrics? — Yes — external/custom metrics don't require CPU/memory requests, only resource-type metrics do.<br>
+<strong>38.</strong> What's the risk of combining HPA and Cluster Autoscaler without headroom planning? — Scale-up latency compounds — HPA creates Pods instantly, but they stay Pending until Cluster Autoscaler provisions and boots new nodes.<br>
+<strong>39.</strong> How would you watch replica count change live during a load test? — <code>kubectl get deployment &lt;name&gt; -w</code>.<br>
+<strong>40.</strong> What's the significance of HPA being "just a controller" architecturally? — It reinforces that HorizontalPodAutoscaler is an ordinary API object reconciled like any other resource, not a special built-in mechanism.<br>
+<strong>41.</strong> What's the danger of not setting any behavior/stabilization config at all? — HPA falls back to Kubernetes' defaults, which may not suit noisy or bursty workloads, risking flapping.<br>
+<strong>42.</strong> Can HPA scale to zero replicas? — No, standard HPA respects a minReplicas floor of at least 1 in typical configurations; scale-to-zero requires additional tooling (e.g. KEDA).<br>
+<strong>43.</strong> What's a realistic production incident caused by HPA maxReplicas misconfiguration? — A traffic spike hit maxReplicas and stayed there, capping capacity below actual demand and degrading latency.<br>
+<strong>44.</strong> Why does HPA depend on the same metrics pipeline as VPA for resource metrics? — Both consume metrics-server's <code>metrics.k8s.io</code> API as their resource usage data source, just for different purposes (scaling vs sizing).<br>
+<strong>45.</strong> What's the fastest way to confirm whether HPA or Cluster Autoscaler is the bottleneck during a slow scale-up? — Check if new Pods are Pending (Cluster Autoscaler bottleneck) vs not yet created (HPA hasn't reacted yet or is in a stabilization window).<br>
+<strong>46.</strong> What field lets you rate-limit how many Pods are removed per scale-down step? — <code>behavior.scaleDown.policies[].value</code> with type <code>Pods</code> or <code>Percent</code>.<br>
+<strong>47.</strong> Why is it good practice to test HPA behavior under synthetic load before production rollout? — To validate the scaling formula, stabilization windows, and metrics pipeline actually produce the intended replica trajectory under realistic traffic patterns.<br>
+<strong>48.</strong> What's the relationship between HPA's target utilization and QoS/requests from topic 36? — HPA's percentage target is computed directly against the Pod's resource request, tying the two topics together operationally.<br>
+<strong>49.</strong> Why might a team choose <code>type: External</code> over <code>type: Resource</code> metrics for a checkout queue worker? — Because queue depth is a far more direct signal of required capacity than CPU utilization for a queue-driven workload.<br>
+<strong>50.</strong> What's the one-line interview summary of HPA? — A controller that polls a metrics API on a fixed interval and adjusts replica count via the same formula-driven, request-relative logic as a manual kubectl scale, but automatic and continuous.
+</div></details>
+
+<footer class="course-footer">Next up: Topic 38 — Vertical Pod Autoscaler, which resizes pod resources instead of replica count.</footer>
+
+<script>
+  mermaid.initialize({ startOnLoad: true, theme: 'dark' });
+</script>
+
+</body>
+</html>

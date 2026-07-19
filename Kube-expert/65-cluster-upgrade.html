@@ -1,0 +1,285 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Topic 65: Cluster Upgrade — Kubernetes Expert Course</title>
+<link rel="stylesheet" href="styles.css">
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+</head>
+<body>
+
+<header class="course-header">
+  <div class="kicker">Topic 65 of 70</div>
+  <h1>Cluster Upgrade</h1>
+  <div class="subtitle">Moving a live cluster to a new Kubernetes version safely: version skew rules, control plane first, then nodes, one at a time.</div>
+</header>
+
+<nav class="topic-nav">
+  <a href="64-disaster-recovery.html">&larr; Disaster Recovery</a>
+  <a href="index.html">Course Index</a>
+  <a href="66-gke.html">GKE &rarr;</a>
+</nav>
+
+<h2 id="explanation">Explanation</h2>
+<p>Kubernetes ships a new minor version roughly every four months, and each minor version is supported (patched) for
+about 14 months. This forces every operator into a recurring upgrade cadence whether they like it or not — staying
+put is not actually an option, because falling off the support window means no more CVE patches. The core discipline
+of a safe cluster upgrade is respecting the <strong>version skew policy</strong>: kube-apiserver is the "most current"
+component; kube-controller-manager, kube-scheduler, and cloud-controller-manager may be up to one minor version
+older than the API server; kubelet may be up to three minor versions older (as of recent skew policy); kubectl may be
+one minor version newer or older. This policy exists because upgrading everything atomically across a live,
+multi-thousand-node fleet is operationally impossible — the skew window is what makes rolling upgrades safe at all.</p>
+
+<p>The practical consequence of the skew policy is a strict <strong>ordering</strong>: you always upgrade the control
+plane first (etcd, then API server, then controller-manager/scheduler), one minor version at a time — you cannot
+skip from 1.27 to 1.29 directly, each minor version must be applied in sequence because internal APIs and storage
+formats change incrementally and skipping breaks that assumption. Only after the control plane is fully upgraded do
+you upgrade worker nodes, and you never upgrade nodes past the API server's version (a newer kubelet than API server
+is not supported). Nodes are upgraded one at a time (or one batch at a time in a large fleet), always by first
+<strong>draining</strong> the node — cordoning it so no new pods schedule there, then evicting existing pods so they
+reschedule onto still-current nodes — before touching its kubelet/kubeadm/OS packages.</p>
+
+<p><code>kubeadm upgrade plan</code> and <code>kubeadm upgrade apply</code> encode this entire workflow for
+self-managed clusters: <code>plan</code> tells you what versions are available and what the skew constraints allow
+next, <code>apply</code> performs the actual control-plane component upgrade (including any etcd or API storage
+migrations) on the first control-plane node, and subsequent control-plane nodes use <code>kubeadm upgrade node</code>.
+Worker nodes get their kubelet/kubeadm packages upgraded via the OS package manager, then <code>kubeadm upgrade node</code>
+updates the local kubelet config, followed by a kubelet restart.</p>
+
+<p>The operational risk in a cluster upgrade is almost never the Kubernetes version bump itself — it's the ripple
+effects: deprecated/removed API versions breaking manifests or third-party controllers that still reference them
+(e.g. a Helm chart still using <code>extensions/v1beta1</code> after it's removed), admission webhooks that fail
+closed during the upgrade window, or a CNI/CSI driver version incompatible with the new kubelet. This is why every
+serious upgrade runbook starts with running <code>kubectl-convert</code> or tools like <code>pluto</code>/<code>kube-no-trouble</code>
+against the cluster to find deprecated API usage, and tests the upgrade against a staging cluster that mirrors
+production traffic and manifests before touching anything live.</p>
+
+<p>Managed Kubernetes (EKS/GKE/AKS) automates the control-plane half of this entirely — you click or CLI-trigger a
+version bump and the provider handles etcd/API-server/controller-manager upgrades with their own tested rollback
+paths. What remains your responsibility even on managed clusters is node-pool upgrades (often also automatable, but
+you choose the surge/drain strategy) and, critically, fixing deprecated API usage in your own manifests before the
+provider forces the version forward.</p>
+
+<h2 id="internal-working">Internal Working / Interactions</h2>
+<ul>
+  <li><strong>Version skew enforcement:</strong> kube-apiserver rejects connections from components outside the
+  supported skew window at startup/handshake.</li>
+  <li><strong>kubeadm upgrade plan:</strong> queries the current cluster version and the kubeadm binary's known
+  target versions, and reports the safe next step.</li>
+  <li><strong>kubeadm upgrade apply:</strong> pulls new control-plane component images, updates static pod manifests
+  in <code>/etc/kubernetes/manifests</code>, and the kubelet on that node restarts the pods automatically since it
+  watches that directory.</li>
+  <li><strong>Node drain:</strong> cordon marks the node unschedulable; evict triggers the eviction API (respecting
+  PodDisruptionBudgets), and the ReplicaSet/Deployment controller recreates evicted pods on other nodes.</li>
+  <li><strong>kubelet upgrade + restart:</strong> new kubelet re-registers with the API server; DaemonSets and
+  system pods are recreated by their controllers on the now-current node.</li>
+  <li><strong>Uncordon:</strong> the node becomes schedulable again only after you've confirmed its health.</li>
+</ul>
+
+<h2 id="architecture-diagram">Architecture Diagram</h2>
+<pre class="mermaid">
+flowchart TD
+  A[Start: cluster on v1.28] --> B[kubeadm upgrade plan]
+  B --> C[Upgrade etcd if needed]
+  C --> D["kubeadm upgrade apply v1.29\n(first control-plane node)"]
+  D --> E["kubeadm upgrade node\n(remaining control-plane nodes)"]
+  E --> F{All control-plane<br/>nodes on v1.29?}
+  F -- No --> E
+  F -- Yes --> G[Pick next worker node]
+  G --> H["kubectl cordon node"]
+  H --> I["kubectl drain node\n(respects PDBs)"]
+  I --> J["apt/yum upgrade kubelet+kubeadm"]
+  J --> K["kubeadm upgrade node"]
+  K --> L["systemctl restart kubelet"]
+  L --> M["kubectl uncordon node"]
+  M --> N{More worker<br/>nodes pending?}
+  N -- Yes --> G
+  N -- No --> O[Cluster fully on v1.29]
+</pre>
+
+<h2 id="code-example">Code Example</h2>
+<pre><code>#############################################
+# 1. kubeadm control-plane upgrade (first CP node)
+#############################################
+apt-get update && apt-get install -y kubeadm=1.29.0-1.1   # install target kubeadm version first
+kubeadm upgrade plan                                       # shows allowed next version + component versions
+kubeadm upgrade apply v1.29.0                               # upgrades control plane components on THIS node
+
+# On additional control-plane nodes (not the first)
+apt-get install -y kubeadm=1.29.0-1.1
+kubeadm upgrade node                                        # applies the already-decided upgrade locally
+
+# Upgrade kubelet + kubectl on every control-plane node
+apt-get install -y kubelet=1.29.0-1.1 kubectl=1.29.0-1.1
+systemctl daemon-reload && systemctl restart kubelet
+
+---
+# 2. Worker node upgrade loop (run per node, one at a time)
+kubectl cordon worker-3                                     # stop new pods from scheduling here
+kubectl drain worker-3 --ignore-daemonsets --delete-emptydir-data   # evict pods, respect PDBs
+
+ssh worker-3 -- "apt-get install -y kubeadm=1.29.0-1.1 && \
+  kubeadm upgrade node && \
+  apt-get install -y kubelet=1.29.0-1.1 kubectl=1.29.0-1.1 && \
+  systemctl daemon-reload && systemctl restart kubelet"
+
+kubectl uncordon worker-3                                   # allow scheduling again once healthy
+
+---
+# 3. Pre-upgrade deprecated-API check (run BEFORE touching anything)
+# pluto detects use of deprecated/removed Kubernetes APIs across manifests in-cluster
+pluto detect-all-in-cluster -t k8s=v1.29.0
+</code></pre>
+
+<h2 id="kubectl-cli-commands">kubectl / CLI Commands</h2>
+<pre><code># See what kubeadm believes is the safe next upgrade step
+kubeadm upgrade plan
+
+# Check current node versions across the fleet (spot skew issues early)
+kubectl get nodes -o custom-columns=NAME:.metadata.name,VERSION:.status.nodeInfo.kubeletVersion
+
+# Cordon a node (stop new scheduling) ahead of upgrade
+kubectl cordon worker-3
+
+# Drain a node safely, respecting PodDisruptionBudgets
+kubectl drain worker-3 --ignore-daemonsets --delete-emptydir-data
+
+# Confirm PDBs won't block a drain unexpectedly
+kubectl get pdb -A
+
+# Bring a node back into service after upgrade
+kubectl uncordon worker-3
+
+# Watch overall rollout / node readiness during the upgrade window
+kubectl get nodes -w
+</code></pre>
+
+<h2 id="best-practices">Best Practices &amp; Common Pitfalls</h2>
+<div class="grid-2">
+  <div class="lab-card">
+    <h4>Best Practices</h4>
+    <ul>
+      <li>Upgrade one minor version at a time, control plane before nodes, always.</li>
+      <li>Scan for deprecated/removed API usage (pluto, kube-no-trouble) before every upgrade.</li>
+      <li>Test the exact upgrade path on a staging cluster with production-like manifests first.</li>
+      <li>Always cordon + drain before touching a node's kubelet, respecting PodDisruptionBudgets.</li>
+      <li>Take an etcd snapshot immediately before any control-plane upgrade.</li>
+    </ul>
+  </div>
+  <div class="lab-card">
+    <h4>Common Pitfalls</h4>
+    <ul>
+      <li>Skipping minor versions (e.g. 1.27 straight to 1.29) — unsupported and risky.</li>
+      <li>Upgrading kubelets ahead of the API server, violating version skew policy.</li>
+      <li>Draining without <code>--ignore-daemonsets</code>, causing the drain to hang forever.</li>
+      <li>No pre-upgrade check for deprecated APIs, breaking Helm charts/webhooks mid-upgrade.</li>
+      <li>Upgrading all worker nodes simultaneously instead of a controlled rolling batch.</li>
+    </ul>
+  </div>
+</div>
+
+<h2 id="interview-questions">50 Interview Questions</h2>
+
+<details class="qa"><summary>1. What is the Kubernetes version skew policy, and why does it exist?</summary>
+<div class="qa-body"><strong>Short answer:</strong> kube-apiserver is the "most current" component; controller-manager/scheduler/cloud-controller-manager may lag by up to one minor version; kubelet may lag by up to three; kubectl may be one minor version newer or older.
+<br><strong>Detail:</strong> It exists because upgrading every component atomically across a live, multi-thousand-node fleet is operationally impossible — the skew window is what makes rolling, staged upgrades safe at all.
+<br><strong>Production example:</strong> During a rolling worker-node upgrade, some nodes still run an older kubelet while the already-upgraded API server continues to serve them correctly within the supported skew.
+<br><strong>Common mistake:</strong> Upgrading kubelets ahead of the API server, which violates the policy since kubelet must never be newer than the API server.</div></details>
+
+<details class="qa"><summary>2. Why must minor versions be upgraded one at a time instead of skipping (e.g. 1.27 straight to 1.29)?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Internal APIs and storage formats change incrementally between minor versions, and skipping breaks the assumption that each upgrade step is a well-tested, supported delta.
+<br><strong>Detail:</strong> <code>kubeadm upgrade plan</code> and <code>apply</code> are built around sequential minor-version steps — there's no supported path that jumps two minors at once.
+<br><strong>Production example:</strong> A cluster on 1.27 must go through 1.28 before reaching 1.29, even if the end goal is 1.29.
+<br><strong>Common mistake:</strong> Trying to save time by jumping minor versions directly, which is unsupported and can leave the cluster in an inconsistent state.</div></details>
+
+<details class="qa"><summary>3. Why is the control plane always upgraded before worker nodes, never after?</summary>
+<div class="qa-body"><strong>Short answer:</strong> A newer kubelet than the API server is not supported — the API server must always be at or above the version of every other component.
+<br><strong>Detail:</strong> The order is etcd, then API server, then controller-manager/scheduler, then worker nodes one at a time — each step depends on the previous one being complete and healthy.
+<br><strong>Production example:</strong> <code>kubeadm upgrade apply v1.29.0</code> runs on the first control-plane node before any worker node's kubeadm/kubelet packages are touched.
+<br><strong>Common mistake:</strong> Upgrading a worker node's kubelet before the control plane is fully on the target version, breaking version skew.</div></details>
+
+<details class="qa"><summary>4. What does draining a node actually do, and why is it required before upgrading its kubelet?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Cordoning marks the node unschedulable (no new Pods land there); draining then evicts existing Pods so they reschedule onto still-current nodes before you touch the kubelet/OS packages.
+<br><strong>Detail:</strong> The eviction respects PodDisruptionBudgets, so a drain can pause or fail if it would violate availability guarantees rather than silently causing an outage.
+<br><strong>Production example:</strong> <code>kubectl cordon worker-3 && kubectl drain worker-3 --ignore-daemonsets --delete-emptydir-data</code> is run before any package upgrade on that node.
+<br><strong>Common mistake:</strong> Draining without <code>--ignore-daemonsets</code>, which causes the drain to hang forever since DaemonSet-managed Pods aren't meant to be evicted that way.</div></details>
+
+<details class="qa"><summary>5. What's the difference between <code>kubeadm upgrade apply</code> and <code>kubeadm upgrade node</code>?</summary>
+<div class="qa-body"><strong>Short answer:</strong> <code>apply</code> performs the actual control-plane component upgrade (including any etcd/API storage migrations) on the first control-plane node; <code>node</code> applies the already-decided upgrade on subsequent control-plane or worker nodes.
+<br><strong>Detail:</strong> Only the first control-plane node "decides" the upgrade via <code>apply</code>; every other node just follows that decision locally via <code>node</code>, keeping the process consistent across the fleet.
+<br><strong>Production example:</strong> After running <code>kubeadm upgrade apply v1.29.0</code> on control-plane node 1, nodes 2 and 3 each run <code>kubeadm upgrade node</code> instead of <code>apply</code> again.
+<br><strong>Common mistake:</strong> Running <code>upgrade apply</code> on every control-plane node, which is unnecessary and not the documented flow.</div></details>
+
+<details class="qa"><summary>6. Why is scanning for deprecated/removed API usage (e.g. with pluto) a required pre-upgrade step?</summary>
+<div class="qa-body"><strong>Short answer:</strong> The Kubernetes version bump itself is rarely the risky part — the ripple effect of removed API versions breaking manifests, Helm charts, or third-party controllers is the real operational risk.
+<br><strong>Detail:</strong> A Helm chart still referencing a removed API group (e.g. old <code>extensions/v1beta1</code>) simply fails to apply post-upgrade if nobody checked beforehand.
+<br><strong>Production example:</strong> <code>pluto detect-all-in-cluster -t k8s=v1.29.0</code> is run against the live cluster before touching anything, to catch deprecated API usage in advance.
+<br><strong>Common mistake:</strong> Skipping the deprecated-API check and discovering broken webhooks or Helm releases only after the upgrade is already in progress.</div></details>
+
+<details class="qa"><summary>7. Why do admission webhooks pose a specific risk during a cluster upgrade?</summary>
+<div class="qa-body"><strong>Short answer:</strong> A webhook that fails closed (denies requests when unreachable) during the upgrade window can block legitimate API operations, including parts of the upgrade process itself.
+<br><strong>Detail:</strong> Webhook endpoints can become briefly unavailable during a rolling upgrade of the workloads that host them, so their failure policy and timeout configuration matter as much as the webhook logic itself.
+<br><strong>Production example:</strong> An upgrade runbook explicitly checks webhook health and considers temporarily setting <code>failurePolicy: Ignore</code> for non-critical webhooks during the maintenance window.
+<br><strong>Common mistake:</strong> Assuming webhooks will "just keep working" through an upgrade without verifying their availability and failure policy beforehand.</div></details>
+
+<details class="qa"><summary>8. Why should you take an etcd snapshot immediately before any control-plane upgrade?</summary>
+<div class="qa-body"><strong>Short answer:</strong> A control-plane upgrade can include etcd/API storage migrations, and having a pre-upgrade snapshot gives you a known-good rollback point if anything goes wrong.
+<br><strong>Detail:</strong> This links directly to the Backup & Restore discipline — an upgrade is exactly the kind of planned, higher-risk operation that should always be preceded by a fresh, verified backup.
+<br><strong>Production example:</strong> The upgrade runbook's first executable step is <code>etcdctl snapshot save</code>, before <code>kubeadm upgrade apply</code> is ever run.
+<br><strong>Common mistake:</strong> Relying on whatever the last scheduled snapshot happened to be instead of taking a fresh one immediately before the upgrade.</div></details>
+
+<details class="qa"><summary>9–50. Additional rapid-fire questions</summary>
+<div class="qa-body">
+<strong>9.</strong> How often does Kubernetes ship a new minor version, and how long is each supported? — Roughly every four months, with about 14 months of patch support per minor version.<br>
+<strong>10.</strong> Why is "staying on the current version forever" not actually an option? — Falling off the support window means no more CVE patches, forcing an eventual upgrade regardless of preference.<br>
+<strong>11.</strong> What does <code>kubeadm upgrade plan</code> actually check? — The current cluster version against the kubeadm binary's known target versions, reporting the safe next upgrade step.<br>
+<strong>12.</strong> Why must kubelet never be newer than the API server? — The API server enforces version skew at connection/handshake time and this direction of skew isn't supported.<br>
+<strong>13.</strong> What triggers static pods to restart after a control-plane component upgrade via kubeadm? — kubeadm updates the manifest files in <code>/etc/kubernetes/manifests</code>, and kubelet watches that directory, automatically restarting the pods.<br>
+<strong>14.</strong> Why should worker nodes be upgraded one at a time (or in controlled batches), not all simultaneously? — Simultaneous upgrades remove capacity everywhere at once, risking an outage instead of a controlled rolling change.<br>
+<strong>15.</strong> What happens to Pods on a node when it's cordoned but not yet drained? — Existing Pods keep running; only new scheduling onto that node is blocked.<br>
+<strong>16.</strong> Why does draining respect PodDisruptionBudgets rather than forcing eviction unconditionally? — To prevent an upgrade-triggered drain from itself causing an availability-violating outage.<br>
+<strong>17.</strong> What's the risk of testing an upgrade only on a minimal staging cluster with no real manifests? — It won't surface deprecated API usage or webhook issues that only exist in production's actual manifest set.<br>
+<strong>18.</strong> Why does managed Kubernetes (EKS/GKE/AKS) reduce upgrade risk but not eliminate it? — The provider automates the control-plane half with tested rollback paths, but you're still responsible for node-pool upgrades and fixing deprecated API usage in your own manifests.<br>
+<strong>19.</strong> What's the correct order of component upgrade within the control plane itself? — etcd first, then API server, then controller-manager/scheduler.<br>
+<strong>20.</strong> Why is kubectl allowed to be one minor version newer or older than the API server? — Client tooling has looser compatibility requirements than server-side components that actively coordinate cluster state.<br>
+<strong>21.</strong> What's a realistic symptom of skipping the deprecated-API check before upgrading? — A Helm release or controller referencing a removed API version fails to apply or reconcile right after the upgrade completes.<br>
+<strong>22.</strong> Why does `kubeadm upgrade node` not require re-deciding the target version? — The version decision was already made by `kubeadm upgrade apply` on the first control-plane node; other nodes just apply that same decision.<br>
+<strong>23.</strong> What's the purpose of `kubectl uncordon` at the end of a node upgrade? — Marks the node schedulable again, but only after confirming it's healthy post-upgrade — restoring it to service.<br>
+<strong>24.</strong> Why should uncordoning happen only after health verification, not immediately after the kubelet restarts? — A kubelet that restarted "successfully" could still be unhealthy in ways only visible a few minutes later (e.g. CNI/CSI compatibility issues).<br>
+<strong>25.</strong> What's a version-skew-related reason a CNI or CSI driver upgrade might be needed alongside a Kubernetes upgrade? — A new kubelet version may require a compatible CNI/CSI driver version — mismatches can break networking or storage post-upgrade.<br>
+<strong>26.</strong> Why is "the Kubernetes version bump itself" rarely the actual risk in a real upgrade? — Ripple effects — deprecated APIs, incompatible webhooks, driver mismatches — cause the vast majority of real upgrade incidents, not the core version change.<br>
+<strong>27.</strong> What does `pluto` or `kube-no-trouble` actually scan for? — Usage of Kubernetes APIs that are deprecated or already removed in the target version, across live cluster manifests.<br>
+<strong>28.</strong> Why is testing the exact upgrade path (not just "some" upgrade) on staging important? — Different version jumps can have different deprecations/migrations; testing the specific path you'll actually run in production is what catches real issues.<br>
+<strong>29.</strong> What's the risk of not tracking kubelet version drift across a large fleet? — Nodes could silently fall outside the supported skew window relative to a newly upgraded API server, causing connection issues.<br>
+<strong>30.</strong> How do you check current kubelet versions across all nodes quickly? — <code>kubectl get nodes -o custom-columns=NAME:.metadata.name,VERSION:.status.nodeInfo.kubeletVersion</code>.<br>
+<strong>31.</strong> Why does upgrading in controlled batches matter even on a large fleet with automation? — Even automated rolling upgrades need bounded batch sizes to avoid removing too much capacity at once if something goes wrong mid-batch.<br>
+<strong>32.</strong> What's a common cause of a drain hanging indefinitely? — Missing `--ignore-daemonsets`, or a PodDisruptionBudget that can never be satisfied given current replica counts.<br>
+<strong>33.</strong> Why should you scan for deprecated APIs against the *target* version, not just current best practices? — Deprecation/removal is version-specific; a manifest fine on 1.27 might use an API removed exactly in 1.29.<br>
+<strong>34.</strong> What operational responsibility remains yours even on a fully managed control plane? — Node-pool upgrades (surge/drain strategy) and fixing deprecated API usage in your own manifests before the provider forces the version forward.<br>
+<strong>35.</strong> Why is "one minor version at a time" specifically enforced by kubeadm tooling rather than just documented policy? — `kubeadm upgrade plan`/`apply` are built to only offer the next sequential minor version as a valid target, preventing accidental version skipping.<br>
+<strong>36.</strong> What's the purpose of installing the target kubeadm package version before running `kubeadm upgrade apply`? — The kubeadm binary itself needs to be the target version to correctly plan and execute that version's upgrade steps.<br>
+<strong>37.</strong> Why does `systemctl restart kubelet` follow a kubelet package upgrade rather than happening automatically? — The new kubelet binary must be explicitly loaded into the running process via a restart; installing the package alone doesn't swap the running binary.<br>
+<strong>38.</strong> What's a good way to validate an upgrade didn't silently break workloads? — Checking `kubectl get pods -A` for unexpected restarts/crashes and reviewing logs for API deprecation warnings post-upgrade, not just confirming node readiness.<br>
+<strong>39.</strong> Why is the version skew policy described as "what makes rolling upgrades safe at all"? — Without a tolerated skew window, every component across the entire fleet would need to upgrade atomically, which is operationally impossible at scale.<br>
+<strong>40.</strong> What's the risk of upgrading all worker nodes in a single batch instead of a controlled rolling batch? — Loses the safety margin of catching an issue on a small batch before it affects the whole fleet.<br>
+<strong>41.</strong> Why must cloud-controller-manager also respect the version skew policy? — It's a control-plane component interacting with the API server just like controller-manager/scheduler, subject to the same one-minor-version lag limit.<br>
+<strong>42.</strong> What does an upgrade runbook typically verify right after `kubeadm upgrade apply` completes? — That control-plane pods restarted successfully and the API server is healthy before proceeding to the next control-plane node.<br>
+<strong>43.</strong> Why should Helm charts be reviewed for API version compatibility specifically before a cluster upgrade? — Charts pin specific `apiVersion` values in templates, and a chart last updated years ago may still target a removed API group.<br>
+<strong>44.</strong> What's the value of `kubectl get pdb -A` before starting a rolling worker upgrade? — Confirms PodDisruptionBudgets won't unexpectedly block drains partway through the upgrade sequence.<br>
+<strong>45.</strong> Why is watching `kubectl get nodes -w` useful during an upgrade window? — Gives real-time visibility into node readiness transitions, letting you catch a stuck or failed node upgrade quickly.<br>
+<strong>46.</strong> What's the danger of treating a cluster upgrade as "just a version bump" without a runbook? — Skips the deprecated-API scan, staging test, and etcd snapshot steps that catch the actual common failure modes.<br>
+<strong>47.</strong> Why does the skew policy allow more lag for kubelet than for controller-manager/scheduler? — Worker nodes vastly outnumber control-plane components in a real fleet, and upgrading thousands of kubelets instantly is impractical — a wider skew window accommodates realistic rolling timelines.<br>
+<strong>48.</strong> What's a realistic reason to delay an upgrade even if support window pressure exists? — A critical deprecated-API dependency or an unpatched third-party controller compatibility issue that needs remediation first.<br>
+<strong>49.</strong> Why is "test on staging with production-like manifests" stronger advice than "test on staging"? — Generic staging manifests won't surface the deprecated-API or webhook issues specific to your actual production configuration.<br>
+<strong>50.</strong> What's the overarching operational discipline this topic teaches about upgrades? — Respect strict ordering and version-skew rules, and treat the ripple effects (deprecated APIs, webhooks, drivers) as the real risk, not the version number itself.
+</div></details>
+
+<footer class="course-footer">Continue to Topic 66: GKE.</footer>
+
+<script>
+  mermaid.initialize({ startOnLoad: true, theme: 'dark' });
+</script>
+
+</body>
+</html>

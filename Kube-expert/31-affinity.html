@@ -1,0 +1,252 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Topic 31: Affinity — Kubernetes Expert Course</title>
+<link rel="stylesheet" href="styles.css">
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+</head>
+<body>
+
+<header class="course-header">
+  <div class="kicker">Topic 31 of 70</div>
+  <h1>Node &amp; Pod Affinity</h1>
+  <div class="subtitle">nodeAffinity vs podAffinity, and the required-vs-preferred distinction that controls how strict a rule is.</div>
+</header>
+
+<nav class="topic-nav">
+  <a href="30-scheduling.html">&larr; Scheduling</a>
+  <a href="index.html">Course Index</a>
+  <a href="32-anti-affinity.html">Anti-Affinity &rarr;</a>
+</nav>
+
+<h2 id="explanation">Explanation</h2>
+<p>Affinity rules let you express placement preferences richer than a flat <code>nodeSelector</code> label match. Kubernetes needs this because real placement decisions are rarely a single equality check — you often want "prefer SSD nodes but fall back to HDD," or "run this cache Pod on the same node as the app it serves," or "spread these replicas so no two land in the same zone." Two distinct rule families exist because they answer two different questions: <strong>nodeAffinity</strong> asks "what does the node itself look like" (labels, instance type, zone), while <strong>podAffinity</strong>/<strong>podAntiAffinity</strong> ask "what other Pods are already running nearby" — a relational constraint the scheduler resolves by looking at currently-running Pods' labels, not static node metadata.</p>
+<p><code>nodeAffinity</code> is essentially nodeSelector with boolean logic (<code>In</code>, <code>NotIn</code>, <code>Exists</code>, <code>Gt</code>, <code>Lt</code>) and a topology dimension. It's the natural fit for constraints like "must run on <code>amd64</code> nodes," "prefer nodes in <code>us-east-1a</code>," or "must run on nodes with an SSD-backed instance type."</p>
+<p><code>podAffinity</code> pulls Pods together — e.g. co-locating a web Pod with its Redis cache Pod on the same node (minimizing network latency) or, more commonly, within the same zone (<code>topologyKey: topology.kubernetes.io/zone</code>) to avoid cross-AZ data transfer costs and latency. <code>podAntiAffinity</code> pushes Pods apart — the standard mechanism for spreading replicas of the same Deployment across different nodes or zones so a single node/zone failure doesn't take out every replica at once. (Topic 32 goes deeper on anti-affinity specifically.)</p>
+<p>Every affinity rule — node or pod — comes in two flavors that control how strictly it's enforced. <strong>requiredDuringSchedulingIgnoredDuringExecution</strong> is a hard constraint: it behaves like a Filter — any node that doesn't satisfy it is eliminated outright, and the Pod stays <code>Pending</code> if no node qualifies. <strong>preferredDuringSchedulingIgnoredDuringExecution</strong> is a soft constraint fed into Scoring with a weight (1-100): the scheduler tries to satisfy it but will still place the Pod elsewhere if nothing else fits, just with a lower score. The "IgnoredDuringExecution" suffix on both is a deliberate design detail: once a Pod is running, Kubernetes does not re-evaluate or move it if the affinity condition later becomes false (e.g. the node's label changes) — affinity governs initial placement only, not ongoing enforcement.</p>
+
+<h2 id="internal-working">Internal Working / Interactions</h2>
+<ul>
+<li><strong>kube-scheduler Filter plugins</strong> — enforce all "required" node/pod affinity rules, eliminating non-matching nodes.</li>
+<li><strong>kube-scheduler Score plugins</strong> — evaluate "preferred" rules and add weighted scores to surviving candidate nodes.</li>
+<li><strong>API Server / etcd</strong> — the scheduler reads live Pod and Node label state from its informer cache (backed by watches against the API Server) to evaluate podAffinity, which requires knowing what's currently running everywhere.</li>
+<li><strong>Node labels vs Pod labels</strong> — nodeAffinity matches against Node object labels; podAffinity/AntiAffinity match against labels of other Pod objects, correlated via a <code>topologyKey</code> (e.g. node label <code>topology.kubernetes.io/zone</code>) that groups nodes into domains.</li>
+</ul>
+
+<h2 id="architecture-diagram">Architecture Diagram</h2>
+<pre class="mermaid">
+flowchart TD
+  NewPod[New Pod with affinity rules] --> NA{nodeAffinity rules?}
+  NA -->|required| FilterNode[Filter: eliminate nodes w/o matching labels]
+  NA -->|preferred| ScoreNode[Score: weight nodes with matching labels higher]
+  NewPod --> PA{podAffinity / podAntiAffinity rules?}
+  PA -->|required| FilterPod[Filter: eliminate nodes based on co-located Pods' labels + topologyKey]
+  PA -->|preferred| ScorePod[Score: weight nodes based on co-located Pods]
+  FilterNode --> Candidates[Candidate Nodes]
+  FilterPod --> Candidates
+  Candidates --> ScoreNode
+  Candidates --> ScorePod
+  ScoreNode --> Final[Final ranked node list]
+  ScorePod --> Final
+  Final --> Bind[Highest score selected & bound]
+</pre>
+
+<h2 id="code-example">Code Example</h2>
+<pre><code># nodeAffinity: hard requirement + soft preference combined
+apiVersion: v1
+kind: Pod
+metadata:
+  name: web-frontend
+  labels:
+    app: web-frontend
+spec:
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+        - matchExpressions:
+          - key: kubernetes.io/arch
+            operator: In
+            values: ["amd64"]                 # hard: must be amd64, no exceptions
+      preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 80                             # soft: try hard to satisfy, but not mandatory
+        preference:
+          matchExpressions:
+          - key: node.kubernetes.io/instance-type
+            operator: In
+            values: ["m6i.large", "m6i.xlarge"]  # prefer these instance types if available
+  containers:
+  - name: web
+    image: myco/web:2.3
+
+---
+# podAffinity: co-locate with cache Pods in the same zone (not necessarily same node)
+apiVersion: v1
+kind: Pod
+metadata:
+  name: web-frontend-2
+  labels:
+    app: web-frontend
+spec:
+  affinity:
+    podAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+      - labelSelector:
+          matchExpressions:
+          - key: app
+            operator: In
+            values: ["redis-cache"]             # must land near a Pod labeled app=redis-cache
+        topologyKey: topology.kubernetes.io/zone  # "near" = same zone, not necessarily same node
+  containers:
+  - name: web
+    image: myco/web:2.3
+</code></pre>
+
+<h2 id="kubectl-commands">kubectl Commands</h2>
+<pre><code>kubectl get nodes --show-labels                              # inspect labels used by nodeAffinity rules
+kubectl label nodes node-1 topology.kubernetes.io/zone=us-east-1a  # set/verify topology labels
+kubectl describe pod web-frontend                             # scheduling events, unmet affinity reasons
+kubectl get pods -o wide -l app=redis-cache                   # see where podAffinity target Pods are running
+kubectl get pod web-frontend -o jsonpath='{.spec.affinity}'   # dump the affinity spec actually applied
+kubectl get events --field-selector reason=FailedScheduling   # find Pods rejected due to affinity constraints
+</code></pre>
+
+<h2 id="best-practices">Best Practices &amp; Common Pitfalls</h2>
+<div class="grid-2">
+<div class="callout good">
+<strong>Do</strong>
+<ul>
+<li>Default to "preferred" rules unless a hard requirement is truly non-negotiable — required rules can strand Pods Pending.</li>
+<li>Use a broad <code>topologyKey</code> (zone) for podAffinity when node-level co-location isn't strictly necessary.</li>
+<li>Combine nodeAffinity with taints/tolerations for dedicated pools rather than affinity alone.</li>
+<li>Test affinity rules in a staging cluster with realistic node label sets before rolling to prod.</li>
+</ul>
+</div>
+<div class="callout warn">
+<strong>Pitfalls</strong>
+<ul>
+<li>Required podAffinity rules referencing a Pod label that doesn't exist yet, causing a chicken-and-egg scheduling deadlock.</li>
+<li>Expecting affinity to react to runtime changes — "IgnoredDuringExecution" means it won't.</li>
+<li>Overusing required node affinity for minor preferences, fragmenting capacity and causing Pending Pods during node churn.</li>
+<li>Forgetting <code>topologyKey</code> must be a label that actually exists and is consistent across all relevant nodes.</li>
+</ul>
+</div>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="interview-questions">50 Interview Questions</h2>
+
+<details class="qa"><summary>1. Why does Kubernetes split placement rules into nodeAffinity and podAffinity/podAntiAffinity instead of one unified mechanism?</summary>
+<div class="qa-body"><strong>Short answer:</strong> They answer fundamentally different questions — nodeAffinity asks what a node looks like, podAffinity/podAntiAffinity ask what other Pods are already running nearby.
+<br><strong>Detailed explanation:</strong> nodeAffinity is evaluated purely against static Node object labels (instance type, zone, arch) — it's essentially nodeSelector with richer boolean logic. podAffinity/podAntiAffinity are relational: the scheduler must inspect the labels of currently-running Pods and correlate them through a topologyKey, which is a fundamentally different kind of lookup requiring live cluster state rather than a fixed label set.
+<br><strong>Production example:</strong> A cluster uses nodeAffinity to pin a Pod to <code>amd64</code> nodes, and separately uses podAffinity to co-locate that same Pod with its Redis cache in the same zone — two independent decisions answered by two independent mechanisms.
+<br><strong>Common mistake:</strong> Trying to express "run near another Pod" using nodeSelector/nodeAffinity by hand-labeling nodes, instead of using podAffinity which tracks actual Pod placement dynamically.</div></details>
+
+<details class="qa"><summary>2. What role does topologyKey play in podAffinity and podAntiAffinity rules?</summary>
+<div class="qa-body"><strong>Short answer:</strong> topologyKey defines the granularity of "nearby" by naming a node label that groups nodes into domains, such as zone or hostname.
+<br><strong>Detailed explanation:</strong> podAffinity/podAntiAffinity don't compare Pods directly to each other; they compare via nodes. The scheduler finds nodes running Pods that match the labelSelector, reads each of those nodes' topologyKey label value, and treats any node sharing that same value as satisfying (or violating, for anti-affinity) the rule. A node-level key like <code>kubernetes.io/hostname</code> means "same node"; a broader key like <code>topology.kubernetes.io/zone</code> means "same zone."
+<br><strong>Production example:</strong> Using <code>topologyKey: topology.kubernetes.io/zone</code> to co-locate a web Pod with redis-cache Pods lets the scheduler pick any node in the same AZ, not necessarily the exact same node, avoiding cross-AZ costs while still allowing flexibility.
+<br><strong>Common mistake:</strong> Choosing a topologyKey label that isn't consistently applied across all nodes, causing some nodes to be silently excluded from evaluation.</div></details>
+
+<details class="qa"><summary>3. What's the practical difference between requiredDuringSchedulingIgnoredDuringExecution and preferredDuringSchedulingIgnoredDuringExecution?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Required is a hard Filter — nodes that don't match are eliminated and the Pod stays Pending if none qualify; preferred is a soft, weighted Score that influences ranking without blocking placement.
+<br><strong>Detailed explanation:</strong> Required rules run in the scheduler's Filter phase, pruning the candidate node list before scoring even begins. Preferred rules run in the Score phase: each rule carries a weight from 1-100, and nodes satisfying more/higher-weighted preferences rank higher, but a Pod will still be placed somewhere even if no preference is met.
+<br><strong>Production example:</strong> A Pod with a required amd64 nodeAffinity rule and a preferred instance-type rule will never land on an arm64 node, but will happily land on an m6i.2xlarge if the preferred m6i.large/xlarge types are all busy.
+<br><strong>Common mistake:</strong> Marking a rule as required when a preferred rule would achieve the intent with far less risk of Pods becoming stuck Pending during capacity crunches.</div></details>
+
+<details class="qa"><summary>4. What does the "IgnoredDuringExecution" suffix actually mean, and why does it matter operationally?</summary>
+<div class="qa-body"><strong>Short answer:</strong> It means affinity rules only govern the moment of initial scheduling — Kubernetes never re-evaluates or evicts/moves a running Pod if the condition later becomes false.
+<br><strong>Detailed explanation:</strong> Once a Pod is bound and running, changes to node labels or the disappearance/appearance of other Pods that would have changed the original scheduling decision have zero effect on that already-placed Pod. There is no controller that continuously reconciles affinity against live state for running Pods; it's a one-time placement filter/score, not an ongoing constraint.
+<br><strong>Production example:</strong> If a node's zone label is corrected after a Pod was scheduled with a required podAffinity rule keyed on that zone, the already-running Pod stays put even though it would no longer pass scheduling if re-evaluated today.
+<br><strong>Common mistake:</strong> Assuming affinity rules act like a continuously enforced policy (similar to NetworkPolicy) that will react to drift, and being surprised when a stale placement isn't automatically corrected.</div></details>
+
+<details class="qa"><summary>5. In a production scenario, why would you use podAffinity to co-locate a web tier with a Redis cache in the same zone rather than the same node?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Same-zone co-location captures most of the latency/cost benefit of proximity while avoiding the fragility of pinning to one exact node.
+<br><strong>Detailed explanation:</strong> Cross-AZ network calls typically carry both extra latency and per-GB data transfer costs in cloud environments. Requiring the exact same node (<code>kubernetes.io/hostname</code> topologyKey) ties both Pods' fate to a single node's capacity and failure domain; requiring only the same zone still eliminates cross-AZ hops while letting the scheduler freely choose among many nodes.
+<br><strong>Production example:</strong> A web-frontend Pod with a required podAffinity rule matching <code>app: redis-cache</code> and <code>topologyKey: topology.kubernetes.io/zone</code> guarantees zone-local Redis calls without forcing both Pods onto one physical node.
+<br><strong>Common mistake:</strong> Using <code>kubernetes.io/hostname</code> for co-location "for lowest latency" without considering that it also removes scheduling flexibility and couples both Pods to the same node's health.</div></details>
+
+<details class="qa"><summary>6. What is the "chicken-and-egg" deadlock that required podAffinity rules can cause, and how does it happen?</summary>
+<div class="qa-body"><strong>Short answer:</strong> A required podAffinity rule referencing a Pod label that no Pod currently satisfies leaves every node ineligible, so the new Pod stays Pending forever.
+<br><strong>Detailed explanation:</strong> podAffinity is relational — it needs at least one currently-running Pod matching the labelSelector to anchor a topology domain as valid. If the target Pods (e.g. <code>app: redis-cache</code>) haven't been scheduled yet, or were deleted, there's no node satisfying the constraint, and the Filter phase eliminates every candidate node.
+<br><strong>Production example:</strong> Deploying a web tier with required podAffinity on redis-cache before the Redis Deployment has been applied causes every web Pod to sit Pending until at least one Redis Pod is scheduled somewhere.
+<br><strong>Common mistake:</strong> Applying manifests with an ordering assumption baked into required podAffinity without verifying deployment order, or without a preferred fallback for first-time bootstraps.</div></details>
+
+<details class="qa"><summary>7. How does nodeAffinity's boolean logic (In, NotIn, Exists, Gt, Lt) go beyond what nodeSelector can express?</summary>
+<div class="qa-body"><strong>Short answer:</strong> nodeSelector only supports exact key=value equality across all entries (implicit AND), while nodeAffinity's matchExpressions support set-membership, existence checks, and numeric comparisons.
+<br><strong>Detailed explanation:</strong> Operators like <code>In</code>/<code>NotIn</code> allow matching against a list of acceptable values (e.g. several instance types), <code>Exists</code>/<code>DoesNotExist</code> check for label presence regardless of value, and <code>Gt</code>/<code>Lt</code> allow numeric comparisons on label values. Multiple <code>nodeSelectorTerms</code> are OR'd together, while expressions within one term are AND'd, giving compound logic nodeSelector cannot express at all.
+<br><strong>Production example:</strong> A rule requiring instance type <code>In</code> ["m6i.large", "m6i.xlarge"] cannot be written with plain nodeSelector, which would need an exact single value per key.
+<br><strong>Common mistake:</strong> Continuing to use nodeSelector for constraints that actually need set-membership or negation logic, then working around it with multiple near-duplicate Pod specs.</div></details>
+
+<details class="qa"><summary>8. A Pod is stuck Pending and you suspect an affinity rule is the cause — how would you confirm and troubleshoot it?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Check the Pod's scheduling events for a FailedScheduling reason describing unmet affinity, then verify the actual labels on nodes or target Pods against the rule.
+<br><strong>Detailed explanation:</strong> <code>kubectl describe pod</code> surfaces scheduler event messages like "node(s) didn't match Pod's node affinity/selector" or "didn't match pod affinity rules." From there, cross-check <code>kubectl get nodes --show-labels</code> for nodeAffinity issues, or <code>kubectl get pods -o wide -l <selector></code> to see whether any Pod matching the podAffinity labelSelector is even running, and in which topology domain.
+<br><strong>Production example:</strong> A required podAffinity rule targeting <code>app: redis-cache</code> fails because the Redis Deployment was scaled to zero for a maintenance window, removing the only anchor Pod satisfying the rule.
+<br><strong>Common mistake:</strong> Only checking node labels and missing that podAffinity failures stem from the absence of a matching Pod, not a node label problem at all.</div></details>
+
+<details class="qa"><summary>9. What's the tradeoff between using podAffinity versus podAntiAffinity for the same Deployment?</summary>
+<div class="qa-body"><strong>Short answer:</strong> podAffinity pulls related Pods together to optimize for latency/cost between cooperating workloads; podAntiAffinity pushes replicas of the same workload apart to optimize for failure isolation.
+<br><strong>Detailed explanation:</strong> They serve opposite goals and are typically applied to different relationships — podAffinity between a service and its dependency (web + cache), podAntiAffinity among replicas of the same Deployment so a single node or zone outage doesn't remove every replica simultaneously. Using podAffinity on replicas of the same Deployment would actively work against resilience by clustering them together.
+<br><strong>Production example:</strong> A production Deployment combines podAffinity toward its Redis cache (same zone) with podAntiAffinity among its own replicas (different nodes) to get both proximity and resilience at once.
+<br><strong>Common mistake:</strong> Confusing the two and applying podAffinity where podAntiAffinity was intended, accidentally concentrating all replicas onto the same node or zone.</div></details>
+
+<details class="qa"><summary>10. Internally, how do the scheduler's Filter and Score plugins process affinity rules, and why does podAffinity evaluation require reading live cluster state?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Filter plugins enforce required rules by eliminating non-conforming nodes; Score plugins evaluate preferred rules with their weights; podAffinity specifically needs the scheduler's informer cache of current Pod and Node labels since it depends on what's actually running, not static config.
+<br><strong>Detailed explanation:</strong> nodeAffinity Filter/Score plugins only need to read Node object labels, which change rarely. podAffinity/podAntiAffinity plugins must additionally enumerate currently running Pods across the cluster (via the scheduler's informer cache backed by API Server watches) to find which nodes host Pods matching the labelSelector, then map those nodes to topology domains via topologyKey before filtering or scoring candidates.
+<br><strong>Production example:</strong> In a large cluster, required podAffinity rules with a broad topologyKey (e.g. zone) are computationally cheaper than node-level ones because the scheduler needs to correlate fewer distinct topology domains.
+<br><strong>Common mistake:</strong> Assuming affinity evaluation cost is negligible at scale — heavy use of podAffinity/podAntiAffinity across many Pods and nodes measurably increases scheduler latency.</div></details>
+
+<details class="qa"><summary>11–50. Additional rapid-fire questions</summary>
+<div class="qa-body">
+<strong>11.</strong> What are the two rule families under <code>spec.affinity</code>? — <code>nodeAffinity</code> and <code>podAffinity</code>/<code>podAntiAffinity</code>.<br>
+<strong>12.</strong> What operators does nodeAffinity's matchExpressions support? — <code>In</code>, <code>NotIn</code>, <code>Exists</code>, <code>DoesNotExist</code>, <code>Gt</code>, <code>Lt</code>.<br>
+<strong>13.</strong> Does podAffinity support the same rich operator set as nodeAffinity? — Its labelSelector supports <code>In</code>, <code>NotIn</code>, <code>Exists</code>, <code>DoesNotExist</code> (matchExpressions), but not <code>Gt</code>/<code>Lt</code>.<br>
+<strong>14.</strong> What weight range is valid for preferredDuringSchedulingIgnoredDuringExecution entries? — 1 to 100.<br>
+<strong>15.</strong> Can multiple nodeSelectorTerms be specified under requiredDuringSchedulingIgnoredDuringExecution? — Yes, and they are OR'd together; expressions within one term are AND'd.<br>
+<strong>16.</strong> Does a Pod need any affinity rule at all to be scheduled? — No, affinity is entirely optional; without it the scheduler uses default Filter/Score plugins only.<br>
+<strong>17.</strong> What happens to a Pod with an unmet required nodeAffinity rule? — It stays in <code>Pending</code> state with a FailedScheduling event.<br>
+<strong>18.</strong> What happens to a Pod with an unmet preferred nodeAffinity rule? — It still gets scheduled, just potentially on a lower-scored node.<br>
+<strong>19.</strong> What field on podAffinity restricts the labelSelector match to specific namespaces? — <code>namespaces</code> (or <code>namespaceSelector</code> for label-based namespace matching).<br>
+<strong>20.</strong> What's the default namespace scope for a podAffinity labelSelector if <code>namespaces</code> is omitted? — The same namespace as the Pod being scheduled.<br>
+<strong>21.</strong> Is nodeAffinity evaluated against Node labels or Node annotations? — Node labels only.<br>
+<strong>22.</strong> Can nodeAffinity match on built-in labels like <code>topology.kubernetes.io/zone</code>? — Yes, any Node label including standard well-known labels.<br>
+<strong>23.</strong> Is <code>requiredDuringSchedulingRequiredDuringExecution</code> a real, GA field? — No, it has existed only as an alpha/experimental concept; the stable fields both use <code>IgnoredDuringExecution</code>.<br>
+<strong>24.</strong> What scheduler phase handles required rules — Filter or Score? — Filter (they eliminate candidate nodes before scoring).<br>
+<strong>25.</strong> What scheduler phase handles preferred rules — Filter or Score? — Score (they influence ranking of surviving candidates).<br>
+<strong>26.</strong> Why can heavy podAntiAffinity usage across many replicas increase scheduling latency? — Each additional replica adds more Pods the scheduler must cross-reference against the topology domains of every candidate node.<br>
+<strong>27.</strong> What's a simpler, less scheduler-intensive alternative to podAntiAffinity for spreading replicas evenly? — Pod Topology Spread Constraints (<code>topologySpreadConstraints</code>).<br>
+<strong>28.</strong> Can nodeAffinity and podAffinity rules be combined on the same Pod? — Yes, they're independent fields under <code>spec.affinity</code> and are all evaluated together.<br>
+<strong>29.</strong> What happens if required nodeAffinity and required podAffinity conflict such that no node satisfies both? — The Pod remains Pending — both are hard Filter constraints applied jointly.<br>
+<strong>30.</strong> How would you check which node labels are available before writing a nodeAffinity rule? — <code>kubectl get nodes --show-labels</code>.<br>
+<strong>31.</strong> How would you verify the affinity spec Kubernetes actually stored for a Pod? — <code>kubectl get pod <name> -o jsonpath='{.spec.affinity}'</code>.<br>
+<strong>32.</strong> Why is <code>topologyKey</code> mandatory on podAffinity/podAntiAffinity but not on nodeAffinity? — nodeAffinity matches Node labels directly with no grouping concept; podAffinity needs a key to define what "nearby" means across nodes.<br>
+<strong>33.</strong> What's a typical topologyKey used for node-level (same-machine) co-location? — <code>kubernetes.io/hostname</code>.<br>
+<strong>34.</strong> What's a typical topologyKey used for zone-level co-location? — <code>topology.kubernetes.io/zone</code>.<br>
+<strong>35.</strong> Does changing a node's label after Pods are already scheduled retroactively evict Pods that no longer satisfy affinity? — No — "IgnoredDuringExecution" means already-running Pods are never re-evaluated or moved.<br>
+<strong>36.</strong> What is the risk of using required podAffinity as the very first workload deployed into a fresh namespace? — No anchor Pod exists yet to satisfy the labelSelector, so the Pod can deadlock Pending.<br>
+<strong>37.</strong> Would a preferred (not required) podAffinity rule cause the same first-deploy deadlock? — No — since it's a soft preference, the Pod still schedules even if no matching Pod exists yet.<br>
+<strong>38.</strong> What's the general guidance on defaulting to required vs preferred rules? — Default to preferred unless the constraint is truly non-negotiable, since required rules can strand Pods Pending.<br>
+<strong>39.</strong> Why should podAffinity typically use a broad topologyKey unless node-level co-location is essential? — It gives the scheduler more candidate nodes to choose from, reducing the chance of Pending Pods.<br>
+<strong>40.</strong> What complements nodeAffinity well for dedicating a node pool to specific workloads? — Taints and tolerations, used together with nodeAffinity rather than affinity alone.<br>
+<strong>41.</strong> Why is it good practice to test affinity rules in staging with realistic node labels before production rollout? — Label naming/values often differ across environments, and an untested rule can silently fail to match any node.<br>
+<strong>42.</strong> What's a pitfall of overusing required nodeAffinity for minor preferences? — It fragments available capacity and causes Pending Pods during normal node churn or scaling events.<br>
+<strong>43.</strong> Why must a topologyKey label be consistent across all relevant nodes? — If some nodes lack the label, the scheduler can't correlate them into a topology domain, effectively excluding them from evaluation.<br>
+<strong>44.</strong> How do you find which nodes currently host Pods matching a podAffinity labelSelector? — <code>kubectl get pods -o wide -l <label-selector></code> to see their node placement.<br>
+<strong>45.</strong> What kubectl command surfaces affinity-related scheduling failures across the cluster? — <code>kubectl get events --field-selector reason=FailedScheduling</code>.<br>
+<strong>46.</strong> Does nodeAffinity get re-evaluated by the kubelet after the Pod is bound to a node? — No — once bound, the Pod runs regardless of subsequent node label changes.<br>
+<strong>47.</strong> What is the effect of a preferred rule's weight being higher relative to another preferred rule? — Nodes satisfying the higher-weighted preference get proportionally more added score during the Score phase.<br>
+<strong>48.</strong> Why might a Pod with only preferred rules still land on a node matching none of them? — All preferred rules are soft; if no node satisfies any, the Pod is still scheduled on the best-scoring node available by other criteria.<br>
+<strong>49.</strong> What's a good way to detect that a required affinity rule (not resource shortage) is the actual cause of Pending Pods? — The FailedScheduling event text explicitly references node/pod affinity mismatch rather than insufficient CPU/memory.<br>
+<strong>50.</strong> Why is affinity described as governing "initial placement only"? — Because both required and preferred variants are suffixed IgnoredDuringExecution — they're consulted once at scheduling time and never enforced again for a running Pod.
+</div></details>
+
+<footer class="course-footer">Next: Topic 32 — Anti-Affinity (spreading replicas across nodes/zones for resilience).</footer>
+
+<script>
+  mermaid.initialize({ startOnLoad: true, theme: 'dark' });
+</script>
+
+</body>
+</html>

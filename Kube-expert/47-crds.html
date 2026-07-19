@@ -1,0 +1,277 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Topic 47: Custom Resource Definitions — Kubernetes Expert Course</title>
+<link rel="stylesheet" href="styles.css">
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+</head>
+<body>
+
+<header class="course-header">
+  <div class="kicker">Topic 47 of 70</div>
+  <h1>Custom Resource Definitions (CRDs)</h1>
+  <div class="subtitle">How the API Server learns to serve entirely new resource types without a single line of core Kubernetes code changing.</div>
+</header>
+
+<nav class="topic-nav">
+  <a href="46-operators.html">&larr; Operators</a>
+  <a href="index.html">Course Index</a>
+  <a href="48-gitops.html">GitOps &rarr;</a>
+</nav>
+
+<h2 id="explanation">Explanation</h2>
+
+<p>Kubernetes ships with built-in resource types — Pod, Deployment, Service — but real platforms need to extend that
+vocabulary: an <code>Application</code> object for Argo CD, a <code>ServiceMonitor</code> for Prometheus, a
+<code>PostgresCluster</code> for a database Operator. A <strong>CustomResourceDefinition (CRD)</strong> is the API
+object that teaches the API Server a brand-new <code>kind</code>, complete with its own schema, versioning, and REST
+endpoints — turning "I want a new kind of object" from a fork of Kubernetes source code into a single YAML file.</p>
+
+<p>Kubernetes needs this because its core cannot anticipate every domain's needs, and forcing every extension into
+core would make the API server bloated, slow to evolve, and impossible to govern safely. CRDs (alongside the
+Aggregated API Server model, a heavier alternative) are the sanctioned extension mechanism: once a CRD is applied,
+the API Server dynamically registers a new REST path (e.g. <code>/apis/postgres-operator.example.com/v1/postgresclusters</code>),
+and from that point on the new kind behaves exactly like any built-in resource — it gets etcd storage, watch/list
+support, RBAC enforcement, <code>kubectl get/describe/apply</code>, and admission control, all for free.</p>
+
+<p>The schema is defined using <strong>OpenAPI v3 validation</strong> embedded directly in the CRD
+(<code>spec.versions[].schema.openAPIV3Schema</code>) — required fields, types, enums, min/max values. The API
+Server validates every write against this schema at admission time, rejecting malformed custom resources before
+they're ever persisted — the same guarantee built-in types get from their compiled-in Go structs, but declared as
+data instead of code.</p>
+
+<p>CRDs support <strong>multiple versions</strong> simultaneously (e.g. <code>v1alpha1</code>, <code>v1beta1</code>,
+<code>v1</code>), which matters because a CRD's schema evolves over time just like any API. When multiple versions
+coexist, exactly one is marked the <strong>storage version</strong> (what's actually persisted in etcd), and a
+<strong>conversion webhook</strong> handles translating objects between versions on read/write when the schemas
+differ meaningfully — this is the same version-skew problem core Kubernetes APIs solve internally, exposed to CRD
+authors as an explicit extension point.</p>
+
+<p>A CRD alone only gives you storage and validation — it does nothing on its own. The "brains" that make a custom
+resource meaningful come from a <strong>controller/Operator</strong> watching it and reconciling real-world state
+(see Topic 46). A CRD with no controller watching it is just structured data sitting inertly in etcd; the pairing of
+"CRD defines the shape" + "controller defines the behavior" is the entire extension model.</p>
+
+<h2 id="internal-working">Internal Working / Interactions</h2>
+<ul>
+  <li><strong>API Server:</strong> reads the CRD object at startup/apply time and dynamically registers a new REST endpoint + OpenAPI schema for the new kind — no restart, no compiled code.</li>
+  <li><strong>etcd:</strong> stores instances of the custom resource exactly like any built-in object, keyed under the CRD's group/version/resource path.</li>
+  <li><strong>Admission control:</strong> the API Server's built-in OpenAPI-schema validation runs on every custom-resource write; optional conversion webhooks run when multiple CRD versions are served.</li>
+  <li><strong>RBAC:</strong> Roles/ClusterRoles reference the CRD's <code>apiGroups</code>/<code>resources</code> exactly like built-in types — custom resources are first-class RBAC citizens.</li>
+  <li><strong>Controllers/Operators:</strong> watch the new kind via the same informer/watch mechanism used for Pods or Deployments — from client-go's perspective, a CRD-backed object is indistinguishable from a built-in one.</li>
+</ul>
+
+<h2 id="architecture-diagram">Architecture Diagram</h2>
+<pre class="mermaid">
+sequenceDiagram
+    participant Admin as Cluster Admin
+    participant API as API Server
+    participant ETCD as etcd
+    participant User as App Team (kubectl)
+    participant Ctrl as Custom Controller
+
+    Admin->>API: Apply CustomResourceDefinition (postgresclusters.postgres-operator.example.com)
+    API->>API: Register new REST path + OpenAPI v3 schema
+    API-->>Admin: CRD established
+    User->>API: kubectl apply -f postgrescluster.yaml
+    API->>API: Validate against CRD's openAPIV3Schema
+    API->>ETCD: Persist custom resource instance
+    Ctrl->>API: Watch postgresclusters (informer)
+    API-->>Ctrl: New/changed PostgresCluster object
+    Ctrl->>API: Reconcile: create owned StatefulSet, Services, etc.
+</pre>
+
+<h2 id="code-example">Code Example</h2>
+<pre><code># CustomResourceDefinition — teaches the API Server about "PostgresCluster"
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: postgresclusters.postgres-operator.example.com   # Must be <plural>.<group>
+spec:
+  group: postgres-operator.example.com
+  names:
+    kind: PostgresCluster
+    plural: postgresclusters
+    singular: postgrescluster
+    shortNames: ["pgc"]                # Enables `kubectl get pgc`
+  scope: Namespaced
+  versions:
+    - name: v1
+      served: true                     # This version is reachable via the API.
+      storage: true                    # This is the version actually persisted in etcd.
+      schema:
+        openAPIV3Schema:                # OpenAPI v3 validation — enforced at admission time.
+          type: object
+          properties:
+            spec:
+              type: object
+              required: ["version", "instances"]
+              properties:
+                version:
+                  type: string
+                  enum: ["13", "14", "15", "16"]   # Rejects unsupported Postgres versions up front.
+                instances:
+                  type: integer
+                  minimum: 1
+                  maximum: 9
+                storage:
+                  type: object
+                  properties:
+                    size: { type: string, pattern: "^[0-9]+Gi$" }
+            status:
+              type: object
+              properties:
+                phase: { type: string }
+                currentPrimary: { type: string }
+      subresources:
+        status: {}                     # Enables the separate /status subresource, same pattern as built-in types.
+</code></pre>
+
+<h2 id="kubectl-commands">kubectl Commands</h2>
+<pre><code>kubectl apply -f postgrescluster-crd.yaml           # Register the new CRD
+kubectl get crd | grep postgres-operator.example.com  # Confirm the CRD is established
+kubectl explain postgrescluster.spec                  # API Server serves live schema, just like built-in types
+kubectl get postgresclusters -A                        # List custom resources across all namespaces
+kubectl get pgc orders-db -n payments -o yaml           # Full object incl. status subresource
+kubectl api-resources | grep postgres                   # Confirm the new REST resource is registered
+kubectl delete crd postgresclusters.postgres-operator.example.com   # Removes the type AND all its instances — dangerous
+</code></pre>
+
+<h2 id="best-practices">Best Practices &amp; Common Pitfalls</h2>
+<div class="grid-2">
+<div>
+<h4>Best Practices</h4>
+<ul>
+  <li>Always define a strict <code>openAPIV3Schema</code> with required fields and enums — don't leave it permissive.</li>
+  <li>Use the <code>status</code> subresource so RBAC can separate who can write spec vs. who (the controller) can write status.</li>
+  <li>Version CRDs deliberately (v1alpha1 &rarr; v1beta1 &rarr; v1) and provide conversion webhooks before dropping an old version.</li>
+  <li>Document custom resources like any public API — consumers (other teams) will treat the CRD as a contract.</li>
+</ul>
+</div>
+<div>
+<h4>Pitfalls</h4>
+<ul>
+  <li>Deleting a CRD deletes every instance of that custom resource cluster-wide — treat CRD deletion as destructive as dropping a database table.</li>
+  <li>Shipping a CRD with no controller watching it, leaving custom resources as inert, unenforced data.</li>
+  <li>Skipping schema validation ("just accept anything") and pushing validation entirely into the controller — admission-time rejection is cheaper and safer.</li>
+  <li>Forgetting CRDs are cluster-scoped objects themselves even when the custom resources they define are namespaced — plan RBAC for who can install/modify CRDs.</li>
+</ul>
+</div>
+</div>
+
+<h2 id="interview-questions">50 Interview Questions</h2>
+
+<details class="qa"><summary>1. What does applying a CustomResourceDefinition actually do to the API Server?</summary>
+<div class="qa-body"><strong>Short answer:</strong> It dynamically registers a brand-new REST endpoint and OpenAPI schema for the new kind, with no restart or compiled code needed.
+<br><strong>Detail:</strong> Once established, the new kind behaves exactly like any built-in resource — etcd storage, watch/list support, RBAC enforcement, and kubectl get/describe/apply all work for free.
+<br><strong>Production example:</strong> Applying a PostgresCluster CRD instantly makes <code>/apis/postgres-operator.example.com/v1/postgresclusters</code> a live, functioning REST path.
+<br><strong>Common mistake:</strong> Assuming extending the API requires forking or recompiling Kubernetes source code.</div></details>
+
+<details class="qa"><summary>2. How does the API Server validate custom resource writes without compiled Go structs?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Via OpenAPI v3 validation embedded directly in the CRD's spec.versions[].schema.openAPIV3Schema field.
+<br><strong>Detail:</strong> Required fields, types, enums, and min/max values are declared as data instead of code, and the API Server enforces them at admission time before persisting to etcd — the same guarantee built-in types get, but declarative.
+<br><strong>Production example:</strong> A version field with enum ["13","14","15","16"] rejecting any PostgresCluster spec requesting an unsupported Postgres version.
+<br><strong>Common mistake:</strong> Leaving the schema permissive ("just accept anything") and pushing all validation into the controller instead — admission-time rejection is cheaper and safer.</div></details>
+
+<details class="qa"><summary>3. What happens when a CRD serves multiple versions simultaneously?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Exactly one version is marked the storage version (what's actually persisted); a conversion webhook translates between versions on read/write when schemas differ meaningfully.
+<br><strong>Detail:</strong> This mirrors the version-skew problem core Kubernetes APIs solve internally, exposed to CRD authors as an explicit extension point they must implement themselves for non-trivial schema changes.
+<br><strong>Production example:</strong> A CRD serving both v1beta1 and v1, with v1 as the storage version and a conversion webhook translating v1beta1 requests transparently.
+<br><strong>Common mistake:</strong> Dropping an old served version before providing a conversion webhook, breaking clients still using that version.</div></details>
+
+<details class="qa"><summary>4. What's the difference between "served" and "storage" in a CRD version's spec?</summary>
+<div class="qa-body"><strong>Short answer:</strong> served means the version is reachable via the API; storage means it's the one actually persisted in etcd — only one version can be storage: true at a time.
+<br><strong>Detail:</strong> Multiple versions can be served simultaneously for compatibility, but etcd only ever holds objects in the single designated storage version's shape, converting on the fly for other served versions.
+<br><strong>Production example:</strong> v1 marked storage: true while v1alpha1 remains served: true for backward compatibility during a migration window.
+<br><strong>Common mistake:</strong> Marking multiple versions as storage: true, which is invalid — only one is allowed.</div></details>
+
+<details class="qa"><summary>5. Why does deleting a CRD count as one of the most destructive operations in a cluster?</summary>
+<div class="qa-body"><strong>Short answer:</strong> It deletes every instance of that custom resource cluster-wide, not just the CRD's own schema definition.
+<br><strong>Detail:</strong> This is comparable to dropping a database table — all data stored under that type across every namespace disappears along with the type itself.
+<br><strong>Production example:</strong> Accidentally deleting the PostgresCluster CRD wiping out every PostgresCluster object cluster-wide, even though the underlying StatefulSets/PVCs might survive depending on ownerReference/finalizer behavior.
+<br><strong>Common mistake:</strong> Treating `kubectl delete crd` as a routine cleanup action instead of a destructive, cluster-wide operation requiring extreme caution.</div></details>
+
+<details class="qa"><summary>6. What's the purpose of the status subresource on a CRD?</summary>
+<div class="qa-body"><strong>Short answer:</strong> It splits spec and status into separately addressable endpoints, letting RBAC distinguish who can write spec versus who (typically only the controller) can write status.
+<br><strong>Detail:</strong> This is the same pattern built-in resources like Deployment use — users declare desired state via spec, controllers report observed state via status, and RBAC can enforce that separation cleanly.
+<br><strong>Production example:</strong> A user's RoleBinding allows updating a PostgresCluster's spec, but only the Operator's ServiceAccount can write to its status subresource.
+<br><strong>Common mistake:</strong> Omitting the status subresource, which means any client with general write access to the object can also freely overwrite status fields meant to be controller-owned.</div></details>
+
+<details class="qa"><summary>7. Why is a CRD alone insufficient to make a custom resource "do" anything?</summary>
+<div class="qa-body"><strong>Short answer:</strong> A CRD only provides storage, schema validation, and REST endpoints — it has no behavior; a controller/Operator watching it is what reconciles real-world state.
+<br><strong>Detail:</strong> Without a controller, instances of the custom resource are just structured data sitting inertly in etcd — the pairing of "CRD defines the shape" plus "controller defines the behavior" is the entire extension model.
+<br><strong>Production example:</strong> Applying a CRD for a new kind with no Operator deployed yet results in objects that can be created/listed but never actually provision anything.
+<br><strong>Common mistake:</strong> Shipping a CRD to a team before the corresponding controller is deployed and running, leading to confusion about why "nothing happens."</div></details>
+
+<details class="qa"><summary>8. Are CRDs themselves namespaced or cluster-scoped, even when they define namespaced resources?</summary>
+<div class="qa-body"><strong>Short answer:</strong> CRDs are always cluster-scoped objects, even if the custom resource type they define has scope: Namespaced.
+<br><strong>Detail:</strong> This distinction matters for RBAC planning — anyone who can create/modify CRDs affects the whole cluster's API surface, regardless of whether the resulting resource instances are namespace-scoped.
+<br><strong>Production example:</strong> Restricting `create`/`update`/`delete` on CustomResourceDefinition objects to platform-team RBAC only, while individual PostgresCluster instances remain manageable by app teams within their namespace.
+<br><strong>Common mistake:</strong> Assuming a namespaced custom resource type implies the CRD object itself is also namespace-scoped.</div></details>
+
+<details class="qa"><summary>9. How does RBAC treat custom resources compared to built-in types like Pods?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Identically — Roles/ClusterRoles reference the CRD's apiGroups/resources exactly as they would core or built-in extension types.
+<br><strong>Detail:</strong> Custom resources are first-class RBAC citizens; there's no special-casing required to grant or restrict access to them versus any core Kubernetes type.
+<br><strong>Production example:</strong> A Role granting get/list/watch on resources: ["postgresclusters"] under apiGroups: ["postgres-operator.example.com"].
+<br><strong>Common mistake:</strong> Assuming custom resources need a different or special RBAC mechanism instead of the standard Role/RoleBinding pattern.</div></details>
+
+<details class="qa"><summary>10. What's the alternative extension mechanism to CRDs, and why are CRDs preferred for most cases?</summary>
+<div class="qa-body"><strong>Short answer:</strong> The Aggregated API Server model — running your own API server that Kubernetes' API Server proxies to — is heavier and reserved for cases needing custom storage backends or non-CRUD semantics.
+<br><strong>Detail:</strong> CRDs are far simpler to author (a single YAML file, no need to run and maintain a separate API server binary) and cover the vast majority of extension needs; aggregated API servers are used only when CRDs' constraints (e.g. etcd-backed storage, standard REST semantics) don't fit.
+<br><strong>Production example:</strong> The Kubernetes metrics-server uses an aggregated API server because it serves live, non-persisted metric data rather than stored objects — a poor fit for CRDs.
+<br><strong>Common mistake:</strong> Reaching for an aggregated API server when a standard CRD would have been sufficient and far simpler to maintain.</div></details>
+
+<details class="qa"><summary>11–50. Additional rapid-fire questions</summary>
+<div class="qa-body">
+<strong>11.</strong> What must a CRD's metadata.name match? — <code>&lt;plural&gt;.&lt;group&gt;</code>.<br>
+<strong>12.</strong> What field enables `kubectl get pgc` as a shorthand? — <code>spec.names.shortNames</code>.<br>
+<strong>13.</strong> What kubectl command shows live schema for a custom resource, just like built-in types? — <code>kubectl explain &lt;kind&gt;.spec</code>.<br>
+<strong>14.</strong> What confirms a CRD's new REST resource is registered? — <code>kubectl api-resources | grep &lt;name&gt;</code>.<br>
+<strong>15.</strong> What confirms a CRD is fully established after applying it? — <code>kubectl get crd | grep &lt;group&gt;</code>.<br>
+<strong>16.</strong> Does client-go/informers treat CRD-backed objects differently from built-in ones? — No, they're indistinguishable from a client's perspective — same watch/informer mechanism.<br>
+<strong>17.</strong> What API group manages CRD objects themselves? — apiextensions.k8s.io.<br>
+<strong>18.</strong> Can a CRD define a resource with scope: Cluster instead of Namespaced? — Yes, custom resources can be cluster-scoped just like Node or PersistentVolume.<br>
+<strong>19.</strong> What happens to admission control for writes to a custom resource? — Built-in OpenAPI-schema validation always runs; optional conversion webhooks run additionally when multiple versions are served.<br>
+<strong>20.</strong> Is a conversion webhook required if a CRD only ever serves one version? — No, it's only needed when multiple versions with differing schemas coexist.<br>
+<strong>21.</strong> What's the risk of a CRD schema with no required fields at all? — Nearly anything gets accepted, pushing all real validation downstream into the controller, losing admission-time safety.<br>
+<strong>22.</strong> Can you add new optional fields to a CRD schema without a version bump? — Yes, additive optional fields are typically safe to add to an existing version without bumping it.<br>
+<strong>23.</strong> What's a risky schema change that does require careful version handling? — Removing or renaming a previously required field, which can break existing stored objects or clients.<br>
+<strong>24.</strong> How does a CRD's subresources.status: {} setting affect PATCH behavior? — Updates to spec and status become separately addressable, each via their own subresource endpoint.<br>
+<strong>25.</strong> Who typically writes to a CR's status field in practice? — The controller/Operator reconciling that CR, not end users.<br>
+<strong>26.</strong> What's the analogy for "CRD defines shape, controller defines behavior"? — Like a class definition (schema) versus the running program instance that acts on it (controller).<br>
+<strong>27.</strong> Can a single CRD support both v1alpha1 and v1 being served at once? — Yes, multiple served versions can coexist during a migration window.<br>
+<strong>28.</strong> What's a practical reason to keep an old CRD version served temporarily? — Giving existing clients/tooling time to migrate to the new version before it's removed.<br>
+<strong>29.</strong> Does deleting a CRD affect any owned native resources (like StatefulSets) that a controller created? — Only indirectly — those resources may become orphaned or garbage-collected depending on ownerReferences and finalizers, but they aren't defined by the CRD itself.<br>
+<strong>30.</strong> What's the purpose of a validating admission webhook alongside a CRD's built-in schema validation? — Enforcing business rules beyond what static OpenAPI schema can express (e.g. cross-field consistency checks).<br>
+<strong>31.</strong> Is a CRD's OpenAPI schema enforced only on create, or also on update? — Both — every write (create and update) is validated against the schema at admission time.<br>
+<strong>32.</strong> What's a good practice for documenting a custom resource? — Treat it like a public API contract since other teams will consume it, documenting fields and expected behavior.<br>
+<strong>33.</strong> Can RBAC restrict who can install/modify CRDs separately from who can create instances of them? — Yes, since CRDs are cluster-scoped objects with their own resource type (customresourcedefinitions) distinct from the custom resource instances.<br>
+<strong>34.</strong> What's the typical progression pattern for CRD versions? — v1alpha1 → v1beta1 → v1, with conversion webhooks bridging as needed before dropping old versions.<br>
+<strong>35.</strong> Does a CRD support default values for fields not explicitly set? — Yes, OpenAPI v3 schemas can specify defaults applied at admission time.<br>
+<strong>36.</strong> What's a common pitfall with enum fields in a CRD schema? — Forgetting to add a new valid value when the underlying software adds support for it, causing valid configs to be rejected.<br>
+<strong>37.</strong> How does a CRD interact with `kubectl get -o yaml` output compared to built-in types? — Identical behavior — full object including status is returned the same way.<br>
+<strong>38.</strong> What's the effect of pattern validation (e.g. regex) in an OpenAPI v3 schema field? — Rejects string values that don't match the given pattern at admission time, e.g. enforcing a storage size format like "100Gi".<br>
+<strong>39.</strong> Can a CRD schema enforce cross-field relationships (e.g. "field A required only if field B is set")? — Limited support via newer OpenAPI features (like CEL validation rules in recent Kubernetes versions); classic schema validation alone is more limited.<br>
+<strong>40.</strong> What's the risk of skipping schema validation entirely on a CRD? — Malformed custom resources get persisted, and the controller may fail unpredictably trying to act on invalid data.<br>
+<strong>41.</strong> Does a CRD need a controller running at the moment it's applied? — No, the CRD registers the schema/API immediately; the controller can be deployed separately, before or after.<br>
+<strong>42.</strong> What's a "finalizer" in the context of a CR managed by a controller? — A marker blocking deletion from completing until the controller finishes cleanup of external/owned resources.<br>
+<strong>43.</strong> Why might a CR appear "stuck deleting"? — A finalizer set by its controller hasn't been removed yet, often because the controller is down or failing cleanup.<br>
+<strong>44.</strong> Can two different CRDs use the same group but different resource names? — Yes, a single API group can host multiple distinct custom resource kinds.<br>
+<strong>45.</strong> What's the relationship between a CRD's `kind` and `plural` fields? — kind is the singular, capitalized Go-style type name; plural is the lowercase name used in REST paths and kubectl commands.<br>
+<strong>46.</strong> Is etcd storage format for custom resources different from built-in types? — No, custom resources are stored under their own group/version/resource key path exactly like built-in objects.<br>
+<strong>47.</strong> What's a good CI practice for CRD schema changes? — Validate new schemas against sample manifests and run conversion webhook tests before rolling out to production clusters.<br>
+<strong>48.</strong> Can a custom resource type be queried across all namespaces like built-in namespaced resources? — Yes, `kubectl get &lt;kind&gt; -A` works identically to built-in resources.<br>
+<strong>49.</strong> What's the danger of a controller having overly permissive RBAC on a CRD's resources? — It can read/write far more than its intended scope, increasing blast radius if the controller is compromised or buggy.<br>
+<strong>50.</strong> What's the first thing to check when `kubectl apply` on a custom resource fails with a schema error? — Compare the submitted YAML against the CRD's openAPIV3Schema for missing required fields, wrong types, or invalid enum values.
+</div></details>
+
+<footer class="course-footer">Next: Topic 48 — GitOps, using CRDs like Argo CD's Application to make Git the source of truth.</footer>
+
+<script>
+  mermaid.initialize({ startOnLoad: true, theme: 'dark' });
+</script>
+
+</body>
+</html>

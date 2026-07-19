@@ -1,0 +1,322 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Topic 36: Resource Management — Kubernetes Expert Course</title>
+<link rel="stylesheet" href="styles.css">
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+</head>
+<body>
+
+<header class="course-header">
+  <div class="kicker">Topic 36 of 70</div>
+  <h1>Resource Management</h1>
+  <div class="subtitle">Requests, limits, QoS classes, and cluster-wide guardrails that keep noisy neighbors from starving each other.</div>
+</header>
+
+<nav class="topic-nav">
+  <a href="35-topology-spread.html">&larr; Topology Spread</a>
+  <a href="index.html">Course Index</a>
+  <a href="37-hpa.html">HPA &rarr;</a>
+</nav>
+
+<h2 id="explanation">Explanation</h2>
+<p>Kubernetes resource management is the system of <strong>requests</strong>, <strong>limits</strong>, <strong>Quality
+of Service (QoS) classes</strong>, and cluster-wide guardrails (<code>LimitRange</code>, <code>ResourceQuota</code>)
+that together decide how CPU and memory are shared across every Pod on every node. A <strong>request</strong> is what
+a container is guaranteed to get and what the Scheduler uses to decide which node has room; a <strong>limit</strong>
+is the hard ceiling the container is not allowed to exceed, enforced by the kernel via cgroups on the node. These are
+two entirely separate mechanisms solving two entirely separate problems — placement (requests) and containment
+(limits) — and conflating them is the single most common source of scheduling and stability confusion in Kubernetes.</p>
+
+<p>Kubernetes needs this because a node's physical CPU and memory are finite and shared across every Pod scheduled to
+it. Without requests, the Scheduler has no way to reason about whether a node has room for another Pod — it would be
+bin-packing blind. Without limits, a single misbehaving container (memory leak, runaway CPU loop) can starve every
+other Pod on the same node, since the kernel has no idea it should be constrained. Requests protect the Scheduler's
+decision-making; limits protect node stability.</p>
+
+<p>CPU and memory behave very differently once a limit is exceeded, and this distinction matters enormously in
+production: CPU is a <strong>compressible</strong> resource — a container exceeding its CPU limit is simply throttled
+(CFS bandwidth throttling), it keeps running, just slower. Memory is <strong>incompressible</strong> — a container
+exceeding its memory limit gets OOM-killed by the kernel, immediately and unconditionally, because there's no way to
+"throttle" memory usage after the fact.</p>
+
+<p>Every Pod is assigned one of three <strong>QoS classes</strong> automatically, derived purely from how requests and
+limits are set (no separate field to configure):</p>
+<ul>
+  <li><strong>Guaranteed</strong> — every container has requests == limits, for both CPU and memory. Highest protection; last to be OOM-killed or evicted under node pressure.</li>
+  <li><strong>Burstable</strong> — at least one container has a request set, but requests != limits (or limits are unset for some resource). Evicted after BestEffort but before Guaranteed under pressure.</li>
+  <li><strong>BestEffort</strong> — no requests or limits set at all. First to be OOM-killed/evicted under node pressure.</li>
+</ul>
+
+<p>Beyond individual Pods, <code>LimitRange</code> objects set per-container/per-Pod defaults and min/max bounds within
+a namespace (so a forgotten request doesn't default to "unbounded"), while <code>ResourceQuota</code> objects cap the
+total resource consumption across an entire namespace — the tool platform teams use to prevent one team's namespace
+from consuming an entire cluster's capacity. Together, these four mechanisms form the complete resource-governance
+toolkit: requests/limits govern one Pod, LimitRange governs defaults within a namespace, ResourceQuota governs totals
+within a namespace.</p>
+
+<div class="callout warn">
+  <strong>Production incident pattern:</strong> a container with no memory limit set (BestEffort or Burstable-with-unset-limit)
+  develops a memory leak. Because there's no ceiling, it slowly consumes the entire node's memory, eventually
+  triggering node-level memory pressure that evicts <em>other, healthy</em> Pods on that node — a single misconfigured
+  Deployment takes down unrelated services. This is why "always set limits" is close to a universal rule.
+</div>
+
+<h2 id="internal-working">Internal Working / Interactions</h2>
+<ul>
+  <li><strong>Scheduler:</strong> reads <code>requests</code> only (never limits) during the Filter phase to determine which nodes have enough allocatable capacity; scoring plugins like <code>NodeResourcesFit</code> use requests to bin-pack or spread.</li>
+  <li><strong>kubelet:</strong> configures cgroups (v1 or v2) on the node according to both requests (for the cgroup's relative CPU share / OOM score adjustment) and limits (for the hard cgroup ceiling), then relies on the Linux kernel to enforce them.</li>
+  <li><strong>Kernel (cgroups + OOM killer):</strong> throttles CPU via CFS bandwidth control when a container exceeds its CPU limit; invokes the OOM killer immediately when a container exceeds its memory limit, using each Pod's QoS-derived <code>oom_score_adj</code> to decide kill order under system-wide pressure.</li>
+  <li><strong>API Server / admission (LimitRange, ResourceQuota):</strong> LimitRange is enforced at admission time (defaults injected, min/max validated) when a Pod is created; ResourceQuota is enforced at admission time by rejecting the request outright if the namespace total would be exceeded.</li>
+  <li><strong>Metrics pipeline (metrics-server):</strong> reads actual usage (not requests/limits) from kubelet's cAdvisor-derived stats, feeding HPA/VPA decisions (topics 37-38) — a separate data path from scheduling.</li>
+</ul>
+
+<h2 id="architecture-diagram">Architecture Diagram</h2>
+<pre class="mermaid">
+flowchart TB
+    subgraph Node["Node: 8 CPU / 16Gi Memory"]
+        P1["Pod A - Guaranteed\nreq=lim=2CPU/2Gi"]
+        P2["Pod B - Burstable\nreq=1CPU/1Gi lim=2CPU/2Gi"]
+        P3["Pod C - BestEffort\nno req/lim"]
+    end
+
+    SCHED["Scheduler"] -->|"Sums requests: 2+1+0=3 CPU\nfits in 8 CPU allocatable"| Node
+    PRESSURE["Node under memory pressure"] -->|"1st evicted"| P3
+    PRESSURE -->|"2nd evicted"| P2
+    PRESSURE -->|"Last, protected"| P1
+</pre>
+
+<pre class="mermaid">
+sequenceDiagram
+    participant U as kubectl apply
+    participant A as API Server
+    participant LR as LimitRange (admission)
+    participant RQ as ResourceQuota (admission)
+    participant S as Scheduler
+    participant K as kubelet
+    participant C as cgroups/kernel
+
+    U->>A: Create Pod (no resources set)
+    A->>LR: Apply namespace default requests/limits
+    LR-->>A: Pod now has req=500m/512Mi, lim=1/1Gi
+    A->>RQ: Check namespace total wouldn't exceed quota
+    RQ-->>A: OK, within quota
+    A->>S: Pod persisted, watch fires
+    S->>S: Filter nodes by allocatable >= requests
+    S->>A: Bind to node-3
+    K->>C: Configure cgroup: cpu.shares from request, memory.max from limit
+    C-->>K: Enforced at runtime (throttle CPU / OOM-kill memory as needed)
+</pre>
+
+<h2 id="code-example">Code Example</h2>
+<pre><code>apiVersion: v1
+kind: Pod
+metadata:
+  name: checkout-guaranteed
+spec:
+  containers:
+    - name: checkout
+      image: registry.internal/checkout-service:2.4.1
+      resources:
+        requests:            # Scheduler placement guarantee
+          cpu: "500m"
+          memory: "512Mi"
+        limits:               # requests == limits for BOTH cpu and memory -> QoS: Guaranteed
+          cpu: "500m"
+          memory: "512Mi"
+</code></pre>
+
+<pre><code>apiVersion: v1
+kind: LimitRange
+metadata:
+  name: default-limits
+  namespace: payments
+spec:
+  limits:
+    - type: Container
+      default:                 # applied if a container omits limits
+        cpu: "500m"
+        memory: "512Mi"
+      defaultRequest:           # applied if a container omits requests
+        cpu: "250m"
+        memory: "256Mi"
+      max:                      # hard ceiling any container in this namespace may request
+        cpu: "2"
+        memory: "2Gi"
+      min:                      # hard floor
+        cpu: "100m"
+        memory: "128Mi"
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: payments-quota
+  namespace: payments
+spec:
+  hard:
+    requests.cpu: "20"          # sum of all container requests in namespace cannot exceed this
+    requests.memory: 40Gi
+    limits.cpu: "40"
+    limits.memory: 80Gi
+    pods: "50"                  # also caps total pod count
+</code></pre>
+
+<h2 id="kubectl-commands">kubectl Commands</h2>
+<pre><code># See a pod's QoS class directly
+kubectl get pod checkout-guaranteed -o jsonpath='{.status.qosClass}'
+
+# View actual resource usage vs requests/limits (requires metrics-server)
+kubectl top pod -n payments
+kubectl top node
+
+# Inspect a namespace's ResourceQuota usage
+kubectl describe resourcequota payments-quota -n payments
+
+# Inspect a namespace's LimitRange defaults
+kubectl describe limitrange default-limits -n payments
+
+# Find pods without resource requests/limits set (BestEffort candidates)
+kubectl get pods -A -o json | jq -r '.items[] | select(.spec.containers[].resources.requests == null) | .metadata.name'
+
+# See why a pod was OOMKilled
+kubectl describe pod <pod-name> | grep -A5 "Last State"
+</code></pre>
+
+<h2 id="best-practices">Best Practices &amp; Common Pitfalls</h2>
+<div class="grid-2">
+<div>
+<h4>Do's</h4>
+<ul>
+  <li>Always set both requests and limits for memory (incompressible) to avoid one leaky pod destabilizing a node.</li>
+  <li>Use Guaranteed QoS for latency-critical or stateful workloads that must never be preempted casually.</li>
+  <li>Set a LimitRange in every namespace as a safety net against forgotten resource fields.</li>
+  <li>Set a ResourceQuota per team/namespace to enforce fair-share capacity in shared clusters.</li>
+</ul>
+</div>
+<div>
+<h4>Don'ts</h4>
+<ul>
+  <li>Don't set a CPU limit far above the request for latency-sensitive services — CFS throttling under contention can cause severe tail-latency spikes even with a generous limit.</li>
+  <li>Don't leave memory limits unset "to be safe" — it removes the isolation that requests/limits are meant to guarantee.</li>
+  <li>Don't confuse requests (scheduling) with limits (runtime enforcement) — Scheduler never looks at limits.</li>
+  <li>Don't set requests far below real usage just to fit more pods per node — it causes node-level overcommit and cascading evictions under load.</li>
+</ul>
+</div>
+</div>
+
+<h2 id="interview-questions">50 Interview Questions</h2>
+
+<details class="qa"><summary>1. What's the fundamental difference between a resource request and a resource limit?</summary>
+<div class="qa-body"><strong>Short answer:</strong> A request is what the Scheduler uses to guarantee placement and reserve capacity; a limit is the hard runtime ceiling enforced by the kernel via cgroups.
+<br><strong>Detailed explanation:</strong> Requests solve placement — deciding which node has room; limits solve containment — preventing a container from consuming unbounded resources once running. Conflating the two is the most common source of scheduling/stability confusion.
+<br><strong>Production example:</strong> checkout-service requests 500m/512Mi (used by the Scheduler) and limits at the same values for Guaranteed QoS.
+<br><strong>Common mistake:</strong> Assuming the Scheduler considers limits when deciding placement — it only ever reads requests.</div></details>
+
+<details class="qa"><summary>2. Why do CPU and memory behave differently when a limit is exceeded?</summary>
+<div class="qa-body"><strong>Short answer:</strong> CPU is compressible — the container is throttled but keeps running; memory is incompressible — the container is OOM-killed immediately.
+<br><strong>Detailed explanation:</strong> CFS bandwidth throttling can pause CPU cycles without killing the process, but there's no equivalent way to "throttle" memory usage after the fact, so the kernel's OOM killer intervenes instead.
+<br><strong>Production example:</strong> A CPU-limited batch job ran slower under load but stayed up; a memory-limited service with a leak was OOM-killed and restarted repeatedly.
+<br><strong>Common mistake:</strong> Setting a CPU limit far above request for latency-sensitive services, not realizing CFS throttling under contention can still cause severe tail-latency spikes.</div></details>
+
+<details class="qa"><summary>3. What are the three QoS classes and how are they determined?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Guaranteed (requests == limits for all resources), Burstable (some requests set but requests != limits), BestEffort (no requests/limits at all) — derived automatically, never set directly.
+<br><strong>Detailed explanation:</strong> QoS class determines eviction/OOM-kill order under node pressure: BestEffort first, then Burstable, Guaranteed last — it's purely a byproduct of how requests/limits are configured.
+<br><strong>Production example:</strong> A latency-critical payment service is deliberately configured Guaranteed so it's the last thing evicted under node memory pressure.
+<br><strong>Common mistake:</strong> Trying to set QoS class as a field directly — it can only be influenced indirectly through requests/limits configuration.</div></details>
+
+<details class="qa"><summary>4. What is the difference between a LimitRange and a ResourceQuota?</summary>
+<div class="qa-body"><strong>Short answer:</strong> LimitRange sets per-container/per-Pod defaults and min/max bounds within a namespace; ResourceQuota caps total resource consumption across the entire namespace.
+<br><strong>Detailed explanation:</strong> LimitRange prevents "unbounded by accident" (a forgotten request defaults sensibly); ResourceQuota prevents "one team consumes everything" at the aggregate namespace level — they compose rather than overlap.
+<br><strong>Production example:</strong> payments namespace has a LimitRange defaulting unset requests to 250m/256Mi, and a ResourceQuota capping total namespace requests.cpu at 20.
+<br><strong>Common mistake:</strong> Assuming a LimitRange alone prevents a namespace from consuming excessive total cluster capacity — that's ResourceQuota's job.</div></details>
+
+<details class="qa"><summary>5. Why is a container with no memory limit set considered dangerous in production?</summary>
+<div class="qa-body"><strong>Short answer:</strong> A memory leak in that container can slowly consume the entire node's memory, triggering node-level memory pressure that evicts other, healthy Pods on the same node.
+<br><strong>Detailed explanation:</strong> Without a ceiling, there's no isolation mechanism protecting neighbors — a single misconfigured Deployment can take down unrelated services sharing the node.
+<br><strong>Production example:</strong> A BestEffort Pod with a slow memory leak triggered node-wide memory pressure, causing an unrelated Burstable Pod to be evicted first.
+<br><strong>Common mistake:</strong> Leaving memory limits unset "to be safe," which actually removes the isolation requests/limits are meant to guarantee.</div></details>
+
+<details class="qa"><summary>6. How does the Scheduler use resource requests during Filter and Score?</summary>
+<div class="qa-body"><strong>Short answer:</strong> It reads requests (never limits) to determine which nodes have enough allocatable capacity, and scoring plugins like NodeResourcesFit use requests to bin-pack or spread.
+<br><strong>Detailed explanation:</strong> This is why unset requests make a Pod effectively invisible to capacity-aware scheduling — the Scheduler treats it as needing zero resources, which can lead to overcommit.
+<br><strong>Production example:</strong> A Pod with no CPU request was scheduled onto an already-busy node because the Scheduler saw zero declared demand.
+<br><strong>Common mistake:</strong> Setting requests far below real usage just to fit more pods per node, causing node-level overcommit and cascading evictions under load.</div></details>
+
+<details class="qa"><summary>7. How do requests and limits translate into actual kernel enforcement?</summary>
+<div class="qa-body"><strong>Short answer:</strong> kubelet configures cgroups based on both — request informs relative CPU share/OOM score adjustment, limit sets the hard cgroup ceiling — and the Linux kernel enforces them at runtime.
+<br><strong>Detailed explanation:</strong> The kernel's CFS bandwidth controller throttles CPU when a limit is exceeded, and the OOM killer uses each Pod's QoS-derived <code>oom_score_adj</code> to decide kill order under system-wide memory pressure.
+<br><strong>Production example:</strong> Under system-wide pressure, the kernel's OOM killer targeted the BestEffort Pod first because of its higher oom_score_adj value.
+<br><strong>Common mistake:</strong> Assuming Kubernetes itself enforces limits — enforcement is delegated entirely to the kernel via cgroups, Kubernetes just configures them.</div></details>
+
+<details class="qa"><summary>8. When is a ResourceQuota enforced, and what happens if it's exceeded?</summary>
+<div class="qa-body"><strong>Short answer:</strong> At admission time — the API Server rejects the Pod-creation request outright if the namespace total would exceed the quota.
+<br><strong>Detailed explanation:</strong> This is a hard, synchronous check during the same admission pipeline stage as LimitRange defaulting, not an after-the-fact alert.
+<br><strong>Production example:</strong> A deploy attempting to scale past the namespace's <code>pods: "50"</code> quota was rejected immediately with an admission error, not silently queued.
+<br><strong>Common mistake:</strong> Expecting ResourceQuota violations to show up as a warning or Pending state rather than an outright rejected create request.</div></details>
+
+<details class="qa"><summary>9. Why does metrics-server read actual usage rather than requests/limits, and how does that differ from scheduling?</summary>
+<div class="qa-body"><strong>Short answer:</strong> metrics-server reports real, observed CPU/memory usage from kubelet's cAdvisor-derived stats — a completely separate data path from the Scheduler's request-based placement decisions.
+<br><strong>Detailed explanation:</strong> This distinction matters because HPA/VPA (topics 37-38) act on actual usage trends, while the Scheduler only ever reasons about declared requests at placement time — the two systems never share the same numbers.
+<br><strong>Production example:</strong> A Pod requesting 250m CPU but actually using 800m would schedule fine (Scheduler only sees the request) while HPA reacts to the real 800m usage.
+<br><strong>Common mistake:</strong> Assuming the Scheduler "sees" real usage the way HPA/VPA do — it only ever sees the declared request value.</div></details>
+
+<details class="qa"><summary>10. How would you find Pods without resource requests set as part of a cluster audit?</summary>
+<div class="qa-body"><strong>Short answer:</strong> <code>kubectl get pods -A -o json | jq</code> filtering for containers whose <code>resources.requests</code> is null.
+<br><strong>Detailed explanation:</strong> These are BestEffort candidates — the highest-risk Pods for both scheduling blindness and first-in-line eviction under node pressure.
+<br><strong>Production example:</strong> A platform-wide audit used this pattern to find and remediate dozens of Deployments silently running BestEffort in production namespaces.
+<br><strong>Common mistake:</strong> Only checking for missing limits during an audit while overlooking Pods missing requests entirely, which is the more scheduling-relevant gap.</div></details>
+
+<details class="qa"><summary>11–50. Additional rapid-fire questions</summary>
+<div class="qa-body">
+<strong>11.</strong> Which QoS class is evicted first under node memory pressure? — BestEffort.<br>
+<strong>12.</strong> Which QoS class is evicted last? — Guaranteed.<br>
+<strong>13.</strong> What makes a Pod Guaranteed QoS? — Every container has requests == limits for both CPU and memory.<br>
+<strong>14.</strong> What makes a Pod Burstable? — At least one container has a request set but requests != limits for some resource.<br>
+<strong>15.</strong> What makes a Pod BestEffort? — No requests or limits set at all on any container.<br>
+<strong>16.</strong> Does the Scheduler ever read limits during Filter? — No, only requests are used for placement decisions.<br>
+<strong>17.</strong> What command shows a Pod's assigned QoS class? — <code>kubectl get pod &lt;name&gt; -o jsonpath='{.status.qosClass}'</code>.<br>
+<strong>18.</strong> What command shows real-time resource usage vs requests/limits? — <code>kubectl top pod</code> / <code>kubectl top node</code> (requires metrics-server).<br>
+<strong>19.</strong> What happens when CPU usage exceeds its limit? — CFS bandwidth throttling — the container is throttled but keeps running.<br>
+<strong>20.</strong> What happens when memory usage exceeds its limit? — The kernel's OOM killer terminates the container immediately.<br>
+<strong>21.</strong> What field does LimitRange use to fill in a missing request? — <code>defaultRequest</code>.<br>
+<strong>22.</strong> What field does LimitRange use to fill in a missing limit? — <code>default</code>.<br>
+<strong>23.</strong> What field enforces a hard ceiling per container in a namespace? — LimitRange's <code>max</code>.<br>
+<strong>24.</strong> What field enforces a hard floor per container in a namespace? — LimitRange's <code>min</code>.<br>
+<strong>25.</strong> What does ResourceQuota's <code>requests.cpu</code> field control? — The sum of all container CPU requests allowed across the namespace.<br>
+<strong>26.</strong> What does ResourceQuota's <code>pods</code> field control? — The total number of Pods allowed in the namespace.<br>
+<strong>27.</strong> Is LimitRange enforced at admission time or continuously? — At admission time, when a Pod is created (defaults injected, min/max validated).<br>
+<strong>28.</strong> Is ResourceQuota enforced at admission time or continuously? — At admission time, rejecting the create request if the namespace total would be exceeded.<br>
+<strong>29.</strong> What component configures cgroups on the node according to requests/limits? — kubelet.<br>
+<strong>30.</strong> What determines a container's OOM kill priority under system-wide pressure? — Its QoS-derived <code>oom_score_adj</code> value.<br>
+<strong>31.</strong> Why is CPU called a "compressible" resource? — Because usage beyond the limit can be throttled without terminating the process.<br>
+<strong>32.</strong> Why is memory called an "incompressible" resource? — Because there's no way to "throttle" memory after the fact — the kernel must kill the process instead.<br>
+<strong>33.</strong> What command reveals why a Pod was OOMKilled? — <code>kubectl describe pod &lt;name&gt; | grep -A5 "Last State"</code>.<br>
+<strong>34.</strong> What's the risk of setting requests far below actual usage? — Node-level overcommit, causing cascading evictions and instability under real load.<br>
+<strong>35.</strong> What's the risk of setting a CPU limit far above the request? — CFS throttling under contention can cause severe tail-latency spikes even with a generous limit.<br>
+<strong>36.</strong> Does the metrics pipeline (metrics-server) feed the Scheduler's placement decisions? — No, it's a separate data path used by HPA/VPA, not by the Scheduler.<br>
+<strong>37.</strong> Why should latency-critical workloads prefer Guaranteed QoS? — It gives them the highest protection and last-to-be-evicted priority under node pressure.<br>
+<strong>38.</strong> What's the recommended safety net for every namespace regarding resources? — A LimitRange, so a forgotten request doesn't silently default to unbounded (BestEffort).<br>
+<strong>39.</strong> What's the recommended guardrail for multi-tenant clusters at the namespace level? — A ResourceQuota per team/namespace enforcing fair-share capacity.<br>
+<strong>40.</strong> How do requests and limits relate to node "allocatable" capacity? — The Scheduler sums requests across scheduled Pods and compares against the node's allocatable capacity to decide fit.<br>
+<strong>41.</strong> Does setting limits equal to requests always guarantee good performance? — It guarantees Guaranteed QoS and predictable resource ceilings, but doesn't by itself guarantee the values were sized correctly for real usage.<br>
+<strong>42.</strong> What's a realistic incident pattern tying requests/limits to cascading failure? — An unbounded memory leak triggering node-wide pressure that evicts unrelated healthy Pods.<br>
+<strong>43.</strong> Why is conflating requests and limits called out as "the single most common source of confusion"? — Because they solve entirely separate problems (placement vs containment) but are set in the same YAML block, encouraging people to treat them as one concept.<br>
+<strong>44.</strong> What's the interaction between resource requests and HPA CPU-based scaling? — HPA computes utilization as a percentage of the request, so incorrect requests directly skew scaling decisions (covered further in topic 37).<br>
+<strong>45.</strong> How would you check current ResourceQuota usage in a namespace? — <code>kubectl describe resourcequota &lt;name&gt; -n &lt;namespace&gt;</code>.<br>
+<strong>46.</strong> How would you check current LimitRange defaults in a namespace? — <code>kubectl describe limitrange &lt;name&gt; -n &lt;namespace&gt;</code>.<br>
+<strong>47.</strong> What's the QoS implication of setting only a memory limit but no memory request? — Kubernetes defaults the request to equal the limit in that case, which still generally yields Burstable unless CPU is also aligned.<br>
+<strong>48.</strong> Why is it inaccurate to say "the Scheduler enforces limits"? — Limits are enforced by the kernel via cgroups on the node, not by the Scheduler, which only ever reasons about requests pre-placement.<br>
+<strong>49.</strong> What's the four-mechanism resource-governance toolkit summarized in this topic? — Requests/limits (one Pod), QoS classes (derived eviction priority), LimitRange (namespace defaults/bounds), ResourceQuota (namespace totals).<br>
+<strong>50.</strong> What's the one-line interview answer distinguishing requests from limits? — Requests are what the Scheduler guarantees for placement; limits are the hard runtime ceiling the kernel enforces via cgroups — one governs "where," the other governs "how much."
+</div></details>
+
+<footer class="course-footer">Next up: Topic 37 — Horizontal Pod Autoscaler, which reads real usage metrics to scale replica count automatically.</footer>
+
+<script>
+  mermaid.initialize({ startOnLoad: true, theme: 'dark' });
+</script>
+
+</body>
+</html>

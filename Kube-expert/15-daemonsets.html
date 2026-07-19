@@ -1,0 +1,300 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Topic 15: DaemonSets — Kubernetes Expert Course</title>
+<link rel="stylesheet" href="styles.css">
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+</head>
+<body>
+
+<header class="course-header">
+  <div class="kicker">Topic 15 of 70</div>
+  <h1>DaemonSets</h1>
+  <div class="subtitle">Guarantees exactly one copy of a Pod on every (or every matching) node — the pattern behind log/metrics agents and CNI.</div>
+</header>
+
+<nav class="topic-nav">
+  <a href="14-statefulsets.html">&larr; StatefulSets</a>
+  <a href="index.html">Course Index</a>
+  <a href="16-jobs.html">Jobs &rarr;</a>
+</nav>
+
+<h2 id="explanation">Explanation</h2>
+<p>A <strong>DaemonSet</strong> guarantees that a copy of a specific Pod runs on every node in the cluster (or every
+node matching a selector), and automatically adds that Pod to any new node as it joins, and removes it when a node
+leaves. Unlike a Deployment/ReplicaSet, a DaemonSet doesn't have a "desired replica count" you set — the desired
+count is implicitly derived from the number of eligible nodes: one Pod per node, no more, no less.</p>
+
+<p>Kubernetes needs this pattern because some workloads are fundamentally <strong>node-scoped infrastructure</strong>
+rather than application replicas: a log shipper that must read every node's container logs, a metrics agent that
+must scrape every node's kubelet/cAdvisor, a CNI plugin that must configure every node's network, or a storage
+daemon that must expose every node's local disks. None of these make sense as "3 replicas somewhere in the cluster" —
+they only make sense as "exactly one, on every node, forever." Trying to model this with a Deployment would require
+constantly adjusting replica count to match node count and would offer no guarantee of node coverage (the Scheduler
+could legally pile multiple replicas onto one node and zero onto another).</p>
+
+<p>Architecturally, DaemonSets bypass the normal Scheduler filtering in one important way: since Kubernetes 1.12,
+the DaemonSet controller itself decides placement (one Pod per matching node) and the default scheduler merely
+honors that binding, while still respecting node taints/tolerations. This is why DaemonSet Pods commonly carry
+tolerations for taints like <code>node-role.kubernetes.io/control-plane:NoSchedule</code> — you often want your
+logging or CNI agent to run even on nodes that reject ordinary workloads, because the control plane's own nodes
+still need to be monitored/networked.</p>
+
+<p>A <code>nodeSelector</code> or node affinity rule on the DaemonSet template restricts it to a subset of nodes —
+e.g. a GPU-monitoring DaemonSet only needs to run on nodes labeled <code>gpu=true</code>. This "one-per-matching-node"
+model, combined with automatic Pod creation/removal as nodes join/leave the cluster, is what makes DaemonSets the
+standard mechanism for cluster-wide infrastructure that must track the node fleet exactly.</p>
+
+<h2 id="internal-working">Internal Working / Interactions</h2>
+<ul>
+  <li><strong>DaemonSet controller</strong> (in kube-controller-manager) — watches Node objects and the DaemonSet
+  spec; for every node matching the nodeSelector/affinity and tolerating its taints, ensures exactly one Pod exists.</li>
+  <li><strong>API Server / etcd</strong> — DaemonSet spec and each node-bound Pod are ordinary objects, watched and
+  persisted the normal way.</li>
+  <li><strong>Node lifecycle</strong> — new node joins &rarr; controller detects it &rarr; creates a Pod pre-bound to
+  that node; node removed/drained &rarr; its DaemonSet Pod is garbage collected.</li>
+  <li><strong>Taints and tolerations</strong> — DaemonSet Pods typically declare tolerations for
+  <code>NoSchedule</code>/<code>NoExecute</code> taints so infrastructure agents still run on tainted/control-plane
+  nodes where regular workloads are excluded.</li>
+  <li><strong>kubelet</strong> — starts/runs the Pod exactly as any other Pod once bound to its node; no special
+  kubelet-side behavior is required for DaemonSets.</li>
+</ul>
+
+<h2 id="architecture-diagram">Architecture Diagram</h2>
+<pre class="mermaid">
+flowchart TB
+    DS["DaemonSet: fluent-bit\n(log shipper)"]
+    subgraph N1["Node 1"]
+      P1["Pod fluent-bit-a1b2"]
+    end
+    subgraph N2["Node 2"]
+      P2["Pod fluent-bit-c3d4"]
+    end
+    subgraph N3["Node 3 (control-plane, tainted)"]
+      P3["Pod fluent-bit-e5f6\n(tolerates NoSchedule)"]
+    end
+    DS -->|one Pod per matching node| P1
+    DS -->|one Pod per matching node| P2
+    DS -->|toleration allows placement| P3
+    NewNode["Node 4 joins cluster"] -.->|controller detects join| DS
+</pre>
+
+<pre class="mermaid">
+sequenceDiagram
+    participant NC as Node Controller
+    participant DSC as DaemonSet Controller
+    participant A as API Server
+    participant K as kubelet (new node)
+
+    NC->>A: New Node object registered
+    A-->>DSC: Node added event
+    DSC->>DSC: Check nodeSelector/taints match
+    DSC->>A: Create Pod pre-bound to new node
+    K->>A: Watch Pods bound to my node
+    A-->>K: New fluent-bit Pod assignment
+    K->>K: Start container via CRI
+    K->>A: Report Pod Running
+</pre>
+
+<h2 id="code-example">Code Example</h2>
+<pre><code>apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: fluent-bit
+  namespace: logging
+spec:
+  selector:
+    matchLabels:
+      app: fluent-bit          # Must match template labels; NO replicas field — one per eligible node.
+  template:
+    metadata:
+      labels:
+        app: fluent-bit
+    spec:
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane   # Allow scheduling onto control-plane nodes too.
+          effect: NoSchedule
+        - key: node.kubernetes.io/not-ready             # Keep running briefly even if node is degrading.
+          effect: NoExecute
+          operator: Exists
+      nodeSelector:
+        kubernetes.io/os: linux     # Skip Windows nodes if any exist in the cluster.
+      containers:
+        - name: fluent-bit
+          image: fluent/fluent-bit:2.2
+          resources:
+            requests: { cpu: "50m", memory: "64Mi" }   # Small footprint — runs on EVERY node, cost multiplies fast.
+            limits:   { cpu: "150m", memory: "128Mi" }
+          volumeMounts:
+            - name: varlog
+              mountPath: /var/log       # Read the HOST's log directory, not a container-local one.
+              readOnly: true
+      volumes:
+        - name: varlog
+          hostPath:
+            path: /var/log
+      updateStrategy:
+        type: RollingUpdate
+        rollingUpdate:
+          maxUnavailable: 1             # Update one node's agent at a time.
+</code></pre>
+
+<h2 id="kubectl-commands">kubectl Commands</h2>
+<pre><code># List DaemonSets and their desired/current/ready node counts
+kubectl get ds -n logging
+
+# Confirm one Pod exists per node
+kubectl get pods -n logging -l app=fluent-bit -o wide
+
+# Show scheduling decisions and any nodes it's skipping
+kubectl describe ds fluent-bit -n logging
+
+# Trigger/monitor a rolling update of the DaemonSet's image
+kubectl set image ds/fluent-bit fluent-bit=fluent/fluent-bit:2.2.1 -n logging
+kubectl rollout status ds/fluent-bit -n logging
+
+# Roll back a DaemonSet update
+kubectl rollout undo ds/fluent-bit -n logging
+
+# See which nodes are excluded and why (check taints)
+kubectl get nodes -o json | jq '.items[].spec.taints'
+</code></pre>
+
+<h2 id="best-practices">Best Practices &amp; Common Pitfalls</h2>
+<div class="grid-2">
+<div>
+<h4>Best Practices</h4>
+<ul>
+  <li>Set tight resource requests/limits — costs and risk multiply by node count for every DaemonSet.</li>
+  <li>Add tolerations deliberately for any taint your infra agent genuinely needs to survive (control-plane, not-ready).</li>
+  <li>Use <code>nodeSelector</code>/affinity to scope specialized agents (GPU, storage) instead of running everywhere.</li>
+  <li>Use <code>RollingUpdate</code> with a bounded <code>maxUnavailable</code> to avoid losing all node coverage at once during an update.</li>
+</ul>
+</div>
+<div>
+<h4>Pitfalls</h4>
+<ul>
+  <li>Forgetting tolerations, so critical monitoring/logging silently never runs on control-plane or tainted nodes.</li>
+  <li>Not setting resource limits, causing a "small" agent to become a cluster-wide noisy-neighbor at scale.</li>
+  <li>Using hostPath volumes without readOnly where not needed, widening the security blast radius.</li>
+  <li>Trying to use a DaemonSet for horizontal application scaling — it scales with nodes, not with load.</li>
+</ul>
+</div>
+</div>
+
+<h2 id="interview-questions">50 Interview Questions</h2>
+
+<details class="qa"><summary>1. Why doesn't a DaemonSet have a spec.replicas field like a Deployment?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Its desired count is implicitly derived from the number of eligible nodes — one Pod per matching node, automatically.
+<br><strong>Detailed explanation:</strong> Setting an explicit count would require constantly reconciling it against a changing node count; instead the DaemonSet controller watches Node objects directly and creates/removes Pods as nodes join/leave.
+<br><strong>Production example:</strong> A fluent-bit DaemonSet automatically gains a new Pod the instant a node is added to the cluster, with no manual scale action.
+<br><strong>Common mistake:</strong> Looking for a replicas field to "scale" a DaemonSet — you scope it via nodeSelector/affinity instead, not a count.</div></details>
+
+<details class="qa"><summary>2. Why can't a Deployment reliably model "one Pod per node" infrastructure like log or metrics agents?</summary>
+<div class="qa-body"><strong>Short answer:</strong> A Deployment's replica count has no concept of node coverage — the Scheduler could legally place multiple replicas on one node and zero on another.
+<br><strong>Detailed explanation:</strong> DaemonSets solve this by having the controller itself decide placement (one Pod per matching node) rather than leaving distribution to normal Scheduler scoring, which optimizes for bin-packing, not coverage.
+<br><strong>Production example:</strong> A cluster-wide log shipper needs a guarantee every node is covered — a Deployment with replicas=node-count could still leave a node with zero agents.
+<br><strong>Common mistake:</strong> Trying to approximate DaemonSet behavior with a Deployment plus anti-affinity rules — fragile and doesn't auto-track node count changes.</div></details>
+
+<details class="qa"><summary>3. Why do DaemonSet Pods commonly carry tolerations for control-plane taints?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Because infrastructure agents like logging/monitoring/CNI often need to run even on nodes that reject ordinary workloads.
+<br><strong>Detailed explanation:</strong> Control-plane nodes are normally tainted <code>NoSchedule</code> to keep regular application Pods off them, but those nodes still need to be monitored and networked — so DaemonSets explicitly tolerate that taint while regular Deployments don't.
+<br><strong>Production example:</strong> The fluent-bit DaemonSet tolerates <code>node-role.kubernetes.io/control-plane:NoSchedule</code> so control-plane node logs are still shipped.
+<br><strong>Common mistake:</strong> Forgetting this toleration, silently leaving control-plane nodes unmonitored/unlogged while assuming full cluster coverage.</div></details>
+
+<details class="qa"><summary>4. How does the DaemonSet controller's scheduling differ from the normal Scheduler's filter/score model?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Since Kubernetes 1.12, the DaemonSet controller itself decides placement and pre-binds the Pod; the default scheduler mostly just honors that binding.
+<br><strong>Detailed explanation:</strong> This bypasses normal scoring entirely — there's no "best node" competition; every eligible node (matching nodeSelector/affinity and tolerating its taints) gets exactly one Pod, full stop.
+<br><strong>Production example:</strong> A GPU-monitoring DaemonSet scoped with <code>nodeSelector: gpu=true</code> places a Pod on every GPU node without any scoring/ranking step.
+<br><strong>Common mistake:</strong> Assuming DaemonSet Pods compete for "best fit" placement the way ReplicaSet Pods do.</div></details>
+
+<details class="qa"><summary>5. Why is resource sizing especially critical for DaemonSets compared to other workload types?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Because whatever you set is multiplied by the entire node count — a "small" agent becomes a large aggregate cost/risk at scale.
+<br><strong>Detailed explanation:</strong> A DaemonSet with unset or generous limits can become a cluster-wide noisy neighbor, since every single node reserves/consumes that amount simultaneously, unlike a Deployment where only a few replicas exist regardless of cluster size.
+<br><strong>Production example:</strong> A 50m/64Mi fluent-bit request seems trivial on one node but reserves 5 full CPU cores and 6.4Gi of memory across a 100-node cluster.
+<br><strong>Common mistake:</strong> Copy-pasting Deployment-style generous resource requests onto a DaemonSet template without considering the node-count multiplier.</div></details>
+
+<details class="qa"><summary>6. How does nodeSelector let a DaemonSet run on only a subset of nodes?</summary>
+<div class="qa-body"><strong>Short answer:</strong> It restricts "eligible nodes" to only those matching the selector, so the DaemonSet controller only creates Pods there instead of cluster-wide.
+<br><strong>Detailed explanation:</strong> This is how specialized infrastructure agents (e.g. GPU drivers, storage daemons) avoid wasting resources on nodes that don't need them, while still getting the "exactly one, auto-tracked" guarantee on the nodes that do.
+<br><strong>Production example:</strong> A GPU-monitoring DaemonSet with <code>nodeSelector: gpu=true</code> only ever runs on labeled GPU nodes, never on general-purpose worker nodes.
+<br><strong>Common mistake:</strong> Omitting a needed nodeSelector and having a specialized agent uselessly attempt to run (and possibly crash-loop) on incompatible nodes.</div></details>
+
+<details class="qa"><summary>7. What happens automatically when a new node joins the cluster, from the DaemonSet's perspective?</summary>
+<div class="qa-body"><strong>Short answer:</strong> The DaemonSet controller detects the new Node object, checks it against nodeSelector/taints, and creates a pre-bound Pod for every DaemonSet it applies to.
+<br><strong>Detailed explanation:</strong> This happens without any manual intervention — the controller watches Node objects the same way other controllers watch their primary resource, reacting within its normal reconcile cycle.
+<br><strong>Production example:</strong> Adding a node to an autoscaling node group automatically gets its own fluent-bit and CNI Pods moments after joining, before application workloads are even scheduled there.
+<br><strong>Common mistake:</strong> Assuming new nodes need manual DaemonSet Pod creation — this is fully automatic and requires no action.</div></details>
+
+<details class="qa"><summary>8. Why is a DaemonSet the wrong tool for horizontal application scaling?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Its Pod count scales with the number of nodes, not with application load.
+<br><strong>Detailed explanation:</strong> Adding more nodes to handle unrelated workloads would also add more instances of a DaemonSet-based "application," which has nothing to do with that application's actual traffic/load — the wrong scaling signal entirely.
+<br><strong>Production example:</strong> Running a stateless API server as a DaemonSet would tie its replica count to cluster size rather than request volume, breaking any sensible capacity planning.
+<br><strong>Common mistake:</strong> Choosing DaemonSet for "I want it always running" without realizing that's node-scoped, not load-scoped.</div></details>
+
+<details class="qa"><summary>9. What's the danger of using hostPath volumes in a DaemonSet without readOnly?</summary>
+<div class="qa-body"><strong>Short answer:</strong> It widens the security blast radius — a compromised DaemonSet Pod with write access to the host filesystem can tamper with node-level files across every node in the cluster.
+<br><strong>Detailed explanation:</strong> Because DaemonSets run on every node (often including control-plane nodes), a writable hostPath mount effectively gives that level of host access cluster-wide, not just on one machine.
+<br><strong>Production example:</strong> A logging DaemonSet only needs read access to <code>/var/log</code> — mounting it writable unnecessarily would let a compromised container tamper with host logs everywhere.
+<br><strong>Common mistake:</strong> Defaulting to a writable hostPath mount out of convenience instead of explicitly setting readOnly where write access isn't actually required.</div></details>
+
+<details class="qa"><summary>10. How does a DaemonSet's RollingUpdate strategy differ in effect from a Deployment's?</summary>
+<div class="qa-body"><strong>Short answer:</strong> It updates node-by-node (bounded by maxUnavailable), rather than shifting traffic between two ReplicaSets — there's only ever one DaemonSet generation active per node at a time.
+<br><strong>Detailed explanation:</strong> Since there's no "surge" concept for DaemonSets (you can't run two Pods on the same node under the same DaemonSet), the update proceeds by taking down and replacing the agent on a bounded number of nodes at once.
+<br><strong>Production example:</strong> Setting <code>maxUnavailable: 1</code> on the fluent-bit DaemonSet updates one node's logging agent at a time, so log coverage is never lost cluster-wide during the rollout.
+<br><strong>Common mistake:</strong> Setting maxUnavailable too high for a critical infrastructure DaemonSet, briefly losing coverage (e.g. CNI or logging) across too many nodes simultaneously.</div></details>
+
+<details class="qa"><summary>11–50. Additional rapid-fire questions</summary>
+<div class="qa-body">
+<strong>11.</strong> What API group/version is DaemonSet under? — <code>apps/v1</code>.<br>
+<strong>12.</strong> Does a DaemonSet Pod get an ownerReference like a ReplicaSet's Pods? — Yes, pointing back to the owning DaemonSet.<br>
+<strong>13.</strong> What happens to a DaemonSet's Pod when its node is drained? — It's evicted; the controller will recreate it once the node is uncordoned/rejoins (drain typically also uses <code>--ignore-daemonsets</code> since DaemonSet Pods otherwise block drain completion).<br>
+<strong>14.</strong> Why does kubectl drain need --ignore-daemonsets? — Because DaemonSet Pods are meant to run on every node including the one being drained, and would otherwise never "successfully" evict.<br>
+<strong>15.</strong> Can a DaemonSet use podAffinity/podAntiAffinity? — Rarely meaningful — placement is already one-per-node via the controller, not the normal scheduler affinity mechanism.<br>
+<strong>16.</strong> What update strategies does DaemonSet support? — RollingUpdate (default) and OnDelete (manual, Pod-by-Pod on deletion only).<br>
+<strong>17.</strong> What's the purpose of OnDelete for a DaemonSet? — Full manual control over exactly when each node's Pod picks up the new template, rather than an automatic bounded rollout.<br>
+<strong>18.</strong> Does a DaemonSet support HPA? — No — HPA scales replica counts, which DaemonSets don't have; scaling is inherently tied to node count.<br>
+<strong>19.</strong> How do you check which nodes a DaemonSet is skipping? — Compare <code>kubectl get nodes</code> against <code>kubectl get pods -o wide</code> for that DaemonSet, and inspect node taints.<br>
+<strong>20.</strong> What field shows desired vs current vs ready DaemonSet Pod counts? — <code>kubectl get ds</code> output columns: DESIRED, CURRENT, READY, UP-TO-DATE, AVAILABLE.<br>
+<strong>21.</strong> Can a DaemonSet run more than one Pod per node? — No — exactly one per eligible node is the entire model; you can't have two DaemonSet Pods from the same DaemonSet on one node.<br>
+<strong>22.</strong> How would you completely exclude one specific node from a DaemonSet? — Add a taint that Pod's tolerations don't cover, or use node affinity/anti-affinity rules to exclude it.<br>
+<strong>23.</strong> What's a real production use case beyond logging/monitoring? — CNI plugins (e.g. Calico's calico-node), CSI node plugins, and security agents (e.g. Falco) all run as DaemonSets.<br>
+<strong>24.</strong> Why is DaemonSet the natural fit for CNI plugins specifically? — Networking must be configured on literally every node for Pod-to-Pod connectivity to work — a coverage gap on any single node breaks that node's Pods entirely.<br>
+<strong>25.</strong> What happens if a DaemonSet's Pod repeatedly crashes on one specific node? — Normal Pod restart policy applies locally on that node; the DaemonSet controller doesn't reschedule it elsewhere since it's pinned to that node by design.<br>
+<strong>26.</strong> Is DaemonSet namespaced or cluster-scoped? — Namespaced, like Deployments and StatefulSets, even though its effect (one Pod per node) is cluster-wide.<br>
+<strong>27.</strong> What's the risk of a DaemonSet's readinessProbe misconfiguration? — Every single node's Pod could simultaneously fail readiness, causing the underlying capability (e.g. metrics scraping) to silently break cluster-wide.<br>
+<strong>28.</strong> Can DaemonSets be updated via kubectl set image like Deployments? — Yes — <code>kubectl set image ds/&lt;name&gt; ...</code> triggers a rolling update the same way.<br>
+<strong>29.</strong> How do you roll back a DaemonSet update? — <code>kubectl rollout undo ds/&lt;name&gt;</code>, same command family as Deployments.<br>
+<strong>30.</strong> What's a common cost-optimization concern specific to DaemonSets? — Aggregate resource reservation across all nodes — even modest per-Pod requests add up quickly at scale and affect bin-packing headroom.<br>
+<strong>31.</strong> Why might a DaemonSet need tolerations for node.kubernetes.io/not-ready? — So it keeps running briefly on a degrading node rather than immediately evicting, useful for agents that should keep reporting status as long as possible.<br>
+<strong>32.</strong> Does the DaemonSet controller retry failed Pod creation? — Yes — like any controller, it keeps reconciling toward "one Pod per eligible node" and retries on failure.<br>
+<strong>33.</strong> What's the effect of labeling a node to match a DaemonSet's nodeSelector after the DaemonSet already exists? — The controller detects the newly-matching node and creates a Pod there immediately.<br>
+<strong>34.</strong> What's the effect of removing a label so a node no longer matches? — The controller detects the node no longer matches and deletes that node's DaemonSet Pod.<br>
+<strong>35.</strong> How is DaemonSet Pod placement different from a Job's Pod placement? — Job Pods are scheduled normally (filter/score, any eligible node); DaemonSet Pods are pre-bound one-per-matching-node by the controller itself.<br>
+<strong>36.</strong> Why is monitoring DaemonSet rollout status important operationally? — A stuck DaemonSet rollout could leave some nodes running an old, possibly vulnerable, version of a security-critical agent indefinitely.<br>
+<strong>37.</strong> Can you scope a DaemonSet to just Windows nodes? — Yes, via <code>nodeSelector: kubernetes.io/os: windows</code> (or the inverse to exclude them, as shown for Linux-only agents).<br>
+<strong>38.</strong> What's a subtle failure mode if a DaemonSet's tolerations are too broad? — It could schedule onto nodes explicitly cordoned/tainted for maintenance or dedicated workloads, defeating the purpose of those taints.<br>
+<strong>39.</strong> How does a DaemonSet interact with cluster-autoscaler scale-down? — cluster-autoscaler generally ignores DaemonSet Pods when deciding if a node is "empty enough" to remove, since they're expected on every node.<br>
+<strong>40.</strong> What's the relationship between DaemonSet and node taints during cordon? — Cordoning (marking unschedulable) doesn't taint the node in a way that excludes existing DaemonSet Pods from continuing to run.<br>
+<strong>41.</strong> Why do storage CSI node plugins commonly run as DaemonSets? — Volume attach/mount operations must happen on the specific node where a Pod using that volume is scheduled — needs a local agent everywhere.<br>
+<strong>42.</strong> Is it possible for a DaemonSet Pod's image update to require a node reboot? — No inherently — but some low-level agents (e.g. certain CNI/CSI plugins) may require a brief node network/mount disruption during their own update.<br>
+<strong>43.</strong> What's the interview-relevant distinction between DaemonSet coverage and Deployment redundancy? — DaemonSet guarantees "everywhere," Deployment guarantees "somewhere, N times" — different guarantees entirely, not interchangeable.<br>
+<strong>44.</strong> How would you audit whether a DaemonSet is missing coverage on any node? — Compare node count to DaemonSet's DESIRED/CURRENT/READY columns from <code>kubectl get ds</code>, and cross-check taints on any excluded nodes.<br>
+<strong>45.</strong> What happens if two DaemonSets have overlapping nodeSelectors targeting the same infrastructure role? — Both run independently on the same matching nodes — no conflict, since each DaemonSet places its own distinct Pod per node.<br>
+<strong>46.</strong> Why is it risky to run heavyweight agents (e.g. full APM instrumentation) as a DaemonSet without careful sizing? — The per-node overhead directly competes with application workloads for CPU/memory on every single node, unlike a handful of Deployment replicas.<br>
+<strong>47.</strong> What's a good practice for versioning DaemonSet images in production? — Pin specific tags (not <code>latest</code>) and roll out via the same controlled RollingUpdate mechanism used for Deployments.<br>
+<strong>48.</strong> Can a DaemonSet's Pod template include init containers? — Yes — same Pod spec capabilities as any workload, including initContainers for pre-setup tasks (e.g. kernel module checks).<br>
+<strong>49.</strong> What's the operational risk of running privileged containers in a DaemonSet? — Since it runs on every node, a security flaw is maximally exploitable cluster-wide rather than confined to a handful of replicas.<br>
+<strong>50.</strong> What's the first thing to check when a DaemonSet shows fewer READY than DESIRED? — <code>kubectl describe ds</code> and per-Pod events for scheduling/toleration mismatches or readinessProbe failures on the missing nodes.
+</div></details>
+
+<footer class="course-footer">Next: Topic 16 — Jobs, for run-to-completion batch workloads.</footer>
+
+<script>
+  mermaid.initialize({ startOnLoad: true, theme: 'dark' });
+</script>
+
+</body>
+</html>

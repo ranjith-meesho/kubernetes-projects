@@ -1,0 +1,7 @@
+# macOS
+.DS_Store
+
+# Nested Git repositories
+20-hours-plan/
+Claude-Learning/
+Repos-Learning/

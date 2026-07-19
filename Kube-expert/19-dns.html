@@ -1,0 +1,288 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Topic 19: DNS — Kubernetes Expert Course</title>
+<link rel="stylesheet" href="styles.css">
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+</head>
+<body>
+
+<header class="course-header">
+  <div class="kicker">Topic 19 of 70</div>
+  <h1>DNS</h1>
+  <div class="subtitle">The cluster-wide naming convention that lets every Pod and Service be addressed by a stable, predictable hostname.</div>
+</header>
+
+<nav class="topic-nav">
+  <a href="18-services.html">&larr; Services</a>
+  <a href="index.html">Course Index</a>
+  <a href="20-coredns.html">CoreDNS &rarr;</a>
+</nav>
+
+<h2 id="explanation">Explanation</h2>
+<p><strong>Cluster DNS</strong> is the naming layer that lets Pods find Services (and, less commonly, other Pods) by
+a predictable hostname instead of a raw, ever-changing IP address. Every Kubernetes cluster runs a cluster-wide DNS
+service (in practice, always CoreDNS today) that automatically creates and updates DNS records as Services and Pods
+are created, deleted, or rescheduled — closing the loop that starts with a Service's stable virtual IP: the IP is
+stable, but you still need a human/application-friendly name to reach it, and that name still needs to survive the
+Service being recreated with a new IP.</p>
+
+<p>Kubernetes needs this because hardcoding IPs anywhere in application config is fragile and defeats the entire
+point of a dynamic, self-healing platform — an IP baked into a config file becomes wrong the moment the underlying
+object is recreated. DNS names, by contrast, are derived deterministically from object names and namespaces, so they
+never change even as the underlying IPs do. This is what lets a manifest say
+<code>http://checkout.payments.svc.cluster.local:8080</code> and have that URL remain correct forever, regardless of
+how many times the checkout Service's ClusterIP changes underneath it.</p>
+
+<p>The naming convention follows a fixed hierarchy: a Service named <code>checkout</code> in namespace
+<code>payments</code> gets the DNS name <code>checkout.payments.svc.cluster.local</code> (often shortened to just
+<code>checkout</code> or <code>checkout.payments</code> when resolving from within the same or a different namespace,
+thanks to the search-domain suffixes injected into every Pod's <code>/etc/resolv.conf</code>). Headless Services
+(ClusterIP: None, used by StatefulSets) get one DNS record <em>per backing Pod</em> instead of one record for the
+whole Service, in the form <code>&lt;pod-hostname&gt;.&lt;service&gt;.&lt;namespace&gt;.svc.cluster.local</code> —
+this is exactly the mechanism StatefulSet replicas use to find each other by stable name.</p>
+
+<p>Every Pod, unless explicitly configured otherwise, has its container's <code>/etc/resolv.conf</code> populated by
+the kubelet with the cluster DNS service's IP as the nameserver, plus a search list of
+(<code>&lt;namespace&gt;.svc.cluster.local</code>, <code>svc.cluster.local</code>, <code>cluster.local</code>) so
+short, unqualified names resolve correctly depending on context. This file is what actually wires an application's
+ordinary DNS resolution calls (<code>getaddrinfo</code>, etc.) into the Kubernetes-aware DNS system without the
+application needing any Kubernetes-specific code.</p>
+
+<p>DNS also resolves Pods directly (if their IP is dash-substituted into a hostname under a headless Service) and
+supports SRV records for named Service ports — useful for clients that need to discover both host and port
+dynamically (e.g. some service-mesh sidecars and legacy SRV-aware clients).</p>
+
+<h2 id="internal-working">Internal Working / Interactions</h2>
+<ul>
+  <li><strong>kubelet</strong> — populates each Pod's <code>/etc/resolv.conf</code> with the cluster DNS Service IP
+  and search domains at Pod creation time, based on the Pod's <code>dnsPolicy</code> (default:
+  <code>ClusterFirst</code>).</li>
+  <li><strong>CoreDNS (or equivalent)</strong> — the actual DNS server; watches Services/Endpoints/Pods via the API
+  Server and answers queries by constructing records on the fly rather than from a static zone file.</li>
+  <li><strong>kube-dns Service</strong> — CoreDNS itself is exposed via a stable ClusterIP Service (conventionally
+  named <code>kube-dns</code>), which is the IP kubelet injects into every Pod's resolv.conf.</li>
+  <li><strong>Search domain chaining</strong> — an unqualified name like <code>checkout</code> is tried against each
+  search suffix in order until one resolves, which is why same-namespace lookups can omit the namespace entirely.</li>
+  <li><strong>dnsPolicy variants</strong> — <code>ClusterFirst</code> (default, cluster DNS + fallback to upstream),
+  <code>Default</code> (inherit node's own resolv.conf), <code>None</code> (fully custom via
+  <code>dnsConfig</code>), <code>ClusterFirstWithHostNet</code> (for hostNetwork Pods).</li>
+</ul>
+
+<h2 id="architecture-diagram">Architecture Diagram</h2>
+<pre class="mermaid">
+flowchart TB
+    Pod["Pod (payments ns)\n/etc/resolv.conf:\nnameserver 10.96.0.10\nsearch payments.svc.cluster.local\n       svc.cluster.local\n       cluster.local"]
+    DNS["CoreDNS\nService IP: 10.96.0.10"]
+    SVC["Service: checkout\nClusterIP: 10.96.10.5"]
+    Headless["Headless Service: kafka-headless\nclusterIP: None"]
+    P0["Pod kafka-0"]
+
+    Pod -->|"query: checkout"| DNS
+    DNS -->|"tries checkout.payments.svc.cluster.local -> match"| SVC
+    Pod -->|"query: kafka-0.kafka-headless"| DNS
+    DNS -->|"per-Pod record"| P0
+</pre>
+
+<pre class="mermaid">
+sequenceDiagram
+    participant App as Application in Pod
+    participant Resolver as glibc/musl resolver
+    participant CoreDNS as CoreDNS
+    participant A as API Server
+
+    App->>Resolver: getaddrinfo("checkout")
+    Resolver->>Resolver: Append search domain: checkout.payments.svc.cluster.local
+    Resolver->>CoreDNS: A? checkout.payments.svc.cluster.local
+    CoreDNS->>A: (cached) Service+Endpoints watch data
+    CoreDNS-->>Resolver: A 10.96.10.5
+    Resolver-->>App: 10.96.10.5
+</pre>
+
+<h2 id="code-example">Code Example</h2>
+<pre><code>apiVersion: v1
+kind: Pod
+metadata:
+  name: custom-dns-pod
+spec:
+  dnsPolicy: "None"              # Ignore cluster defaults entirely; use only dnsConfig below.
+  dnsConfig:
+    nameservers:
+      - 10.96.0.10                 # Explicit cluster DNS IP (normally injected automatically).
+      - 8.8.8.8                    # Extra upstream resolver, e.g. for external-only lookups.
+    searches:
+      - payments.svc.cluster.local
+      - svc.cluster.local
+      - cluster.local
+    options:
+      - name: ndots
+        value: "2"                 # Fewer dots before trying search domains -> fewer wasted DNS queries.
+  containers:
+    - name: app
+      image: registry.internal/payments-app:1.0
+---
+# Typical resolv.conf INSIDE a normal Pod (dnsPolicy: ClusterFirst, the default) — generated by kubelet, not user YAML:
+# nameserver 10.96.0.10
+# search payments.svc.cluster.local svc.cluster.local cluster.local
+# options ndots:5
+</code></pre>
+
+<h2 id="kubectl-commands">kubectl Commands</h2>
+<pre><code># Inspect a Pod's actual resolv.conf as generated by kubelet
+kubectl exec -it my-pod -- cat /etc/resolv.conf
+
+# Resolve a Service name from inside the cluster
+kubectl run -it --rm dns-test --image=busybox --restart=Never -- nslookup checkout.payments.svc.cluster.local
+
+# Resolve a specific StatefulSet Pod via its headless-Service DNS name
+kubectl run -it --rm dns-test --image=busybox --restart=Never -- nslookup kafka-0.kafka-headless.default.svc.cluster.local
+
+# Check the cluster DNS Service's ClusterIP (what's injected into every Pod)
+kubectl get svc -n kube-system kube-dns
+
+# Confirm CoreDNS Pods are healthy
+kubectl get pods -n kube-system -l k8s-app=kube-dns
+
+# Show a Pod's effective dnsPolicy/dnsConfig
+kubectl get pod my-pod -o jsonpath='{.spec.dnsPolicy}{"\n"}{.spec.dnsConfig}'
+</code></pre>
+
+<h2 id="best-practices">Best Practices &amp; Common Pitfalls</h2>
+<div class="grid-2">
+<div>
+<h4>Best Practices</h4>
+<ul>
+  <li>Use the shortest name that resolves correctly for your use case (same-namespace: just the Service name).</li>
+  <li>Use fully-qualified names (<code>svc.ns.svc.cluster.local</code>) for cross-namespace calls to avoid ambiguity.</li>
+  <li>Tune <code>ndots</code> only when you understand the extra-query cost tradeoff it creates for external lookups.</li>
+  <li>Rely on headless-Service per-Pod DNS for StatefulSet peer discovery rather than hardcoding Pod IPs.</li>
+</ul>
+</div>
+<div>
+<h4>Pitfalls</h4>
+<ul>
+  <li>High default <code>ndots:5</code> causing every external domain lookup (e.g. api.stripe.com) to first try several useless internal search-domain queries, adding latency.</li>
+  <li>Assuming DNS caching is instant — a Pod's cached negative DNS lookup can briefly outlive a just-created Service.</li>
+  <li>Hardcoding a Service's ClusterIP instead of its DNS name, breaking the moment the Service is recreated.</li>
+  <li>Forgetting cross-namespace calls need the namespace segment — <code>checkout</code> alone won't resolve from a different namespace.</li>
+</ul>
+</div>
+</div>
+
+<h2 id="interview-questions">50 Interview Questions</h2>
+
+<details class="qa"><summary>1. Why do Services need DNS names on top of an already-stable ClusterIP?</summary>
+<div class="qa-body"><strong>Short answer:</strong> The ClusterIP is stable for the Service's lifetime, but the Service object itself can still be deleted and recreated with a new IP — a DNS name derived deterministically from the object's name/namespace survives that.
+<br><strong>Detailed explanation:</strong> Hardcoding an IP anywhere in application config becomes wrong the moment the underlying Service is recreated; DNS names are derived from object identity, not the current IP, so they never need updating.
+<br><strong>Production example:</strong> A manifest referencing <code>http://checkout.payments.svc.cluster.local:8080</code> remains correct forever, regardless of how many times the checkout Service's ClusterIP changes underneath it.
+<br><strong>Common mistake:</strong> Hardcoding a Service's ClusterIP directly in application config instead of its DNS name.</div></details>
+
+<details class="qa"><summary>2. What is the full DNS naming hierarchy for a Service, and what do the shortened forms rely on?</summary>
+<div class="qa-body"><strong>Short answer:</strong> <code>&lt;service&gt;.&lt;namespace&gt;.svc.cluster.local</code> is the full form; shortened forms like just <code>checkout</code> rely on search-domain suffixes injected into every Pod's resolv.conf.
+<br><strong>Detailed explanation:</strong> The resolver tries the unqualified name against each search suffix in order until one resolves, which is why same-namespace lookups can omit the namespace entirely while cross-namespace calls need at least the namespace segment.
+<br><strong>Production example:</strong> From a Pod in the <code>payments</code> namespace, just <code>checkout</code> resolves via the <code>payments.svc.cluster.local</code> search suffix without needing the fully-qualified form.
+<br><strong>Common mistake:</strong> Using an unqualified Service name across namespaces and getting an unexpected resolution failure since the short form only works within the same namespace.</div></details>
+
+<details class="qa"><summary>3. How does a headless Service's DNS behavior differ from a normal Service's, and why does that matter for StatefulSets?</summary>
+<div class="qa-body"><strong>Short answer:</strong> A headless Service returns one DNS record per backing Pod instead of one shared record for the whole Service.
+<br><strong>Detailed explanation:</strong> The per-Pod record takes the form <code>&lt;pod-hostname&gt;.&lt;service&gt;.&lt;namespace&gt;.svc.cluster.local</code>, which is exactly the mechanism StatefulSet replicas use to find and address specific peers by stable name rather than "some randomly chosen instance."
+<br><strong>Production example:</strong> <code>kafka-1.kafka-headless.default.svc.cluster.local</code> always resolves to the specific Kafka broker replica 1, never any other broker.
+<br><strong>Common mistake:</strong> Creating a normal ClusterIP Service for a StatefulSet expecting per-replica DNS resolution, and getting one shared virtual IP instead.</div></details>
+
+<details class="qa"><summary>4. What is dnsPolicy: ClusterFirst, and what happens for domains it doesn't recognize?</summary>
+<div class="qa-body"><strong>Short answer:</strong> It's the default policy — queries first go to cluster DNS (CoreDNS), and any domain CoreDNS doesn't own falls through to an upstream resolver.
+<br><strong>Detailed explanation:</strong> This lets a single Pod resolve both internal Service names and external domains (e.g. api.stripe.com) through the same nameserver entry, since CoreDNS itself forwards non-cluster queries onward.
+<br><strong>Production example:</strong> A Pod querying both <code>checkout.payments.svc.cluster.local</code> and <code>api.stripe.com</code> uses the exact same nameserver IP in its resolv.conf — CoreDNS internally decides which path to take.
+<br><strong>Common mistake:</strong> Assuming a separate resolver configuration is needed for external domains — ClusterFirst already handles the fallback transparently.</div></details>
+
+<details class="qa"><summary>5. What is kubelet's role in making cluster DNS "just work" for every Pod?</summary>
+<div class="qa-body"><strong>Short answer:</strong> kubelet populates each Pod's <code>/etc/resolv.conf</code> with the cluster DNS Service IP and search domains at Pod creation time, based on the Pod's dnsPolicy.
+<br><strong>Detailed explanation:</strong> This is what actually wires an application's ordinary DNS resolution calls (getaddrinfo, etc.) into the Kubernetes-aware DNS system without the application needing any Kubernetes-specific code or configuration.
+<br><strong>Production example:</strong> <code>kubectl exec -it my-pod -- cat /etc/resolv.conf</code> shows a nameserver entry pointing at the cluster DNS Service's ClusterIP (conventionally 10.96.0.10), injected automatically by kubelet.
+<br><strong>Common mistake:</strong> Assuming applications need custom code to be "Kubernetes-DNS-aware" — the standard OS resolver library already does the right thing given the injected resolv.conf.</div></details>
+
+<details class="qa"><summary>6. Why does a high default ndots value (5) sometimes cause latency for external domain lookups?</summary>
+<div class="qa-body"><strong>Short answer:</strong> With ndots:5, a name with fewer than 5 dots is first tried against every internal search-domain suffix before being tried as an absolute external name, wasting several DNS round-trips for genuinely external domains.
+<br><strong>Detailed explanation:</strong> A lookup for <code>api.stripe.com</code> (2 dots) under ndots:5 first tries <code>api.stripe.com.payments.svc.cluster.local</code>, <code>api.stripe.com.svc.cluster.local</code>, and <code>api.stripe.com.cluster.local</code> — all guaranteed failures — before finally trying the real absolute name, adding real latency per request if uncached.
+<br><strong>Production example:</strong> A high-traffic service calling many third-party APIs directly (not through an internal proxy) can see measurable added p99 latency purely from this wasted internal search-domain churn.
+<br><strong>Common mistake:</strong> Not tuning ndots for workloads that make heavy use of external, non-cluster domain lookups.</div></details>
+
+<details class="qa"><summary>7. What's the difference between dnsPolicy: Default and dnsPolicy: None?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Default inherits the node's own resolv.conf (bypassing cluster DNS entirely); None ignores cluster defaults entirely and requires you to specify everything explicitly via dnsConfig.
+<br><strong>Detailed explanation:</strong> Default is useful when a Pod genuinely needs the host's own DNS view (rare); None gives full manual control, useful for a Pod needing a custom nameserver list, custom search domains, or specific resolver options like ndots tuning.
+<br><strong>Production example:</strong> A Pod using dnsPolicy: None with dnsConfig explicitly listing both the cluster DNS IP and an external resolver (8.8.8.8) gets fully controlled, predictable resolution behavior.
+<br><strong>Common mistake:</strong> Confusing "Default" with "the cluster default" — counterintuitively, Default means the node's resolv.conf, not ClusterFirst.</div></details>
+
+<details class="qa"><summary>8. Why can a Pod's cached negative DNS lookup briefly outlive a just-created Service?</summary>
+<div class="qa-body"><strong>Short answer:</strong> DNS caching (both in CoreDNS's cache plugin and potentially in the client's own resolver) isn't instant — a lookup performed just before a Service existed can be cached as "not found" for a short TTL window.
+<br><strong>Detailed explanation:</strong> This is a race condition between Service creation and any earlier failed resolution attempt for that same name; it typically resolves itself once the negative cache TTL expires, but can cause confusing transient failures right after deploying a new Service.
+<br><strong>Production example:</strong> A Pod that started up and failed to resolve a dependency's Service name moments before that Service was created might keep failing for a few seconds even after the Service becomes available.
+<br><strong>Common mistake:</strong> Assuming DNS changes propagate instantly and not accounting for brief caching-related races during rapid successive deploys.</div></details>
+
+<details class="qa"><summary>9. Why do SRV records matter for some clients even though most just use A/AAAA records via the Service name?</summary>
+<div class="qa-body"><strong>Short answer:</strong> SRV records let a client discover both host and port dynamically for a named Service port, useful when the connecting port isn't known/fixed in advance.
+<br><strong>Detailed explanation:</strong> Some service-mesh sidecars and legacy SRV-aware clients query SRV records (in the form <code>_&lt;port-name&gt;._&lt;protocol&gt;.&lt;svc&gt;.&lt;ns&gt;.svc.cluster.local</code>) specifically to avoid hardcoding a port number that might change or vary by named port.
+<br><strong>Production example:</strong> A client needing to discover the correct port for a Service's named "http" port dynamically can query the corresponding SRV record instead of assuming a fixed port number.
+<br><strong>Common mistake:</strong> Assuming SRV record support is universal — most application code just uses plain A-record resolution plus a hardcoded/expected port instead.</div></details>
+
+<details class="qa"><summary>10. Why must cross-namespace calls always include at least the namespace segment in the DNS name?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Because the search-domain suffixes injected into a Pod's resolv.conf are scoped to that Pod's own namespace first — an unqualified name only resolves against the calling Pod's namespace.
+<br><strong>Detailed explanation:</strong> A Pod in <code>frontend</code> namespace querying just <code>checkout</code> would try <code>checkout.frontend.svc.cluster.local</code> first (and likely fail, since checkout lives in <code>payments</code>) — it must instead query <code>checkout.payments</code> or the fully-qualified name.
+<br><strong>Detailed explanation cont'd:</strong> This is a frequent source of "works in this namespace, breaks in that one" bugs when manifests are copy-pasted across environments without adjusting the DNS name's namespace segment.
+<br><strong>Production example:</strong> Migrating a Deployment from a shared namespace into its own dedicated namespace commonly breaks any hardcoded unqualified Service names in its config that assumed same-namespace resolution.
+<br><strong>Common mistake:</strong> Forgetting the namespace segment when referencing a Service cross-namespace and assuming Kubernetes DNS is somehow namespace-agnostic.</div></details>
+
+<details class="qa"><summary>11–50. Additional rapid-fire questions</summary>
+<div class="qa-body">
+<strong>11.</strong> What's the conventional name of the cluster DNS Service? — kube-dns (even when CoreDNS is the actual server implementation).<br>
+<strong>12.</strong> What file does kubelet write DNS configuration into inside each Pod? — /etc/resolv.conf.<br>
+<strong>13.</strong> What are the three default search domains injected for a Pod? — &lt;namespace&gt;.svc.cluster.local, svc.cluster.local, cluster.local.<br>
+<strong>14.</strong> What's the default ndots value inside a Pod's resolv.conf? — 5.<br>
+<strong>15.</strong> What DNS record type resolves a Service name to its ClusterIP? — A (or AAAA for IPv6).<br>
+<strong>16.</strong> Does a Pod get its own DNS A record by default? — Not by default under a normal Service — only under a headless Service with per-Pod records, or if explicitly enabled.<br>
+<strong>17.</strong> What dnsPolicy variant is used for hostNetwork Pods that still want cluster DNS? — ClusterFirstWithHostNet.<br>
+<strong>18.</strong> Why do hostNetwork Pods need a special dnsPolicy variant at all? — Because hostNetwork Pods share the node's network namespace, so the normal ClusterFirst injection needs an explicit variant to still apply correctly.<br>
+<strong>19.</strong> How would you check what dnsPolicy a running Pod is using? — <code>kubectl get pod &lt;name&gt; -o jsonpath='{.spec.dnsPolicy}'</code>.<br>
+<strong>20.</strong> Can you override individual resolver options without setting dnsPolicy: None? — Yes — dnsConfig.options can be combined with ClusterFirst to tweak things like ndots without discarding the cluster defaults entirely.<br>
+<strong>21.</strong> What's a realistic reason to add an extra nameserver via dnsConfig? — Needing to resolve an internal corporate domain not known to cluster DNS, alongside normal cluster resolution.<br>
+<strong>22.</strong> Does cluster DNS resolve external, non-cluster domains directly itself? — No — it forwards them to an upstream resolver (its own forward plugin handles this, not raw cluster DNS logic itself).<br>
+<strong>23.</strong> What happens if a Pod's dnsPolicy is None but dnsConfig is empty? — The Pod effectively has no usable DNS configuration at all, so name resolution fails entirely.<br>
+<strong>24.</strong> Why is it risky to set dnsPolicy: Default for most workloads? — It bypasses cluster DNS entirely, so cluster-internal Service names won't resolve at all from that Pod.<br>
+<strong>25.</strong> What's the resolution order when multiple search domains could match? — Domains are tried in the listed order until one succeeds or all are exhausted.<br>
+<strong>26.</strong> How would a Pod resolve a specific StatefulSet replica from a completely different namespace? — Using the fully-qualified per-Pod headless-Service name including the target namespace, e.g. kafka-0.kafka-headless.data.svc.cluster.local.<br>
+<strong>27.</strong> Does DNS resolution depend on kube-proxy at all? — No — DNS resolution and kube-proxy's traffic routing are independent systems; DNS just returns an IP, kube-proxy handles routing to it separately.<br>
+<strong>28.</strong> What's a common symptom of CoreDNS being completely down? — Cluster-wide new-connection failures for anything addressed by name, while already-established connections keep working.<br>
+<strong>29.</strong> Why do already-established connections survive a DNS outage? — DNS is only consulted at connection-initiation time; existing TCP connections don't re-resolve names mid-session.<br>
+<strong>30.</strong> What's the purpose of testing with kubectl run ... -- nslookup? — Quickly verifying DNS resolution behavior from inside the cluster's actual DNS context, rather than from an external machine.<br>
+<strong>31.</strong> Can a Pod be configured to skip cluster DNS entirely for all lookups? — Yes, via dnsPolicy: Default or a fully custom dnsConfig under None.<br>
+<strong>32.</strong> What's the risk of a very low ndots setting for internal-only workloads? — Short internal names might be misinterpreted as absolute/external before search-domain suffixes are tried, causing internal resolution failures.<br>
+<strong>33.</strong> Why does the DNS naming convention matter for GitOps/portable manifests? — Deterministic names derived from object identity let the same manifest work unchanged across environments (dev/staging/prod) as long as namespace/service names match.<br>
+<strong>34.</strong> What's a subtle bug from copy-pasting a manifest into a new namespace without updating unqualified DNS references? — Any hardcoded unqualified Service name assumed to be "same namespace" now silently points to nothing or the wrong dependency.<br>
+<strong>35.</strong> Does every Kubernetes distribution use CoreDNS specifically? — Overwhelmingly yes today, though the DNS "concept" (cluster-wide naming) is implementation-agnostic; CoreDNS became the de facto standard since replacing kube-dns.<br>
+<strong>36.</strong> What's the effect of a Pod explicitly setting hostNetwork: true without adjusting dnsPolicy? — It may not get proper cluster DNS resolution unless ClusterFirstWithHostNet is set.<br>
+<strong>37.</strong> How does DNS caching interact with a Service's ClusterIP changing after recreation? — Cached positive answers for the old IP can serve stale data briefly until TTL expiry, even though the DNS name is otherwise "always correct" long-term.<br>
+<strong>38.</strong> What's a good practice for cross-namespace dependency references? — Always use at least the namespace-qualified form (svc.namespace) rather than relying on implicit same-namespace shortening.<br>
+<strong>39.</strong> Can Pod-level DNS resolution be tested without deploying a real workload? — Yes — an ephemeral debug Pod (kubectl run --rm) with nslookup/dig is the standard quick test.<br>
+<strong>40.</strong> What's the significance of "cluster.local" as the default cluster domain? — It's the conventional root suffix for all cluster-internal names, though it's technically configurable per-cluster (rare in practice).<br>
+<strong>41.</strong> Why might a multi-cluster setup need to change the default cluster domain? — To avoid naming collisions/ambiguity when cross-cluster service discovery or federation is involved.<br>
+<strong>42.</strong> What's the relationship between dnsConfig.searches and resolv.conf's search line? — dnsConfig.searches is exactly what gets written as the search directive in the Pod's resolv.conf.<br>
+<strong>43.</strong> Does DNS resolution require any RBAC permissions from the querying Pod? — No — DNS queries go straight to CoreDNS over the network; no Kubernetes API RBAC is involved in a client Pod merely resolving a name.<br>
+<strong>44.</strong> What's a common reason external API calls from Pods are slower than expected? — Uninvestigated ndots-driven wasted internal search-domain queries before the real external lookup succeeds.<br>
+<strong>45.</strong> How would you verify the actual search domains a Pod is using at runtime? — <code>kubectl exec -it &lt;pod&gt; -- cat /etc/resolv.conf</code>.<br>
+<strong>46.</strong> What happens if a custom dnsConfig nameserver is unreachable? — Resolution for that Pod fails or times out for any query relying on that nameserver, independent of cluster DNS health.<br>
+<strong>47.</strong> Is DNS involved in Pod-to-Pod communication that doesn't go through a Service? — Not necessarily — direct Pod IP communication (e.g. via a headless Service's per-Pod record, or a hardcoded IP) doesn't require the normal Service-name DNS path, though it's still commonly resolved via headless-Service DNS.<br>
+<strong>48.</strong> What's a good monitoring signal for cluster DNS health specifically? — Query latency and error-rate metrics scraped from CoreDNS, since app-level symptoms (timeouts) can otherwise be misattributed to networking or the target service itself.<br>
+<strong>49.</strong> Why is understanding DNS naming conventions important before troubleshooting connectivity? — Many "network" issues are actually simple naming/namespace-qualification mistakes rather than real connectivity problems.<br>
+<strong>50.</strong> What's the first thing to check when a Pod can't resolve a Service name at all? — Whether the correct namespace-qualified (or fully-qualified) name was used, before assuming CoreDNS itself is broken.
+</div></details>
+
+<footer class="course-footer">Next: Topic 20 — CoreDNS, the server that actually implements the cluster DNS naming system.</footer>
+
+<script>
+  mermaid.initialize({ startOnLoad: true, theme: 'dark' });
+</script>
+
+</body>
+</html>

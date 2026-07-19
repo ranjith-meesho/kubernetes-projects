@@ -1,0 +1,248 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Topic 25: PersistentVolumeClaim (PVC) — Kubernetes Expert Course</title>
+<link rel="stylesheet" href="styles.css">
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+</head>
+<body>
+
+<header class="course-header">
+  <div class="kicker">Topic 25 of 70</div>
+  <h1>PersistentVolumeClaim (PVC)</h1>
+  <div class="subtitle">The namespaced storage request: how binding works, access modes, and how Pods actually consume a PVC.</div>
+</header>
+
+<nav class="topic-nav">
+  <a href="24-pv.html">&larr; PersistentVolume</a>
+  <a href="index.html">Course Index</a>
+  <a href="26-storageclass.html">StorageClass &rarr;</a>
+</nav>
+
+<h2 id="explanation">Explanation</h2>
+<p>A <strong>PersistentVolumeClaim (PVC)</strong> is the developer-facing side of the storage story. Where a PV is a cluster-admin/provisioner concern full of infrastructure detail (disk IDs, mount options, CSI driver names), a PVC is deliberately simple and namespaced: "I need 20Gi, ReadWriteOnce, on the fast-ssd class." Kubernetes needs this split so application authors never have to know or care what's underneath — the same Deployment manifest can run unmodified on AWS, GCP, on-prem, or a local kind cluster, because the PVC abstracts the difference away.</p>
+<p>When a PVC is created, the PV controller looks for a matching <code>Available</code> PV (matching capacity, access mode, storage class, and any label selector). If found, it binds them 1:1 — a PV can only ever be bound to one PVC at a time. If no matching PV exists and the PVC references a StorageClass, dynamic provisioning kicks in and a brand-new PV is created and bound automatically, usually within seconds.</p>
+<p><strong>Access modes</strong> describe how many nodes can mount the volume simultaneously and in what mode: <code>ReadWriteOnce (RWO)</code> — one node at a time (most cloud block storage: EBS, GCE PD, Azure Disk); <code>ReadOnlyMany (ROX)</code> — many nodes, read-only; <code>ReadWriteMany (RWX)</code> — many nodes, read-write (needs a real shared filesystem like NFS, EFS, Ceph FS, Azure Files — not plain block storage); and the newer <code>ReadWriteOncePod</code>, which restricts mounting to a single Pod (not just a single node), useful for StatefulSets where you must guarantee exclusive access even across node failures.</p>
+<p>Pods never mount a PV directly — they declare a volume of type <code>persistentVolumeClaim</code> naming the PVC, and kubelet resolves that to the bound PV and its CSI driver at mount time. This indirection is what makes PVCs portable: the same Pod spec works whether the PVC is bound to a static NFS PV or a dynamically-provisioned cloud disk. It's also why deleting and recreating a PVC with the same name doesn't automatically get you the same data back unless you deliberately re-bind it to the same (Retained) PV.</p>
+
+<h2 id="internal-working">Internal Working / Interactions</h2>
+<ul>
+<li><strong>PV controller</strong> — matches the PVC against existing PVs or triggers dynamic provisioning.</li>
+<li><strong>API Server / etcd</strong> — PVC spec (request) vs status (bound volume, capacity) are tracked like any other object.</li>
+<li><strong>Scheduler</strong> — for topology-aware provisioning (<code>WaitForFirstConsumer</code>), the scheduler's chosen node influences which zone the PV gets created in.</li>
+<li><strong>kubelet</strong> — at Pod startup, resolves the PVC's bound PV and calls the CSI node plugin to stage and publish the volume into the container.</li>
+</ul>
+
+<h2 id="architecture-diagram">Architecture Diagram</h2>
+<pre class="mermaid">
+flowchart TD
+  Dev[Developer writes Pod + PVC manifest] --> PVC[PVC created: 20Gi, RWO, fast-ssd]
+  PVC --> Check{Matching Available PV exists?}
+  Check -->|Yes| Bind[Bind PVC to existing PV]
+  Check -->|No, StorageClass set| Provision[Dynamic provisioning via CSI]
+  Provision --> NewPV[New PV created]
+  NewPV --> Bind
+  Bind --> Ready[PVC status: Bound]
+  Ready --> PodMount[Pod references PVC in volumes]
+  PodMount --> Kubelet[kubelet mounts via CSI node plugin]
+</pre>
+
+<h2 id="code-example">Code Example</h2>
+<pre><code># PVC requesting dynamically-provisioned block storage
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: db-data-pvc
+  namespace: shop
+spec:
+  accessModes:
+    - ReadWriteOnce                # one node at a time — correct for a single-writer database
+  storageClassName: fast-ssd       # triggers dynamic provisioning via this class's provisioner
+  resources:
+    requests:
+      storage: 20Gi                # requested minimum capacity
+
+---
+# Pod consuming the PVC above — no knowledge of the underlying disk/CSI driver
+apiVersion: v1
+kind: Pod
+metadata:
+  name: postgres-pod
+  namespace: shop
+spec:
+  containers:
+  - name: postgres
+    image: postgres:16
+    volumeMounts:
+    - name: data
+      mountPath: /var/lib/postgresql/data
+  volumes:
+  - name: data
+    persistentVolumeClaim:
+      claimName: db-data-pvc       # only reference needed; PV/CSI details are hidden
+
+---
+# RWX PVC for a shared filesystem consumed by multiple replicas
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: shared-assets-pvc
+  namespace: shop
+spec:
+  accessModes:
+    - ReadWriteMany                # multiple Pods on multiple nodes can mount simultaneously
+  storageClassName: efs-sc
+  resources:
+    requests:
+      storage: 50Gi
+</code></pre>
+
+<h2 id="kubectl-commands">kubectl Commands</h2>
+<pre><code>kubectl get pvc -n shop                       # list PVCs and their bound status
+kubectl describe pvc db-data-pvc -n shop      # binding events, capacity, access mode
+kubectl get pvc -n shop -o wide               # shows bound PV name and storage class inline
+kubectl get pv | grep db-data-pvc             # find the PV backing a given PVC
+kubectl delete pvc db-data-pvc -n shop        # release the claim (check reclaim policy first!)
+kubectl patch pvc db-data-pvc -n shop -p '{"spec":{"resources":{"requests":{"storage":"30Gi"}}}}'  # expand (if allowVolumeExpansion is set)
+kubectl get events -n shop --field-selector involvedObject.kind=PersistentVolumeClaim  # provisioning/binding failures
+</code></pre>
+
+<h2 id="best-practices">Best Practices &amp; Common Pitfalls</h2>
+<div class="grid-2">
+<div class="callout good">
+<strong>Do</strong>
+<ul>
+<li>Pick the narrowest access mode that works (RWO over RWX) — RWX backends are usually slower and pricier.</li>
+<li>Set resource requests conservatively but enable volume expansion for growth instead of over-provisioning upfront.</li>
+<li>Use <code>ReadWriteOncePod</code> for StatefulSet workloads needing strict single-Pod exclusivity.</li>
+<li>Name PVCs predictably (e.g. tied to StatefulSet ordinal) for easier operational tracing.</li>
+</ul>
+</div>
+<div class="callout warn">
+<strong>Pitfalls</strong>
+<ul>
+<li>PVC stuck <code>Pending</code> — usually a StorageClass typo, zone mismatch, or no provisioner running.</li>
+<li>Assuming deleting a Pod deletes its PVC — it doesn't; PVCs (and their data) persist independently.</li>
+<li>Requesting RWX on a StorageClass backed by block storage that physically can't support it.</li>
+<li>Forgetting <code>allowVolumeExpansion: true</code> is required on the StorageClass before a PVC resize will work.</li>
+</ul>
+</div>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="interview-questions">50 Interview Questions</h2>
+
+<details class="qa"><summary>1. Why is a PVC namespaced while a PV is cluster-scoped?</summary>
+<div class="qa-body"><strong>Short answer:</strong> A PVC represents an application's storage request and belongs to whichever namespace that application lives in, while a PV represents an actual piece of infrastructure that isn't owned by any single team.
+<br><strong>Detailed explanation:</strong> This split lets cluster admins (or dynamic provisioners) manage the pool of underlying disks centrally, while developers only ever interact with the namespaced PVC object — they request capacity and access mode, never touch disk IDs, mount options, or CSI driver details.
+<br><strong>Production example:</strong> Two teams in <code>shop</code> and <code>billing</code> namespaces can both create a <code>db-data-pvc</code> without collision, because PVC names only need to be unique within a namespace.
+<br><strong>Common mistake:</strong> Expecting to reference a PVC from a different namespace in a Pod's <code>volumes</code> block — it must live in the same namespace as the Pod.</div></details>
+
+<details class="qa"><summary>2. What criteria does the PV controller use to bind a PVC to an existing PV?</summary>
+<div class="qa-body"><strong>Short answer:</strong> It matches capacity (PV must have at least the requested amount), access mode, storage class name, and any label selector on the PVC.
+<br><strong>Detailed explanation:</strong> Only PVs in <code>Available</code> phase are considered. The controller picks the smallest PV that satisfies all criteria rather than an exact match, and binding is exclusive — once bound, that PV is removed from consideration for any other PVC.
+<br><strong>Production example:</strong> A PVC requesting 20Gi RWO with class <code>fast-ssd</code> will bind to a pre-provisioned 50Gi <code>fast-ssd</code> PV rather than wait for an exact 20Gi match, "wasting" the extra 30Gi that PV had.
+<br><strong>Common mistake:</strong> Assuming the PVC's requested storage becomes the bound volume's exact size — it's actually whatever capacity the matched PV declares.</div></details>
+
+<details class="qa"><summary>3. What happens when a PVC references a StorageClass but no matching Available PV exists?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Dynamic provisioning kicks in — the CSI provisioner named in the StorageClass creates a brand-new PV sized to the request and binds it automatically.
+<br><strong>Detailed explanation:</strong> This happens without any admin pre-creating volumes; the PVC's <code>storageClassName</code> tells the external-provisioner sidecar which backend to call, and it usually completes within seconds for cloud block storage.
+<br><strong>Production example:</strong> Creating a <code>db-data-pvc</code> with <code>storageClassName: fast-ssd</code> in a fresh namespace results in a new EBS/GCE-PD-backed PV appearing moments later with no admin action.
+<br><strong>Common mistake:</strong> Forgetting to set <code>storageClassName</code> and expecting dynamic provisioning to still occur — an empty/omitted class only works if a default StorageClass is configured cluster-wide.</div></details>
+
+<details class="qa"><summary>4. Why do Pods reference a PVC instead of a PV directly?</summary>
+<div class="qa-body"><strong>Short answer:</strong> The indirection lets the same Pod spec work regardless of what's actually backing the storage — a static NFS PV, a dynamically-provisioned cloud disk, or anything else.
+<br><strong>Detailed explanation:</strong> A Pod's <code>volumes</code> entry only names <code>persistentVolumeClaim.claimName</code>; kubelet resolves that PVC to its bound PV and CSI driver at mount time. This means portability across environments and storage backends without touching the Pod manifest.
+<br><strong>Production example:</strong> The exact same <code>postgres-pod</code> manifest referencing <code>db-data-pvc</code> runs unmodified on a cloud cluster (EBS-backed PV) or a local kind cluster (hostPath-backed PV).
+<br><strong>Common mistake:</strong> Hardcoding a PV name directly in a Pod's volume spec, bypassing the PVC layer and losing that portability.</div></details>
+
+<details class="qa"><summary>5. Why doesn't recreating a PVC with the same name restore the old data?</summary>
+<div class="qa-body"><strong>Short answer:</strong> A new PVC has no memory of the previous binding — the PV controller treats it as a fresh claim and will match/provision independently unless you deliberately re-bind it.
+<br><strong>Detailed explanation:</strong> If the original PV's reclaim policy was <code>Delete</code>, the underlying disk is gone entirely. If it was <code>Retain</code>, the PV enters <code>Released</code> phase holding the old data, but it won't auto-rebind — an admin must manually clear its <code>claimRef</code> and set it back to <code>Available</code> (or reference it explicitly) before a new PVC can bind to it.
+<br><strong>Production example:</strong> After accidentally deleting <code>db-data-pvc</code>, a team recreates it expecting their database files back, only to get an empty new volume because the reclaim policy was <code>Delete</code>.
+<br><strong>Common mistake:</strong> Deleting a PVC to "reset" storage without first checking the reclaim policy on its bound PV.</div></details>
+
+<details class="qa"><summary>6. What's the practical difference between ReadWriteOnce (RWO) and ReadWriteOncePod?</summary>
+<div class="qa-body"><strong>Short answer:</strong> RWO restricts mounting to a single node (multiple Pods on that same node can still mount it); ReadWriteOncePod restricts mounting to a single Pod, cluster-wide.
+<br><strong>Detailed explanation:</strong> RWO's node-level restriction has historically caused subtle bugs during StatefulSet Pod rescheduling, where an old Pod's leftover mount on a node and a new Pod scheduled to the same node could both attach. ReadWriteOncePod closes that gap by enforcing true single-Pod exclusivity.
+<br><strong>Production example:</strong> A StatefulSet Pod that crash-loops and gets rescheduled to the same node could, under plain RWO, end up with two containers briefly both accessing the same volume; ReadWriteOncePod prevents this outright.
+<br><strong>Common mistake:</strong> Assuming RWO alone guarantees exclusive single-Pod access — it only guarantees single-node access.</div></details>
+
+<details class="qa"><summary>7. Why can't most cloud block storage (EBS, GCE PD, Azure Disk) support ReadWriteMany?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Block storage volumes are attached to one compute instance at a time at the hypervisor/OS level — they aren't a shared filesystem multiple hosts can mount concurrently.
+<br><strong>Detailed explanation:</strong> RWX requires a networked filesystem protocol (NFS, EFS, Azure Files, Ceph FS) that natively supports concurrent multi-client mounts with its own locking semantics; plain block devices have no such mechanism.
+<br><strong>Production example:</strong> Requesting RWX on an <code>ebs-sc</code> StorageClass either fails provisioning outright or the CSI driver rejects the access mode, depending on driver validation.
+<br><strong>Common mistake:</strong> Assuming any StorageClass can serve any access mode — access modes are constrained by the underlying storage technology, not just a YAML field you can set freely.</div></details>
+
+<details class="qa"><summary>8. When would you choose ReadWriteMany over ReadWriteOnce for a workload?</summary>
+<div class="qa-body"><strong>Short answer:</strong> When multiple Pods across multiple nodes genuinely need concurrent read-write access to the same files, like shared static assets or a shared upload directory.
+<br><strong>Detailed explanation:</strong> RWX needs a real shared filesystem backend, which typically costs more and can add latency versus block storage, so it should only be chosen when the access pattern truly requires simultaneous multi-node writers rather than out of convenience.
+<br><strong>Production example:</strong> A <code>shared-assets-pvc</code> backed by <code>efs-sc</code> lets multiple replicas of a content service all read and write to the same image/CDN-origin directory.
+<br><strong>Common mistake:</strong> Defaulting to RWX "just in case" for workloads that actually only need RWO, incurring unnecessary cost and complexity.</div></details>
+
+<details class="qa"><summary>9. Why would a PVC get stuck in Pending status?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Most commonly a StorageClass name typo, no provisioner available for that class, a zone/topology mismatch, or simply no matching Available PV when dynamic provisioning isn't configured.
+<br><strong>Detailed explanation:</strong> <code>kubectl describe pvc</code> surfaces the specific reason via events — e.g. "no persistent volumes available for this claim" or a provisioning error from the CSI driver. With <code>WaitForFirstConsumer</code> binding mode, Pending is also normal and expected until a Pod referencing the PVC gets scheduled.
+<br><strong>Production example:</strong> A PVC referencing <code>storageClassName: fast-ssd</code> stays Pending forever because the actual class name in the cluster is <code>fast-ssd-v2</code> — a simple typo.
+<br><strong>Common mistake:</strong> Panicking and deleting/recreating the PVC repeatedly instead of first running <code>kubectl describe pvc</code> to read the actual binding/provisioning event.</div></details>
+
+<details class="qa"><summary>10. What does allowVolumeExpansion have to do with resizing a PVC, and why can shrinking not work the same way?</summary>
+<div class="qa-body"><strong>Short answer:</strong> A PVC can only be resized larger if its StorageClass has <code>allowVolumeExpansion: true</code>; even then, most CSI drivers only support growing a volume, never shrinking it.
+<br><strong>Detailed explanation:</strong> Editing <code>spec.resources.requests.storage</code> to a larger value on a bound PVC triggers the CSI controller to expand the underlying volume, and then kubelet resizes the filesystem on next mount (or via online expansion if the driver supports it). Shrinking is unsafe because there's no generic way to guarantee data on the "removed" capacity isn't lost, so it's blocked at the API level.
+<br><strong>Production example:</strong> Patching <code>db-data-pvc</code> from 20Gi to 30Gi succeeds instantly if <code>allowVolumeExpansion</code> is set on <code>fast-ssd</code>; without it, the patch is accepted by the API but never actually resizes anything.
+<br><strong>Common mistake:</strong> Assuming a PVC resize request that gets accepted by <code>kubectl patch</code> means the expansion actually happened — it silently no-ops if the StorageClass doesn't allow expansion.</div></details>
+
+<details class="qa"><summary>11–50. Additional rapid-fire questions</summary>
+<div class="qa-body">
+<strong>11.</strong> What field identifies which StorageClass a PVC should use? — <code>spec.storageClassName</code>.<br>
+<strong>12.</strong> Can a PVC bind to two PVs at once? — No, binding is always strictly one-to-one.<br>
+<strong>13.</strong> What phase is a PVC in before it's bound? — <code>Pending</code>.<br>
+<strong>14.</strong> What command shows which PV a given PVC is bound to? — <code>kubectl get pvc -o wide</code> or <code>kubectl describe pvc</code>.<br>
+<strong>15.</strong> Does deleting a Pod delete the PVC it referenced? — No, PVCs (and their data) persist independently of the Pods that use them.<br>
+<strong>16.</strong> What happens if you delete a PVC that's still mounted by a running Pod? — The PVC enters <code>Terminating</code> and stays there until no Pod is using it (a finalizer blocks actual removal).<br>
+<strong>17.</strong> Why would you set a label selector on a PVC? — To force binding only to PVs carrying matching labels, useful for pinning to specific pre-provisioned storage.<br>
+<strong>18.</strong> What does WaitForFirstConsumer binding mode change about PVC Pending behavior? — Binding (and provisioning) is deliberately delayed until a Pod using the PVC is scheduled, so the volume can be created in the correct topology zone.<br>
+<strong>19.</strong> Can a single Pod mount multiple PVCs? — Yes, a Pod's <code>volumes</code> list can reference any number of distinct PVCs.<br>
+<strong>20.</strong> What's the risk of requesting more storage in a PVC than any available PV provides, with no StorageClass set? — It stays Pending indefinitely since there's no provisioner to create new capacity.<br>
+<strong>21.</strong> How do StatefulSets typically manage PVCs per replica? — Via <code>volumeClaimTemplates</code>, which auto-generate a uniquely-named PVC per ordinal Pod.<br>
+<strong>22.</strong> What happens to a StatefulSet's PVCs when the StatefulSet is scaled down then back up? — The same PVCs (and their PVs/data) are reattached to the recreated ordinal Pods, since scaling down doesn't delete PVCs by default.<br>
+<strong>23.</strong> Why might a database workload specifically want ReadWriteOncePod over RWO? — To guarantee true single-writer exclusivity and avoid any risk of the volume being briefly double-mounted during a rescheduling race.<br>
+<strong>24.</strong> What object shows PVC provisioning failures if events don't reveal enough? — Logs of the external-provisioner sidecar Pod for the relevant CSI driver.<br>
+<strong>25.</strong> Can you change a PVC's access mode after creation? — No, access modes are immutable once the PVC is created; you'd need to create a new PVC.<br>
+<strong>26.</strong> Can you change a PVC's storageClassName after creation? — No, that field is immutable post-creation.<br>
+<strong>27.</strong> What's the effect of specifying no storageClassName and no default StorageClass exists? — The PVC will only bind to a manually pre-created PV matching its criteria; it can never be dynamically provisioned.<br>
+<strong>28.</strong> Why is capacity requested in a PVC treated as a minimum, not exact? — Static binding matches the smallest sufficient PV, which may exceed the requested size, since PVs aren't split or resized to fit exactly.<br>
+<strong>29.</strong> What's a common mistake when migrating a PVC's data to a larger disk without volume expansion support? — Manually provisioning a new larger PVC/PV and copying data across (e.g. via a temporary Pod), since in-place resize isn't possible.<br>
+<strong>30.</strong> How would you verify a resize actually took effect on the filesystem, not just the PVC object? — Check <code>kubectl get pvc</code> for updated <code>status.capacity</code>, then exec into the Pod and run <code>df -h</code> on the mount path.<br>
+<strong>31.</strong> What field in the PVC status reflects the actual bound PV's capacity, versus the request? — <code>status.capacity</code> versus <code>spec.resources.requests.storage</code>.<br>
+<strong>32.</strong> Why is a PVC considered the "contract" between application and storage infrastructure? — It expresses intent (size, access mode, class) without leaking implementation details, letting either side change independently.<br>
+<strong>33.</strong> What's a reason a PVC resize could fail even with allowVolumeExpansion set? — The underlying cloud provider or CSI driver may have its own limits (e.g. minimum time between resizes, or hitting max volume size).<br>
+<strong>34.</strong> Why should teams avoid requesting RWX by default across all PVCs? — RWX-capable backends are typically slower and more expensive than block storage, so it should be reserved for genuinely shared-access workloads.<br>
+<strong>35.</strong> What does it mean if a PVC shows Bound but the Pod using it fails to start with a mount error? — The binding succeeded at the API level, but the actual CSI mount at the node failed — check kubelet/CSI node plugin logs, not the PVC object.<br>
+<strong>36.</strong> Why would a PVC in one availability zone fail to bind to a Pod scheduled in another zone? — Zonal block storage (e.g. EBS) can't be attached across zones; the PV's node affinity restricts which nodes can use it.<br>
+<strong>37.</strong> How does topology-aware provisioning avoid the zone-mismatch problem above? — With WaitForFirstConsumer, provisioning waits until the consuming Pod is scheduled, so the new PV is created in that Pod's actual zone.<br>
+<strong>38.</strong> What's a good reason to name PVCs predictably, tied to a workload's identity? — It makes operational tracing (which PVC backs which database instance) far easier during incident response.<br>
+<strong>39.</strong> Can a PVC be shared between two independent Deployments if it's RWO? — Not safely for concurrent writes — RWO only guarantees single-node mount, and two Deployments' Pods could land on different nodes and conflict or fail to mount.<br>
+<strong>40.</strong> What kubectl command would you use to check for PVC provisioning/binding failures across a namespace? — <code>kubectl get events -n &lt;ns&gt; --field-selector involvedObject.kind=PersistentVolumeClaim</code>.<br>
+<strong>41.</strong> Why is it important to check reclaim policy before deleting a "temporary" PVC in a shared cluster? — A <code>Delete</code> policy destroys the underlying disk irreversibly, while <code>Retain</code> leaves recoverable data behind.<br>
+<strong>42.</strong> What happens to a PVC's bound PV if the PVC is deleted and the policy is Retain? — The PV moves to <code>Released</code> phase, keeping its data, but won't auto-bind to a new PVC until manually reset.<br>
+<strong>43.</strong> Why might over-provisioning storage size upfront be discouraged in favor of expansion? — It wastes capacity and cost immediately, whereas enabling expansion lets you grow storage precisely when actually needed.<br>
+<strong>44.</strong> What's the effect of a Pod referencing a PVC that doesn't exist yet? — The Pod stays stuck in <code>ContainerCreating</code> / <code>Pending</code> until the PVC is created and bound.<br>
+<strong>45.</strong> Why does a PVC's namespace matter for RBAC and multi-tenancy? — It scopes who can create, view, or delete storage requests to the same access boundaries as other namespaced resources like Pods and Secrets.<br>
+<strong>46.</strong> What's a subtle danger of relying on a default StorageClass without explicitly setting storageClassName? — If the cluster default changes later, new PVCs silently start provisioning against a different class than intended.<br>
+<strong>47.</strong> How would you confirm whether a PVC was dynamically provisioned or statically bound? — Check whether its bound PV's name matches the dynamic-provisioner naming pattern (e.g. <code>pvc-&lt;uid&gt;</code>) versus a hand-created PV name.<br>
+<strong>48.</strong> Why can't a PVC's access mode list include RWX for a StorageClass whose provisioner only creates block volumes? — The CSI driver validates and rejects access modes it can't physically support at provisioning time.<br>
+<strong>49.</strong> What's a real operational reason to prefer many small PVCs over one large shared PVC across services? — Isolates failure/resize/access-mode requirements per service instead of coupling unrelated workloads to the same volume's lifecycle.<br>
+<strong>50.</strong> Why is understanding PVC binding critical before debugging a "Pod won't start" issue involving storage? — Most storage-related Pod scheduling/startup failures trace back to the PVC never reaching Bound, so checking PVC status is the correct first diagnostic step, before looking at the Pod itself.<br>
+</div></details>
+
+<footer class="course-footer">Next: Topic 26 — StorageClass (dynamic provisioning, provisioners, volumeBindingMode).</footer>
+
+<script>
+  mermaid.initialize({ startOnLoad: true, theme: 'dark' });
+</script>
+
+</body>
+</html>

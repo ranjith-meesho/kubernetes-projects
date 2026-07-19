@@ -1,0 +1,299 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Topic 18: Services — Kubernetes Expert Course</title>
+<link rel="stylesheet" href="styles.css">
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+</head>
+<body>
+
+<header class="course-header">
+  <div class="kicker">Topic 18 of 70</div>
+  <h1>Services</h1>
+  <div class="subtitle">Stable virtual networking to an ever-changing set of Pods — ClusterIP, NodePort, LoadBalancer, ExternalName, and how kube-proxy makes it real.</div>
+</header>
+
+<nav class="topic-nav">
+  <a href="17-cronjobs.html">&larr; CronJobs</a>
+  <a href="index.html">Course Index</a>
+  <a href="19-dns.html">DNS &rarr;</a>
+</nav>
+
+<h2 id="explanation">Explanation</h2>
+<p>A <strong>Service</strong> gives a stable network identity to a dynamic, ever-changing set of Pods. Pods are
+ephemeral — they get new IPs every time they're recreated (by a rollout, a crash, a reschedule) — but clients need
+one durable address to connect to "the checkout service" regardless of which specific Pods are currently backing it.
+A Service solves this by providing a stable virtual IP and/or DNS name that automatically routes to whichever Pods
+currently match its label selector, updated continuously as Pods come and go.</p>
+
+<p>Kubernetes needs this abstraction because without it, every client would need to independently track the live set
+of Pod IPs behind a workload — essentially reimplementing service discovery and load balancing in every consumer.
+Instead, a Service centralizes that logic: the Service controller continuously watches for Pods matching its
+selector and maintains an <strong>Endpoints</strong> (or the newer, scalable <strong>EndpointSlice</strong>) object
+listing their current IPs, while every node's <strong>kube-proxy</strong> programs local networking rules
+(iptables, IPVS, or eBPF depending on the implementation) so that traffic to the Service's virtual IP is transparently
+load-balanced across those real Pod IPs — with no per-client awareness needed.</p>
+
+<p>There are four Service types, each solving a different exposure problem. <strong>ClusterIP</strong> (the default)
+gives a virtual IP reachable only from inside the cluster — the standard choice for internal service-to-service
+traffic. <strong>NodePort</strong> additionally opens a fixed port (30000-32767 range) on every node's IP, letting
+external traffic reach the Service by hitting any node directly — simple but coarse-grained and rarely used directly
+in production. <strong>LoadBalancer</strong> asks the cloud provider (via the Cloud Controller Manager) to provision
+an external load balancer (an AWS ELB/NLB, GCP LB, etc.) that forwards to the Service — the standard way to expose a
+service to the internet on a cloud-managed cluster. <strong>ExternalName</strong> is different in kind: it doesn't
+route to Pods at all, it's a pure DNS CNAME alias inside the cluster pointing to an external hostname, useful for
+referring to an external database or third-party API using an internal, Kubernetes-native name.</p>
+
+<p>Critically, a Service's virtual IP (ClusterIP) is not a real, routable network address handled by any single
+machine — it exists only as distributed iptables/IPVS rules on every node, rewritten on the fly to one of the
+backing Pod IPs per connection. This is why Services scale to large clusters without a centralized load-balancer
+bottleneck: the "load balancing" happens locally, at the node the traffic originates from.</p>
+
+<h2 id="internal-working">Internal Working / Interactions</h2>
+<ul>
+  <li><strong>Endpoints controller / EndpointSlice controller</strong> — watches Services and Pods; for each Service,
+  maintains an up-to-date list of Ready Pod IPs+ports matching its selector.</li>
+  <li><strong>kube-proxy</strong> (every node) — watches Services and EndpointSlices via the API Server, and
+  programs local iptables/IPVS rules so packets destined for the Service's ClusterIP get DNAT'd to a chosen backend
+  Pod IP.</li>
+  <li><strong>CoreDNS</strong> — watches Services and creates a DNS A/AAAA record (<code>&lt;svc&gt;.&lt;ns&gt;.svc.cluster.local</code>)
+  resolving to the ClusterIP, so Pods can address Services by name instead of IP.</li>
+  <li><strong>Cloud Controller Manager</strong> — for <code>type: LoadBalancer</code>, provisions and wires up the
+  actual cloud load balancer, then writes its external IP back onto the Service's <code>status</code>.</li>
+  <li><strong>kubelet readiness probes</strong> — only Pods reporting Ready are included in a Service's Endpoints,
+  so a Pod that's up but not yet healthy never receives traffic.</li>
+</ul>
+
+<h2 id="architecture-diagram">Architecture Diagram</h2>
+<pre class="mermaid">
+flowchart TB
+    Client["Client Pod"]
+    SVC["Service: checkout\nClusterIP: 10.96.10.5\nselector: app=checkout"]
+    EP["EndpointSlice\n10.244.1.5:8080\n10.244.2.9:8080"]
+    KP["kube-proxy (every node)\niptables/IPVS rules"]
+    P1["Pod checkout-abc\n10.244.1.5"]
+    P2["Pod checkout-def\n10.244.2.9"]
+
+    Client -->|"DNS: checkout.default.svc.cluster.local"| SVC
+    SVC -->|"virtual IP, DNAT'd by kube-proxy"| KP
+    KP --> P1
+    KP --> P2
+    EP -->|watched by| KP
+    P1 -.->|Ready| EP
+    P2 -.->|Ready| EP
+</pre>
+
+<pre class="mermaid">
+sequenceDiagram
+    participant P as Client Pod
+    participant DNS as CoreDNS
+    participant KP as kube-proxy (local node)
+    participant B as Backend Pod
+
+    P->>DNS: Resolve checkout.default.svc.cluster.local
+    DNS-->>P: 10.96.10.5 (ClusterIP)
+    P->>KP: TCP SYN to 10.96.10.5:8080
+    KP->>KP: iptables DNAT to one Endpoint (e.g. 10.244.2.9:8080)
+    KP->>B: Forward connection
+    B-->>P: Response (return path via conntrack)
+</pre>
+
+<h2 id="code-example">Code Example</h2>
+<pre><code>apiVersion: v1
+kind: Service
+metadata:
+  name: checkout
+spec:
+  type: ClusterIP              # Default — internal-only virtual IP. Omit this line for the same effect.
+  selector:
+    app: checkout               # Matches Pods with this label; their IPs populate the EndpointSlice.
+  ports:
+    - name: http
+      port: 8080                 # Port clients connect to on the Service's ClusterIP.
+      targetPort: 8080            # Port the container actually listens on (can differ from `port`).
+      protocol: TCP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: checkout-external
+spec:
+  type: LoadBalancer            # Cloud Controller Manager provisions a real external LB for this.
+  selector:
+    app: checkout
+  ports:
+    - port: 443
+      targetPort: 8443
+  loadBalancerSourceRanges:      # Restrict which external CIDRs may reach the LB (defense in depth).
+    - "203.0.113.0/24"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: legacy-payments-db
+spec:
+  type: ExternalName             # No selector, no Pods — pure DNS alias.
+  externalName: payments-db.vendor-hosted.example.com
+</code></pre>
+
+<h2 id="kubectl-commands">kubectl Commands</h2>
+<pre><code># List Services and their type/ClusterIP/external IP
+kubectl get svc
+
+# Show selector, Endpoints, and events for a Service
+kubectl describe svc checkout
+
+# Confirm which Pod IPs are currently backing a Service
+kubectl get endpointslice -l kubernetes.io/service-name=checkout
+
+# Test connectivity to a Service's ClusterIP from inside the cluster
+kubectl run -it --rm curl-test --image=curlimages/curl -- curl http://checkout.default.svc.cluster.local:8080
+
+# Port-forward a Service to your local machine for debugging
+kubectl port-forward svc/checkout 8080:8080
+
+# Watch a LoadBalancer Service until the cloud LB's external IP is assigned
+kubectl get svc checkout-external -w
+
+# Check kube-proxy's programmed rules on a node (iptables mode)
+sudo iptables -t nat -L KUBE-SERVICES -n | grep checkout
+</code></pre>
+
+<h2 id="best-practices">Best Practices &amp; Common Pitfalls</h2>
+<div class="grid-2">
+<div>
+<h4>Best Practices</h4>
+<ul>
+  <li>Use ClusterIP + Ingress for HTTP traffic instead of exposing many LoadBalancer Services (cost and IP sprawl).</li>
+  <li>Always define readinessProbes — Services only route to Pods reporting Ready.</li>
+  <li>Name Service ports explicitly when a Service exposes more than one — required for clarity and some tooling.</li>
+  <li>Use <code>loadBalancerSourceRanges</code> or a NetworkPolicy to restrict exposure of LoadBalancer Services.</li>
+</ul>
+</div>
+<div>
+<h4>Pitfalls</h4>
+<ul>
+  <li>Selector typos — a Service with zero matching Pods silently has an empty EndpointSlice and just times out.</li>
+  <li>Confusing <code>port</code> and <code>targetPort</code>, causing connection refused errors.</li>
+  <li>Using NodePort directly in production instead of a LoadBalancer or Ingress — exposes a wide port range on every node.</li>
+  <li>Forgetting that ExternalName Services do not proxy traffic at all — they only resolve DNS, so TLS/ports must match the real external target.</li>
+</ul>
+</div>
+</div>
+
+<h2 id="interview-questions">50 Interview Questions</h2>
+
+<details class="qa"><summary>1. Why do Pods need Services at all, given that every Pod already has its own IP?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Pod IPs are ephemeral — they change on every recreation — while clients need one durable address that survives Pod churn.
+<br><strong>Detailed explanation:</strong> Without a Service, every client would need to independently track the live set of Pod IPs behind a workload, essentially reimplementing service discovery and load balancing in every consumer.
+<br><strong>Production example:</strong> A checkout Service keeps the same ClusterIP and DNS name across dozens of Pod rollouts, crashes, and reschedules — clients never notice the underlying churn.
+<br><strong>Common mistake:</strong> Hardcoding a Pod's IP directly in client config instead of addressing it through its Service.</div></details>
+
+<details class="qa"><summary>2. What is an EndpointSlice and why did it replace the older Endpoints object?</summary>
+<div class="qa-body"><strong>Short answer:</strong> EndpointSlice is a more scalable way to track which Pod IPs+ports back a Service, splitting the list into multiple smaller objects instead of one giant one.
+<br><strong>Detailed explanation:</strong> A single Endpoints object for a Service with thousands of backing Pods became a serialization/watch bottleneck — every change required broadcasting the entire list to every watcher; EndpointSlice shards this across multiple smaller objects (default max 100 endpoints each) so updates are cheaper to propagate.
+<br><strong>Production example:</strong> A Service backing 500 Pods is represented by roughly 5 EndpointSlice objects instead of one Endpoints object listing all 500 IPs.
+<br><strong>Common mistake:</strong> Still querying the legacy Endpoints object in tooling/scripts instead of EndpointSlice, missing data on large, high-churn Services.</div></details>
+
+<details class="qa"><summary>3. How does kube-proxy actually make a Service's virtual IP work, given it isn't a real address on any machine?</summary>
+<div class="qa-body"><strong>Short answer:</strong> kube-proxy programs local iptables/IPVS (or eBPF, in some CNIs) rules on every node that DNAT traffic destined for the ClusterIP to one of the real backing Pod IPs.
+<br><strong>Detailed explanation:</strong> This means the "load balancing" happens locally at whichever node the traffic originates from, with no centralized load-balancer bottleneck — a key reason Services scale to large clusters.
+<br><strong>Production example:</strong> <code>sudo iptables -t nat -L KUBE-SERVICES -n | grep checkout</code> reveals the actual DNAT rules kube-proxy programmed for the checkout Service's ClusterIP.
+<br><strong>Common mistake:</strong> Assuming a ClusterIP is handled by some central component (like a real load balancer VM) rather than distributed per-node rules.</div></details>
+
+<details class="qa"><summary>4. Why does only a Ready Pod get included in a Service's Endpoints?</summary>
+<div class="qa-body"><strong>Short answer:</strong> So that a Pod which is running but not yet healthy (or degraded) never receives live traffic.
+<br><strong>Detailed explanation:</strong> The Endpoints/EndpointSlice controller specifically checks Pod readiness (driven by the kubelet's readinessProbe evaluation), not just whether the Pod exists or is Running, before adding its IP to the Service's routable set.
+<br><strong>Production example:</strong> A checkout Pod still warming up its connection pool on startup is excluded from the Service's Endpoints until its readinessProbe starts passing, avoiding failed requests during warmup.
+<br><strong>Common mistake:</strong> Omitting a readinessProbe entirely, causing a Pod to receive traffic the instant its container starts, before it's actually able to serve requests.</div></details>
+
+<details class="qa"><summary>5. When would you choose NodePort over LoadBalancer, and why is it rarely used directly in production?</summary>
+<div class="qa-body"><strong>Short answer:</strong> NodePort opens a fixed port on every node's IP; it's coarse-grained (wide port range exposure, manual external LB setup) compared to a cloud-provisioned LoadBalancer.
+<br><strong>Detailed explanation:</strong> LoadBalancer builds on NodePort under the hood but adds a proper external cloud load balancer in front, handling health checks and stable external IP/DNS — NodePort alone leaves you responsible for routing external traffic to node IPs yourself.
+<br><strong>Production example:</strong> On-prem or bare-metal clusters without a cloud LB integration sometimes use NodePort behind their own external load balancer/reverse proxy, since no Cloud Controller Manager exists to provision one automatically.
+<br><strong>Common mistake:</strong> Exposing a NodePort Service directly to the internet in a cloud environment where a proper LoadBalancer type would be safer and simpler.</div></details>
+
+<details class="qa"><summary>6. Why is ExternalName fundamentally different from the other three Service types?</summary>
+<div class="qa-body"><strong>Short answer:</strong> It doesn't route to Pods at all — it's a pure DNS CNAME alias with no selector, no Endpoints, and no traffic proxying.
+<br><strong>Detailed explanation:</strong> When a Pod queries an ExternalName Service's DNS name, CoreDNS simply returns a CNAME pointing to the configured external hostname — the client's own connection then goes directly to that external target, entirely bypassing kube-proxy.
+<br><strong>Production example:</strong> A <code>legacy-payments-db</code> ExternalName Service lets internal code reference a Kubernetes-native name while actually connecting to <code>payments-db.vendor-hosted.example.com</code>.
+<br><strong>Common mistake:</strong> Assuming an ExternalName Service proxies/load-balances traffic like ClusterIP does — it purely resolves DNS, so TLS certs and ports must match the real external target exactly.</div></details>
+
+<details class="qa"><summary>7. What's the difference between a Service's port and targetPort, and why does confusing them cause connection refused errors?</summary>
+<div class="qa-body"><strong>Short answer:</strong> port is what clients connect to on the Service's virtual IP; targetPort is the actual port the container listens on — they can differ.
+<br><strong>Detailed explanation:</strong> kube-proxy's DNAT rule rewrites the destination port from port to targetPort when forwarding to a backend Pod; if targetPort doesn't match what the container actually binds to, connections reach the Pod but get refused at the OS/socket level.
+<br><strong>Production example:</strong> A Service with <code>port: 8080, targetPort: 8080</code> works fine, but if the container actually listens on 3000 while targetPort still says 8080, every routed connection fails.
+<br><strong>Common mistake:</strong> Assuming port and targetPort must always be identical, or forgetting to update targetPort after changing the container's actual listen port.</div></details>
+
+<details class="qa"><summary>8. Why does a selector typo cause a Service to silently fail rather than error loudly?</summary>
+<div class="qa-body"><strong>Short answer:</strong> A Service with a selector matching zero Pods is perfectly valid Kubernetes state — it just ends up with an empty EndpointSlice, so connections simply time out.
+<br><strong>Detailed explanation:</strong> There's no validation step that checks "does this selector match at least one Pod" at creation time, since Services are commonly created before their backing Pods exist (or temporarily have zero healthy replicas) — so this failure mode looks identical to a real outage from the client's perspective.
+<br><strong>Production example:</strong> A Service selecting <code>app: checkout-svc</code> when the Deployment's Pods are actually labeled <code>app: checkout</code> results in indefinite connection timeouts with no obvious error in the Service object itself.
+<br><strong>Common mistake:</strong> Debugging a "connection timeout" as a network/firewall issue before checking <code>kubectl get endpointslice</code> to confirm the Service actually has any backing Pods at all.</div></details>
+
+<details class="qa"><summary>9. How does CoreDNS know to create a DNS record for a Service, and what does that record point to?</summary>
+<div class="qa-body"><strong>Short answer:</strong> CoreDNS's kubernetes plugin watches Service objects via the API Server and constructs an A/AAAA record resolving <code>&lt;svc&gt;.&lt;ns&gt;.svc.cluster.local</code> to the Service's ClusterIP — not to any individual Pod IP.
+<br><strong>Detailed explanation:</strong> This is why DNS resolution stays constant even as backing Pods churn — the record always points at the stable ClusterIP, and it's kube-proxy's DNAT rules (not DNS) that handle the actual routing to a live Pod.
+<br><strong>Production example:</strong> <code>checkout.default.svc.cluster.local</code> always resolves to the same ClusterIP (e.g. 10.96.10.5) regardless of how many times the checkout Deployment has rolled out new Pods.
+<br><strong>Common mistake:</strong> Assuming Service DNS resolves directly to a specific backing Pod's IP — it resolves to the stable virtual IP, one level of indirection above the actual Pods.</div></details>
+
+<details class="qa"><summary>10. Why is ClusterIP + Ingress generally preferred over many LoadBalancer Services for HTTP workloads?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Cost and IP sprawl — every LoadBalancer Service typically provisions its own cloud load balancer, which is expensive and hard to manage at scale for many HTTP services.
+<br><strong>Detailed explanation:</strong> An Ingress controller runs behind a single (or few) LoadBalancer Service and does host/path-based routing to many internal ClusterIP Services, consolidating the expensive external entry point while keeping per-service networking internal and cheap.
+<br><strong>Production example:</strong> A platform running 40 microservices behind one Ingress controller pays for one or two cloud load balancers total, instead of 40 separate ones.
+<br><strong>Common mistake:</strong> Giving every new HTTP microservice its own LoadBalancer-type Service by default, multiplying cloud costs and external IP usage unnecessarily.</div></details>
+
+<details class="qa"><summary>11–50. Additional rapid-fire questions</summary>
+<div class="qa-body">
+<strong>11.</strong> What's the default Service type if spec.type is omitted? — ClusterIP.<br>
+<strong>12.</strong> What component provisions the actual external LB for a LoadBalancer Service? — The Cloud Controller Manager, talking to the cloud provider's API.<br>
+<strong>13.</strong> What field on the Service object holds the external LB's assigned IP? — <code>status.loadBalancer.ingress</code>.<br>
+<strong>14.</strong> What's the NodePort default port range? — 30000–32767.<br>
+<strong>15.</strong> Can you manually pin a specific NodePort number? — Yes, via <code>spec.ports[].nodePort</code>, within the allowed range.<br>
+<strong>16.</strong> Does a ClusterIP Service work if no Pods currently match its selector? — Yes, the object remains valid; it just has an empty EndpointSlice and routes nowhere until matching Pods appear.<br>
+<strong>17.</strong> What's the purpose of loadBalancerSourceRanges? — Restricts which external CIDR blocks may reach a LoadBalancer Service, a defense-in-depth network control.<br>
+<strong>18.</strong> How do you test connectivity to a ClusterIP Service from inside the cluster? — Run a temporary Pod and curl/wget the Service's DNS name or ClusterIP directly.<br>
+<strong>19.</strong> What's the difference between kube-proxy's iptables mode and IPVS mode? — IPVS uses kernel-level hash tables for O(1) backend lookup and scales better with very large numbers of Services; iptables uses sequentially-evaluated rule chains.<br>
+<strong>20.</strong> Why might IPVS be preferred at very large Service counts? — iptables rule evaluation is roughly linear in Service count, while IPVS lookup performance stays flatter as Service count grows.<br>
+<strong>21.</strong> Can a Service target Pods in a different namespace? — No — a Service's selector only matches Pods in its own namespace.<br>
+<strong>22.</strong> How would you reach a Service in a different namespace? — Use its fully-qualified DNS name, <code>&lt;svc&gt;.&lt;namespace&gt;.svc.cluster.local</code>.<br>
+<strong>23.</strong> What's a headless Service and how does it differ from a normal ClusterIP Service? — clusterIP: None — DNS returns individual Pod records instead of one virtual IP; no kube-proxy load balancing occurs.<br>
+<strong>24.</strong> Why do StatefulSets require a headless Service? — To get stable, per-replica DNS records instead of one load-balanced address, since StatefulSet replicas need individually addressable identities.<br>
+<strong>25.</strong> Can a single Service expose multiple ports? — Yes, each with its own name, port, and targetPort — named ports are required when a Service exposes more than one.<br>
+<strong>26.</strong> What happens to existing connections when a backing Pod is removed from a Service's Endpoints? — Established connections via conntrack typically continue until they naturally close; only new connections avoid the removed Pod.<br>
+<strong>27.</strong> Why might a brief request failure spike occur during a rolling update even with a correctly configured Service? — A race between a Pod becoming NotReady/terminating and kube-proxy/EndpointSlice propagation delay can briefly route to a Pod that's shutting down.<br>
+<strong>28.</strong> What field helps mitigate that race during Pod termination? — <code>preStop</code> hooks combined with <code>terminationGracePeriodSeconds</code>, giving time for the Pod to be removed from Endpoints before it actually stops accepting connections.<br>
+<strong>29.</strong> Does a Service's ClusterIP change if the Service is recreated with the same name? — Typically yes, unless you explicitly request a specific ClusterIP — this is why clients should use DNS names, not hardcoded IPs.<br>
+<strong>30.</strong> What's externalTrafficPolicy: Local used for? — Preserves the client's source IP and avoids an extra hop by only routing to Pods on the same node that received the traffic, at the cost of potentially uneven load distribution.<br>
+<strong>31.</strong> What's the tradeoff of externalTrafficPolicy: Local? — Better source-IP visibility and reduced latency, but load isn't evenly spread if Pods aren't present on every node receiving traffic.<br>
+<strong>32.</strong> Can a Service have session affinity? — Yes, via <code>sessionAffinity: ClientIP</code>, routing a given client consistently to the same backend Pod within a timeout window.<br>
+<strong>33.</strong> Why is sessionAffinity rarely sufficient for true stateful session handling? — It's IP-based and coarse — NATed clients sharing one IP, or client IP changes, break the affinity; proper session state should live in a shared store instead.<br>
+<strong>34.</strong> What's the purpose of a Service's publishNotReadyAddresses field? — Allows including not-yet-Ready Pods in the Endpoints anyway — mainly used by headless Services for peer-discovery use cases like StatefulSets, not for normal traffic routing.<br>
+<strong>35.</strong> How do you check which specific Pods currently back a Service? — <code>kubectl get endpointslice -l kubernetes.io/service-name=&lt;svc&gt;</code>.<br>
+<strong>36.</strong> What's the effect of deleting a Service but keeping its backing Pods? — The Pods keep running fine; they simply become unreachable via that Service's stable address until it's recreated.<br>
+<strong>37.</strong> Is a Service itself a load balancer in the traditional sense? — Not really — it's a set of distributed routing rules (via kube-proxy) rather than a single load-balancing process/machine.<br>
+<strong>38.</strong> What's a common cause of "service works from one node but not another"? — kube-proxy not running or misconfigured on the failing node, so its local DNAT rules were never programmed.<br>
+<strong>39.</strong> How would you confirm kube-proxy is healthy on a given node? — Check kube-proxy Pod status/logs on that node and inspect its programmed iptables/IPVS rules directly.<br>
+<strong>40.</strong> Can Services be the target of a NetworkPolicy? — Not directly — NetworkPolicies select Pods by label, not Services; the Service itself has no independent network-policy identity.<br>
+<strong>41.</strong> Why might Services alone be insufficient for zero-downtime deploys without a readinessProbe? — Traffic could be routed to Pods before they're actually able to handle requests, causing errors during rollout regardless of the Deployment's own rollout strategy.<br>
+<strong>42.</strong> What's the purpose of the kubernetes.io/service-name label on EndpointSlices? — Lets tooling find all EndpointSlice shards belonging to one specific Service.<br>
+<strong>43.</strong> Does a Service support multiple selectors combined with OR logic? — No — a Service's selector is a single AND-combined matchLabels map; achieving OR-like behavior requires either multiple Services or broader shared labels.<br>
+<strong>44.</strong> What happens to a LoadBalancer Service if the cloud provider's LB provisioning fails? — The Service stays pending an external IP indefinitely; check Cloud Controller Manager logs/events for the underlying cloud API error.<br>
+<strong>45.</strong> Is it possible to bypass kube-proxy entirely for Service routing? — Yes — some CNIs (e.g. Cilium in "kube-proxy replacement" mode) implement Service routing via eBPF instead of iptables/IPVS.<br>
+<strong>46.</strong> Why would a team choose an eBPF-based Service dataplane over traditional kube-proxy? — Lower latency and better scalability at very high Service/Endpoint counts compared to iptables rule-chain evaluation.<br>
+<strong>47.</strong> What's the risk of forgetting to name ports on a multi-port Service? — The API Server may reject the Service, or referencing tooling (Ingress, service mesh) may be unable to disambiguate which port to use.<br>
+<strong>48.</strong> How do you debug "Service resolves but connection times out"? — Check EndpointSlice for actual backing Pods, then verify NetworkPolicy isn't blocking the path, then verify targetPort matches the container's real listen port.<br>
+<strong>49.</strong> What's a subtle risk of using ExternalName Services for TLS-terminated external endpoints? — Since no proxying occurs, the client Pod's own TLS config must match the real external hostname/cert — a Kubernetes-internal name mismatch in the cert can break verification.<br>
+<strong>50.</strong> What's the first thing to check when "the Service isn't working"? — <code>kubectl get endpointslice -l kubernetes.io/service-name=&lt;svc&gt;</code> to confirm it actually has backing Pods before investigating anything else.
+</div></details>
+
+<footer class="course-footer">Next: Topic 19 — DNS, the cluster-wide naming system that makes Service names resolvable.</footer>
+
+<script>
+  mermaid.initialize({ startOnLoad: true, theme: 'dark' });
+</script>
+
+</body>
+</html>

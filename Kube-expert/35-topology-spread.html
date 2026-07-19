@@ -1,0 +1,314 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Topic 35: Topology Spread Constraints — Kubernetes Expert Course</title>
+<link rel="stylesheet" href="styles.css">
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+</head>
+<body>
+
+<header class="course-header">
+  <div class="kicker">Topic 35 of 70</div>
+  <h1>Topology Spread Constraints</h1>
+  <div class="subtitle">Fine-grained, quantifiable even distribution of replicas across zones, nodes, or any topology domain.</div>
+</header>
+
+<nav class="topic-nav">
+  <a href="34-tolerations.html">&larr; Tolerations</a>
+  <a href="index.html">Course Index</a>
+  <a href="36-resource-management.html">Resource Management &rarr;</a>
+</nav>
+
+<h2 id="explanation">Explanation</h2>
+<p><strong>Topology spread constraints</strong> (<code>topologySpreadConstraints</code> in the Pod spec) give the
+Scheduler a quantitative, self-contained way to distribute a group of Pods evenly across a topology domain — a node,
+a zone, a region, or any custom label you choose as the <code>topologyKey</code>. They solve the same class of
+availability problem as pod anti-affinity, but with a crucial difference: anti-affinity is binary (co-locate or don't),
+while topology spread constraints reason about balance using a numeric <code>maxSkew</code> — the maximum allowed
+difference between the topology domain with the most matching Pods and the domain with the fewest.</p>
+
+<p>Kubernetes needs this because anti-affinity alone doesn't scale well to "spread N replicas evenly across M zones."
+With required anti-affinity you either forbid all co-location (impossible once replicas outnumber zones) or you don't
+constrain it at all. Topology spread constraints instead let you say precisely: "I have 3 zones, I want no more than 1
+extra replica in any zone compared to the least-loaded zone" — expressed as <code>maxSkew: 1</code>. This produces
+genuinely balanced distributions (2/2/2, or 3/2/2, never 5/1/0) in a way anti-affinity rules were never designed to
+guarantee.</p>
+
+<p>The four core fields define the whole behavior:</p>
+<ul>
+  <li><strong>maxSkew</strong> — the maximum permitted imbalance between the busiest and least-busy matching topology domain.</li>
+  <li><strong>topologyKey</strong> — the node label defining the domain (e.g. <code>topology.kubernetes.io/zone</code>, <code>kubernetes.io/hostname</code>).</li>
+  <li><strong>whenUnsatisfiable</strong> — <code>DoNotSchedule</code> (hard: Pod stays Pending if placing it would violate maxSkew) or <code>ScheduleAnyway</code> (soft: the Scheduler still prefers balance via scoring, but places the Pod regardless).</li>
+  <li><strong>labelSelector</strong> — which Pods count towards the skew calculation (usually the Deployment's own label, so unrelated Pods in the same domain don't distort the count).</li>
+</ul>
+
+<p>Since Kubernetes 1.19+, this is a first-class scheduler feature (no longer alpha), and since 1.24 there's a cluster-level
+default constraint (<code>defaultConstraints</code> in the scheduler config, or auto-applied via <code>PodTopologySpread</code>
+plugin defaults) that applies basic zone/host spreading automatically even if you set nothing — but production teams
+should still declare explicit constraints for anything availability-critical, since defaults are intentionally soft
+and generic.</p>
+
+<p>In production, topology spread constraints are the modern replacement for most anti-affinity use cases: a single
+Deployment usually wants "spread my own replicas evenly," which is exactly what this feature does natively, with
+better guarantees and lower Scheduler overhead than an equivalent required pod anti-affinity rule at scale. Anti-affinity
+remains the right tool specifically when the requirement is about a relationship between <em>two different</em>
+workloads (e.g. "never put my cache and my app on the same node"), which topology spread constraints don't express.</p>
+
+<div class="callout">
+  <strong>maxSkew intuition:</strong> with 3 zones and <code>maxSkew: 1</code>, valid distributions for 5 replicas
+  include 2/2/1 but not 3/1/1 (skew of 2 between busiest and least-busy zone). Lower maxSkew = tighter balance, at the
+  cost of more Pending pods if some zones lack capacity.
+</div>
+
+<h2 id="internal-working">Internal Working / Interactions</h2>
+<ul>
+  <li><strong>Scheduler (PodTopologySpread plugin):</strong> during Filter, computes current Pod counts per topology domain (via its Pod cache) and rejects candidate nodes whose domain would exceed maxSkew when <code>DoNotSchedule</code> is set; during Score, favors domains with fewer matching Pods.</li>
+  <li><strong>API Server:</strong> validates and persists <code>topologySpreadConstraints</code> as part of the Pod template; no separate object type.</li>
+  <li><strong>Node labels:</strong> the whole mechanism depends on nodes being correctly labeled with the topologyKey (e.g. cloud-provider-injected <code>topology.kubernetes.io/zone</code>) — missing/incorrect labels silently break spreading.</li>
+  <li><strong>Cluster Autoscaler:</strong> must account for topology spread constraints when deciding which node group to scale, since adding a node in the wrong zone won't unblock a Pending pod constrained to a different zone.</li>
+  <li><strong>Deployment/ReplicaSet controller:</strong> creates Pods with the constraint inherited from the Pod template; it has no awareness of the constraint's effect — that's entirely the Scheduler's job.</li>
+</ul>
+
+<h2 id="architecture-diagram">Architecture Diagram</h2>
+<pre class="mermaid">
+flowchart TB
+    subgraph ZA["Zone A (2 replicas)"]
+        A1[pod-1]
+        A2[pod-2]
+    end
+    subgraph ZB["Zone B (2 replicas)"]
+        B1[pod-3]
+        B2[pod-4]
+    end
+    subgraph ZC["Zone C (1 replica)"]
+        C1[pod-5]
+    end
+
+    NEW["New pod-6 pending scheduling\nmaxSkew=1, topologyKey=zone"] --> DECIDE{"Which zone keeps\nskew <= 1?"}
+    DECIDE -->|"A:3 vs C:1 -> skew 2, REJECT"| ZA
+    DECIDE -->|"B:3 vs C:1 -> skew 2, REJECT"| ZB
+    DECIDE -->|"C:2 vs A/B:2 -> skew 0, OK"| ZC
+</pre>
+
+<pre class="mermaid">
+sequenceDiagram
+    participant D as Deployment Controller
+    participant A as API Server
+    participant S as Scheduler
+    participant N as Node Labels (zone info)
+
+    D->>A: Create pod-6 (topologySpreadConstraints attached)
+    A-->>S: Watch fires
+    S->>N: Read topology.kubernetes.io/zone for candidate nodes
+    S->>S: Count existing matching pods per zone (A:2, B:2, C:1)
+    S->>S: Evaluate maxSkew for each candidate zone
+    S->>S: Zone C selected (lowest count, satisfies maxSkew)
+    S->>A: Bind pod-6 to a node in Zone C
+</pre>
+
+<h2 id="code-example">Code Example</h2>
+<pre><code>apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: checkout-service
+  namespace: payments
+spec:
+  replicas: 6
+  selector:
+    matchLabels: { app: checkout }
+  template:
+    metadata:
+      labels: { app: checkout }
+    spec:
+      topologySpreadConstraints:
+        - maxSkew: 1                                     # busiest zone can have at most 1 more pod than the least-busy
+          topologyKey: topology.kubernetes.io/zone         # domain = AZ
+          whenUnsatisfiable: DoNotSchedule                 # hard rule: block scheduling rather than violate skew
+          labelSelector:
+            matchLabels:
+              app: checkout                                # only count OTHER checkout pods, ignore unrelated workloads
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname               # ALSO spread across individual nodes within a zone
+          whenUnsatisfiable: ScheduleAnyway                  # soft rule: best-effort, don't block on this one
+          labelSelector:
+            matchLabels:
+              app: checkout
+      containers:
+        - name: checkout
+          image: registry.internal/checkout-service:2.4.1
+          resources:
+            requests: { cpu: "300m", memory: "256Mi" }
+</code></pre>
+
+<pre><code># Cluster-scoped default (kube-scheduler config, not a Pod field) that applies a baseline
+# zone + hostname spread to ALL pods lacking their own explicit constraints.
+apiVersion: kubescheduler.config.k8s.io/v1
+kind: KubeSchedulerConfiguration
+profiles:
+  - pluginConfig:
+      - name: PodTopologySpread
+        args:
+          defaultConstraints:
+            - maxSkew: 3
+              topologyKey: topology.kubernetes.io/zone
+              whenUnsatisfiable: ScheduleAnyway
+</code></pre>
+
+<h2 id="kubectl-commands">kubectl Commands</h2>
+<pre><code># See which zone/node each replica landed on
+kubectl get pods -l app=checkout -o wide
+
+# Cross-reference node zone labels
+kubectl get nodes -L topology.kubernetes.io/zone,kubernetes.io/hostname
+
+# Count replicas per zone quickly with jsonpath + sort
+kubectl get pods -l app=checkout -o json | jq -r '.items[].spec.nodeName'
+
+# Inspect the constraint on a running Deployment
+kubectl get deploy checkout-service -o jsonpath='{.spec.template.spec.topologySpreadConstraints}'
+
+# Check why a pod is stuck Pending due to skew violation
+kubectl describe pod <pending-pod> | grep -A5 Events
+
+# View the scheduler's default topology spread config (if customized)
+kubectl get configmap -n kube-system kube-scheduler-config -o yaml
+</code></pre>
+
+<h2 id="best-practices">Best Practices &amp; Common Pitfalls</h2>
+<div class="grid-2">
+<div>
+<h4>Do's</h4>
+<ul>
+  <li>Prefer topology spread constraints over pod anti-affinity for single-Deployment even distribution — cheaper for the Scheduler and gives quantifiable balance.</li>
+  <li>Combine a hard zone-level constraint with a soft node-level constraint for layered guarantees.</li>
+  <li>Always scope <code>labelSelector</code> tightly to the workload's own labels to avoid miscounting unrelated pods.</li>
+  <li>Verify node topology labels are present and correct before relying on spreading — missing labels silently disable the constraint.</li>
+</ul>
+</div>
+<div>
+<h4>Don'ts</h4>
+<ul>
+  <li>Don't set <code>maxSkew: 0</code> expecting perfect balance in clusters with uneven zone capacity — it will just produce Pending pods.</li>
+  <li>Don't use <code>DoNotSchedule</code> everywhere without capacity headroom in every zone — it turns capacity shortages into scheduling failures.</li>
+  <li>Don't forget existing pods are never rebalanced — constraints only affect placement of new/rescheduled pods.</li>
+  <li>Don't mix an overly broad labelSelector that accidentally includes canary or debug pods in the skew count.</li>
+</ul>
+</div>
+</div>
+
+<h2 id="interview-questions">50 Interview Questions</h2>
+
+<details class="qa"><summary>1. What problem do topology spread constraints solve that anti-affinity doesn't?</summary>
+<div class="qa-body"><strong>Short answer:</strong> They provide quantifiable, even distribution of N replicas across M topology domains, rather than a binary co-locate/don't-co-locate rule.
+<br><strong>Detailed explanation:</strong> Required anti-affinity can't express "spread evenly" once replica count exceeds domain count — it can only forbid all co-location, which becomes infeasible. maxSkew reasons numerically about balance instead.
+<br><strong>Production example:</strong> checkout-service with 6 replicas across 3 zones uses <code>maxSkew: 1</code> to guarantee something like 2/2/2, never 5/1/0.
+<br><strong>Common mistake:</strong> Reaching for anti-affinity to spread a Deployment's own replicas when topology spread constraints are the purpose-built, cheaper tool.</div></details>
+
+<details class="qa"><summary>2. What does <code>maxSkew</code> actually mean?</summary>
+<div class="qa-body"><strong>Short answer:</strong> The maximum allowed difference between the topology domain with the most matching Pods and the domain with the fewest.
+<br><strong>Detailed explanation:</strong> With <code>maxSkew: 1</code> and 3 zones, 5 replicas could land as 2/2/1 but never 3/1/1 (skew of 2 is disallowed).
+<br><strong>Production example:</strong> Lowering maxSkew from 3 to 1 tightened balance across AZs at the cost of more Pending pods when a zone lacked capacity.
+<br><strong>Common mistake:</strong> Setting <code>maxSkew: 0</code> expecting perfect balance regardless of zone capacity — it just produces more Pending pods in uneven clusters.</div></details>
+
+<details class="qa"><summary>3. What are the four core fields of a topology spread constraint?</summary>
+<div class="qa-body"><strong>Short answer:</strong> maxSkew, topologyKey, whenUnsatisfiable, and labelSelector.
+<br><strong>Detailed explanation:</strong> maxSkew sets the imbalance tolerance, topologyKey defines the domain (zone/hostname/custom), whenUnsatisfiable decides hard vs soft enforcement, labelSelector scopes which Pods count toward the skew calculation.
+<br><strong>Production example:</strong> checkout-service scopes labelSelector to <code>app: checkout</code> so unrelated workloads in the same zone don't distort the skew count.
+<br><strong>Common mistake:</strong> Using an overly broad labelSelector that accidentally includes canary or debug pods in the skew count.</div></details>
+
+<details class="qa"><summary>4. What's the difference between <code>DoNotSchedule</code> and <code>ScheduleAnyway</code>?</summary>
+<div class="qa-body"><strong>Short answer:</strong> DoNotSchedule is a hard rule — the Pod stays Pending if placing it would violate maxSkew; ScheduleAnyway is soft — the Scheduler still prefers balance via scoring but places the Pod regardless.
+<br><strong>Detailed explanation:</strong> This mirrors required vs preferred affinity semantics but expressed through the maxSkew/whenUnsatisfiable combination instead.
+<br><strong>Production example:</strong> checkout-service uses a hard zone-level constraint (DoNotSchedule) layered with a soft node-level constraint (ScheduleAnyway) for defense in depth.
+<br><strong>Common mistake:</strong> Using DoNotSchedule everywhere without capacity headroom in every zone, turning normal capacity shortages into scheduling failures.</div></details>
+
+<details class="qa"><summary>5. Why does topology spread depend on correct node labeling?</summary>
+<div class="qa-body"><strong>Short answer:</strong> The whole mechanism relies on nodes being labeled with the chosen topologyKey (e.g. <code>topology.kubernetes.io/zone</code>) — missing/incorrect labels silently disable the constraint.
+<br><strong>Detailed explanation:</strong> If a node lacks the topologyKey label, the Scheduler can't group it into any domain for skew calculation, effectively excluding it from spread accounting without raising an error.
+<br><strong>Production example:</strong> A newly added bare-metal node pool lacked zone labels, silently skewing distribution until labels were backfilled.
+<br><strong>Common mistake:</strong> Assuming topology spread "just works" without first verifying node topology labels are present and correct.</div></details>
+
+<details class="qa"><summary>6. When should you still use anti-affinity instead of topology spread constraints?</summary>
+<div class="qa-body"><strong>Short answer:</strong> When the requirement is about a relationship between two *different* workloads, not even distribution of one Deployment's own replicas.
+<br><strong>Detailed explanation:</strong> Topology spread constraints only reason about one workload's own Pod count per domain; they can't express "never put my cache and my app on the same node."
+<br><strong>Production example:</strong> A cache-and-app co-location exclusion rule stayed on pod anti-affinity even after the app's own replica spreading moved to topology spread constraints.
+<br><strong>Common mistake:</strong> Trying to force a cross-workload exclusion rule into a topology spread constraint, which it fundamentally can't express.</div></details>
+
+<details class="qa"><summary>7. Does Kubernetes apply any topology spreading by default with no explicit constraint?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Since 1.24, there's a cluster-level default constraint via the PodTopologySpread plugin that applies basic zone/host spreading automatically.
+<br><strong>Detailed explanation:</strong> These defaults are intentionally soft and generic — production teams should still declare explicit constraints for anything availability-critical rather than relying on the baseline.
+<br><strong>Production example:</strong> A team assumed default spreading was "good enough" for a payments-critical service, then added explicit maxSkew constraints after an incident review.
+<br><strong>Common mistake:</strong> Relying on cluster-level default constraints for availability-critical workloads instead of declaring explicit, workload-specific constraints.</div></details>
+
+<details class="qa"><summary>8. Are existing Pods ever rebalanced when a new topology spread constraint is added?</summary>
+<div class="qa-body"><strong>Short answer:</strong> No — constraints only affect placement of new or rescheduled Pods, never already-running ones.
+<br><strong>Detailed explanation:</strong> If a Deployment was already imbalanced before the constraint existed, that imbalance persists until Pods naturally churn or are manually recreated.
+<br><strong>Production example:</strong> After adding a maxSkew constraint, the existing 4/1/1 distribution stayed put until a rolling restart triggered rescheduling under the new rule.
+<br><strong>Common mistake:</strong> Expecting topology spread constraints to actively rebalance a cluster the moment they're applied.</div></details>
+
+<details class="qa"><summary>9. How would you diagnose a Pod stuck Pending due to a topology spread violation?</summary>
+<div class="qa-body"><strong>Short answer:</strong> <code>kubectl describe pod</code> and check Events for a skew-violation message identifying the constraint.
+<br><strong>Detailed explanation:</strong> The FailedScheduling event explains which topologyKey/maxSkew combination no candidate node could satisfy, similar in style to affinity failure messages.
+<br><strong>Production example:</strong> "0/6 nodes are available: 3 node(s) didn't satisfy existing pods anti-affinity rules" style output but referencing topology spread skew, traced to a zone at capacity.
+<br><strong>Common mistake:</strong> Debugging resource requests first when the actual blocker is a skew constraint clearly stated in the Events output.</div></details>
+
+<details class="qa"><summary>10. How do Cluster Autoscaler and topology spread constraints interact?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Cluster Autoscaler must account for topology spread constraints when choosing which node group to scale, since adding a node in the wrong zone won't unblock a Pod constrained to a different zone.
+<br><strong>Detailed explanation:</strong> CA simulates scheduling feasibility per node group; a zone-constrained Pending Pod only gets unblocked if CA scales the specific zone/node group that satisfies the skew requirement.
+<br><strong>Production example:</strong> CA scaled a node group in zone A while the Pending Pod actually needed capacity in zone C to satisfy maxSkew, leaving it Pending despite a successful scale-up elsewhere.
+<br><strong>Common mistake:</strong> Assuming any Cluster Autoscaler scale-up resolves a Pending Pod, regardless of which zone/node group it targeted.</div></details>
+
+<details class="qa"><summary>11–50. Additional rapid-fire questions</summary>
+<div class="qa-body">
+<strong>11.</strong> What Scheduler plugin implements topology spread constraints? — The PodTopologySpread plugin, active in both Filter and Score phases.<br>
+<strong>12.</strong> Since which Kubernetes version has topology spread constraints been a first-class, stable feature? — 1.19+ (no longer alpha).<br>
+<strong>13.</strong> What's a valid distribution for 5 replicas across 3 zones with maxSkew=1? — 2/2/1, but not 3/1/1.<br>
+<strong>14.</strong> Can you combine a hard and a soft constraint in the same Pod spec? — Yes — e.g. a hard zone-level DoNotSchedule plus a soft node-level ScheduleAnyway.<br>
+<strong>15.</strong> What happens if the topologyKey label is missing on some nodes? — Spreading silently breaks for those nodes since they can't be grouped into any domain.<br>
+<strong>16.</strong> Is topologySpreadConstraints a separate API object? — No, it's a field within the Pod template spec, validated and persisted like any other Pod field.<br>
+<strong>17.</strong> Does the Deployment/ReplicaSet controller have any awareness of skew enforcement? — No, it only creates Pods with the inherited constraint; enforcement is entirely the Scheduler's responsibility.<br>
+<strong>18.</strong> What's the purpose of scoping labelSelector tightly? — To ensure only the workload's own Pods count toward the skew calculation, avoiding miscounting unrelated Pods.<br>
+<strong>19.</strong> How would you verify replica distribution across zones after deployment? — <code>kubectl get pods -l app=X -o wide</code> cross-referenced with node zone labels.<br>
+<strong>20.</strong> What cluster-level scheduler config controls default constraints? — <code>defaultConstraints</code> under the PodTopologySpread plugin's pluginConfig.<br>
+<strong>21.</strong> Why is topology spread cheaper for the Scheduler than required pod anti-affinity at scale? — It computes Pod counts per domain more efficiently than inter-pod affinity's live cross-Pod query pattern, giving better guarantees with lower overhead.<br>
+<strong>22.</strong> What's a realistic layered constraint setup for a critical service? — Hard zone-level maxSkew=1 with DoNotSchedule, plus soft hostname-level maxSkew=1 with ScheduleAnyway.<br>
+<strong>23.</strong> Does topology spread guarantee zero Pending pods? — No — DoNotSchedule constraints can produce Pending pods if satisfying maxSkew isn't possible given current capacity.<br>
+<strong>24.</strong> What's the risk of an overly broad labelSelector in a shared namespace? — It may count debug/canary/unrelated Pods, distorting the skew calculation and causing unexpected Pending states.<br>
+<strong>25.</strong> Can topologyKey be a custom label instead of a built-in one? — Yes, any consistently-applied node label can serve as the topology domain.<br>
+<strong>26.</strong> What's the tradeoff of choosing hostname vs zone as topologyKey? — Hostname gives per-node balance (protects against single-node failure); zone gives per-AZ balance (protects against zone outage) — often both are combined.<br>
+<strong>27.</strong> Why might a team prefer topology spread constraints as the org-wide default over anti-affinity? — Lower Scheduler overhead and quantifiable balance guarantees for the common "spread my own replicas" case.<br>
+<strong>28.</strong> What's the impact of setting maxSkew very high (e.g. 10)? — It effectively allows almost any imbalance, making the constraint nearly meaningless for availability purposes.<br>
+<strong>29.</strong> Does a ScheduleAnyway constraint ever block a Pod from scheduling? — No, by definition it only affects scoring/preference, never eligibility.<br>
+<strong>30.</strong> What's the first thing to check if spreading "isn't working" despite a correct constraint? — Whether node topology labels are actually present and correct on all candidate nodes.<br>
+<strong>31.</strong> How does topology spread interact with resource requests during Filter? — Both are independent Filter-phase checks — a node must satisfy skew constraints and have sufficient allocatable resources.<br>
+<strong>32.</strong> What's a common production pattern combining node-level and zone-level constraints? — Hard zone spreading for availability plus soft node-level spreading for even finer-grained balance within a zone.<br>
+<strong>33.</strong> Why is topology spread described as "quantifiable" compared to anti-affinity? — Because maxSkew gives a precise numeric bound on imbalance, rather than anti-affinity's binary allow/forbid co-location.<br>
+<strong>34.</strong> Does topology spread rebalance a cluster after a node is removed? — No, only new/rescheduled Pods are placed under the constraint; existing surviving Pods aren't moved.<br>
+<strong>35.</strong> What's the danger of DoNotSchedule everywhere in a cluster with uneven zone capacity? — Legitimate capacity shortages in one zone turn into scheduling failures instead of graceful imbalance.<br>
+<strong>36.</strong> How do you inspect the constraint currently applied to a running Deployment? — <code>kubectl get deploy &lt;name&gt; -o jsonpath='{.spec.template.spec.topologySpreadConstraints}'</code>.<br>
+<strong>37.</strong> What's the purpose of the cluster-level defaultConstraints setting? — To apply a baseline zone/host spread automatically to Pods that specify no explicit constraint of their own.<br>
+<strong>38.</strong> Why is topology spread considered the "modern replacement" for most anti-affinity use cases? — Because a single Deployment's own even-distribution need maps directly onto maxSkew, with better guarantees than an equivalent anti-affinity rule.<br>
+<strong>39.</strong> What happens to skew calculation if labelSelector matches Pods from multiple unrelated Deployments? — It inflates the perceived count per domain, potentially causing incorrect scheduling decisions for the intended workload.<br>
+<strong>40.</strong> Can you set different maxSkew values for different topologyKeys in the same Pod spec? — Yes, topologySpreadConstraints is a list, each entry independently configured.<br>
+<strong>41.</strong> What's the interview-ready explanation of why maxSkew=0 is often a mistake? — It requires perfectly equal counts across all domains regardless of actual capacity, producing unnecessary Pending pods in uneven clusters.<br>
+<strong>42.</strong> How does the PodTopologySpread plugin's Score phase behave for ScheduleAnyway constraints? — It favors domains with fewer matching Pods, nudging toward balance without enforcing it strictly.<br>
+<strong>43.</strong> What's a realistic failure symptom of missing node zone labels? — Uneven distribution despite a correctly configured maxSkew constraint, with no scheduling error raised.<br>
+<strong>44.</strong> Why is topology spread often preferred at scale over required pod anti-affinity? — Lower per-scheduling-decision cost and native support for balance across more replicas than domains.<br>
+<strong>45.</strong> Does topology spread require the CNI to participate? — No, it's purely a Scheduler placement mechanism, unrelated to networking.<br>
+<strong>46.</strong> What's the first debugging step for "some replicas are Pending but others scheduled fine"? — Check Events for a skew-violation FailedScheduling message and compare current per-zone/per-node Pod counts.<br>
+<strong>47.</strong> How would you express "spread evenly across zones but never require it" in one constraint? — <code>whenUnsatisfiable: ScheduleAnyway</code> with an appropriate maxSkew and topologyKey.<br>
+<strong>48.</strong> What's the relationship between topology spread constraints and PodDisruptionBudgets? — They're independent mechanisms — spread controls placement, PDB controls voluntary disruption bounds; both often combined for full availability guarantees.<br>
+<strong>49.</strong> Why do interviewers often ask "when would you NOT use topology spread constraints"? — To test whether you understand its limits — specifically that it can't express cross-workload exclusion, which anti-affinity still handles.<br>
+<strong>50.</strong> What's the one-line summary distinguishing all three placement tools for an interview? — Anti-affinity = binary repel from other Pods; taints/tolerations = node-side opt-in repulsion; topology spread constraints = quantifiable, self-contained even distribution of one workload's own replicas.
+</div></details>
+
+<footer class="course-footer">Next up: Topic 36 — Resource Management: requests, limits, QoS classes, and quotas.</footer>
+
+<script>
+  mermaid.initialize({ startOnLoad: true, theme: 'dark' });
+</script>
+
+</body>
+</html>

@@ -1,0 +1,266 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Topic 22: Ingress — Kubernetes Expert Course</title>
+<link rel="stylesheet" href="styles.css">
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+</head>
+<body>
+
+<header class="course-header">
+  <div class="kicker">Topic 22 of 70</div>
+  <h1>Ingress</h1>
+  <div class="subtitle">L7 HTTP(S) routing into the cluster — host/path rules, TLS termination, and the Controller that actually implements them.</div>
+</header>
+
+<nav class="topic-nav">
+  <a href="21-networking.html">&larr; Networking</a>
+  <a href="index.html">Course Index</a>
+  <a href="23-storage.html">Storage &rarr;</a>
+</nav>
+
+<h2 id="explanation">Explanation</h2>
+<p>A <code>Service</code> of type <code>ClusterIP</code> or <code>NodePort</code> gives you L4 (TCP/UDP) access, but it has no idea about HTTP hostnames, URL paths, or TLS certificates. Once you have more than a handful of HTTP services, exposing each one via its own <code>LoadBalancer</code> Service becomes expensive and unmanageable — every Service gets its own cloud load balancer, its own IP, its own cost line item. <strong>Ingress</strong> solves this by giving you a single entry point that fans out to many backend Services based on HTTP-level rules: host, path, and headers.</p>
+<p>Kubernetes deliberately splits this into two objects. The <code>Ingress</code> resource itself is just a declarative set of routing rules — "requests for <code>shop.example.com/api</code> go to the <code>api-svc</code> Service on port 80." It is inert on its own. The actual work — running a reverse proxy, watching Ingress objects, reloading config, terminating TLS — is done by an <strong>Ingress Controller</strong>, a separate workload you deploy (NGINX Ingress Controller, Traefik, HAProxy, cloud-provider ALB/GCLB controllers, Contour, Istio Gateway, etc.). Kubernetes ships the API shape but not the implementation, which is why "installing Ingress" always means installing a controller first.</p>
+<p><code>IngressClass</code> is the glue between the two. When multiple controllers run in the same cluster (common during a migration, or when different teams need different proxies), <code>ingressClassName</code> on the Ingress object tells Kubernetes which controller should honor that particular Ingress. Without it, controllers either process everything (if they claim to be default) or nothing.</p>
+<p>TLS termination is one of Ingress's most valuable jobs: the Ingress spec references a <code>Secret</code> of type <code>kubernetes.io/tls</code> containing a certificate and key, and the controller terminates HTTPS at the edge so your backend Pods can stay plain HTTP. Combined with cert-manager, this becomes fully automated (Let's Encrypt certificates requested, renewed, and mounted without human involvement).</p>
+<p>In production, Ingress is the boundary where you also enforce things that don't belong inside application code: rate limiting, WAF rules, canary/traffic-splitting via annotations, and centralized access logging. Because it sits at the edge, a misconfigured or overloaded Ingress Controller is a single point of failure for every HTTP service behind it — which is why controllers are run as a Deployment with multiple replicas and their own resource requests/limits, monitoring, and often a dedicated node pool.</p>
+
+<h2 id="internal-working">Internal Working / Interactions</h2>
+<ul>
+<li><strong>API Server / etcd</strong> — the Ingress object is stored like any other resource; the Ingress Controller runs a watch/list against the API Server for Ingress, Service, Endpoints/EndpointSlice, and Secret objects.</li>
+<li><strong>Ingress Controller</strong> — reconciles Ingress specs into live proxy configuration (e.g. NGINX config + reload, or Envoy xDS updates with no reload needed).</li>
+<li><strong>kube-proxy / Service</strong> — the controller ultimately forwards traffic to a backend Service's ClusterIP (or directly to Pod IPs via EndpointSlice, bypassing kube-proxy, depending on the controller).</li>
+<li><strong>cert-manager (optional)</strong> — watches Ingress annotations/Certificate objects and populates the TLS Secret the Ingress references.</li>
+<li><strong>External LoadBalancer / cloud controller manager</strong> — typically the Ingress Controller itself is exposed via one <code>LoadBalancer</code> Service, so only one cloud LB is provisioned for the whole cluster regardless of how many Ingress objects exist.</li>
+</ul>
+
+<h2 id="architecture-diagram">Architecture Diagram</h2>
+<pre class="mermaid">
+flowchart LR
+  Client([Client Browser]) -->|HTTPS shop.example.com| LB[Cloud Load Balancer]
+  LB --> IC[Ingress Controller Pods]
+  subgraph Cluster
+    IC -->|watches| API[API Server]
+    API -->|Ingress, Service, Secret objects| IC
+    IC -->|"/api → api-svc"| SvcA[Service: api-svc]
+    IC -->|"/web → web-svc"| SvcB[Service: web-svc]
+    SvcA --> PodA1[Pod]
+    SvcA --> PodA2[Pod]
+    SvcB --> PodB1[Pod]
+    TLSSecret[(TLS Secret)] --> IC
+  end
+</pre>
+
+<pre class="mermaid">
+sequenceDiagram
+  participant U as User
+  participant LB as Cloud LB
+  participant N as Ingress Controller (NGINX)
+  participant S as Service api-svc
+  participant P as Pod
+  U->>LB: GET https://shop.example.com/api/orders
+  LB->>N: forward TCP 443
+  N->>N: terminate TLS using shop-tls Secret
+  N->>N: match host+path rule -> api-svc
+  N->>S: HTTP request (ClusterIP or direct Pod IP)
+  S->>P: load-balanced to healthy Pod
+  P-->>U: HTTP response (via chain)
+</pre>
+
+<h2 id="code-example">Code Example</h2>
+<pre><code># IngressClass — declares which controller implements it and whether it's the cluster default
+apiVersion: networking.k8s.io/v1
+kind: IngressClass
+metadata:
+  name: nginx
+  annotations:
+    ingressclass.kubernetes.io/is-default-class: "true"   # used when Ingress omits ingressClassName
+spec:
+  controller: k8s.io/ingress-nginx                        # must match the controller's own identifier
+
+---
+# Ingress — host/path routing + TLS termination
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: shop-ingress
+  namespace: shop
+  annotations:
+    nginx.ingress.controller/rewrite-target: /             # controller-specific behavior tweak
+    cert-manager.io/cluster-issuer: letsencrypt-prod        # cert-manager auto-requests the TLS cert
+spec:
+  ingressClassName: nginx                                  # binds this Ingress to the nginx controller
+  tls:
+  - hosts:
+    - shop.example.com
+    secretName: shop-tls                                    # Secret (type kubernetes.io/tls) holding cert+key
+  rules:
+  - host: shop.example.com                                  # only matches requests for this Host header
+    http:
+      paths:
+      - path: /api                                          # path-based routing
+        pathType: Prefix
+        backend:
+          service:
+            name: api-svc
+            port:
+              number: 80
+      - path: /                                             # catch-all -> frontend
+        pathType: Prefix
+        backend:
+          service:
+            name: web-svc
+            port:
+              number: 80
+</code></pre>
+
+<h2 id="kubectl-commands">kubectl Commands</h2>
+<pre><code>kubectl get ingress -A                        # list all Ingress objects across namespaces
+kubectl describe ingress shop-ingress -n shop # see rules, TLS, and backend resolution events
+kubectl get ingressclass                      # list registered Ingress controllers/classes
+kubectl get svc -n ingress-nginx              # find the controller's LoadBalancer Service & external IP
+kubectl logs -n ingress-nginx deploy/ingress-nginx-controller  # controller reconciliation/reload logs
+kubectl get secret shop-tls -n shop -o yaml   # inspect the TLS secret referenced by the Ingress
+kubectl get events -n shop --field-selector involvedObject.kind=Ingress  # sync/admission events
+</code></pre>
+
+<h2 id="best-practices">Best Practices &amp; Common Pitfalls</h2>
+<div class="grid-2">
+<div class="callout good">
+<strong>Do</strong>
+<ul>
+<li>Always set <code>ingressClassName</code> explicitly rather than relying on a "default" class.</li>
+<li>Automate certificates with cert-manager instead of hand-rotating TLS secrets.</li>
+<li>Run the Ingress Controller with multiple replicas and PodDisruptionBudgets.</li>
+<li>Use path <code>pathType: Prefix</code>/<code>Exact</code> deliberately — don't leave it ambiguous.</li>
+</ul>
+</div>
+<div class="callout warn">
+<strong>Pitfalls</strong>
+<ul>
+<li>Forgetting the Ingress Controller is a separate install — the Ingress object alone does nothing.</li>
+<li>Overloading one Ingress Controller for every namespace with no resource limits, causing a shared outage.</li>
+<li>Annotation drift: controller-specific annotations (NGINX vs ALB vs Traefik) are not portable.</li>
+<li>Mismatched <code>host</code> rules silently falling through to a default backend (404s that look like bugs).</li>
+</ul>
+</div>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="interview-questions">50 Interview Questions</h2>
+
+<details class="qa"><summary>1. Why does Kubernetes split Ingress into an Ingress object and a separate Ingress Controller?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Kubernetes ships only the API shape (routing rules); the actual reverse-proxy implementation is left to a pluggable controller you install separately.
+<br><strong>Detailed explanation:</strong> The <code>Ingress</code> resource is inert declarative YAML — host/path rules and a TLS secret reference. Nothing watches or acts on it until a controller (NGINX, Traefik, ALB, Contour, Istio Gateway, etc.) is deployed to reconcile it into live proxy config.
+<br><strong>Production example:</strong> A cluster with no Ingress Controller installed will show Ingress objects as <code>Pending</code> forever with no external IP — the object alone does nothing.
+<br><strong>Common mistake:</strong> Assuming applying an Ingress YAML is sufficient without first installing a controller.</div></details>
+
+<details class="qa"><summary>2. What is the purpose of IngressClass and ingressClassName?</summary>
+<div class="qa-body"><strong>Short answer:</strong> IngressClass tells Kubernetes which controller should implement a given Ingress when multiple controllers run in the same cluster.
+<br><strong>Detailed explanation:</strong> Each <code>IngressClass</code> maps to a controller identifier (e.g. <code>k8s.io/ingress-nginx</code>). Setting <code>ingressClassName</code> on an Ingress binds it to exactly one controller; omitting it relies on whichever IngressClass is marked default.
+<br><strong>Production example:</strong> During a migration from NGINX to a cloud ALB controller, both run side by side and <code>ingressClassName</code> decides which Ingress objects each one processes.
+<br><strong>Common mistake:</strong> Leaving <code>ingressClassName</code> unset and assuming a specific controller will pick it up — behavior depends entirely on which class is marked default.</div></details>
+
+<details class="qa"><summary>3. How does TLS termination work with Ingress?</summary>
+<div class="qa-body"><strong>Short answer:</strong> The Ingress spec's <code>tls</code> block references a Secret of type <code>kubernetes.io/tls</code>, and the controller terminates HTTPS at the edge using that cert/key.
+<br><strong>Detailed explanation:</strong> Backend Pods can remain plain HTTP since the controller handles the TLS handshake itself, decrypting traffic before proxying it internally.
+<br><strong>Production example:</strong> Combining this with cert-manager automates requesting and renewing Let's Encrypt certificates without any human touching the Secret.
+<br><strong>Common mistake:</strong> Forgetting the referenced Secret must exist in the same namespace as the Ingress, or hand-rotating certs and letting them silently expire.</div></details>
+
+<details class="qa"><summary>4. Why is one misbehaving Ingress Controller a single point of failure for the whole cluster's HTTP traffic?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Every Ingress typically routes through the same small set of controller Pods, so overload or crash there affects every HTTP service behind it.
+<br><strong>Detailed explanation:</strong> Because the controller is exposed via one shared <code>LoadBalancer</code> Service, all inbound HTTP traffic funnels through it — there's no per-Ingress isolation unless you run multiple controller instances/classes.
+<br><strong>Production example:</strong> A traffic spike to one heavily-used Ingress can exhaust the controller's resources and degrade completely unrelated services behind the same controller.
+<br><strong>Common mistake:</strong> Running a single controller replica with no resource requests/limits or PodDisruptionBudget.</div></details>
+
+<details class="qa"><summary>5. How does traffic actually reach a Pod after passing through the Ingress Controller?</summary>
+<div class="qa-body"><strong>Short answer:</strong> The controller matches the request's host/path against Ingress rules, then forwards it to the backend Service's ClusterIP or directly to Pod IPs via EndpointSlice.
+<br><strong>Detailed explanation:</strong> Depending on the controller, it may go through kube-proxy (via ClusterIP) or bypass it entirely by reading EndpointSlice objects and load-balancing directly to Pod IPs for lower latency.
+<br><strong>Production example:</strong> NGINX Ingress Controller by default proxies to Pod IPs directly rather than routing through the Service's ClusterIP, for better load distribution.
+<br><strong>Common mistake:</strong> Assuming all Ingress Controllers route the same way — behavior varies by implementation.</div></details>
+
+<details class="qa"><summary>6. What happens when multiple Ingress objects define conflicting rules for the same host and path?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Behavior is controller-specific and often ambiguous — Kubernetes' Ingress spec doesn't define strict conflict-resolution semantics.
+<br><strong>Detailed explanation:</strong> Most controllers merge rules across all Ingress objects they watch; conflicting paths can result in unpredictable precedence (e.g. by object creation time or alphabetical Ingress name) rather than a clean error.
+<br><strong>Production example:</strong> Two teams both defining <code>shop.example.com/api</code> in separate namespaces can cause routing that depends on the controller's internal tie-breaking, not intent.
+<br><strong>Common mistake:</strong> Assuming Kubernetes validates and prevents host/path overlap across Ingress objects — it generally doesn't.</div></details>
+
+<details class="qa"><summary>7. Why do controller-specific annotations (like NGINX rewrite-target) create portability problems?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Annotations are the escape hatch for behavior the core Ingress spec doesn't standardize, so they're tied to one controller's implementation.
+<br><strong>Detailed explanation:</strong> Features like rewrite rules, rate limiting, and canary weighting aren't part of the portable Ingress API — each controller invents its own annotation namespace for them.
+<br><strong>Production example:</strong> Migrating from NGINX Ingress to an ALB Ingress Controller requires rewriting every <code>nginx.ingress.kubernetes.io/*</code> annotation to its ALB equivalent, or losing that behavior.
+<br><strong>Common mistake:</strong> Writing critical routing/security behavior purely via annotations without documenting the controller dependency.</div></details>
+
+<details class="qa"><summary>8. How does cert-manager integrate with the Ingress TLS flow?</summary>
+<div class="qa-body"><strong>Short answer:</strong> cert-manager watches Ingress annotations (or Certificate objects) and populates the TLS Secret the Ingress references, automating issuance and renewal.
+<br><strong>Detailed explanation:</strong> An annotation like <code>cert-manager.io/cluster-issuer: letsencrypt-prod</code> triggers cert-manager to run the ACME challenge and write the resulting cert/key into the named Secret before the controller needs it.
+<br><strong>Production example:</strong> A new Ingress for <code>shop.example.com</code> gets a valid Let's Encrypt cert within minutes with zero manual cert handling.
+<br><strong>Common mistake:</strong> Creating the TLS Secret manually and cert-manager expecting to own/manage it, causing conflicting updates or renewal failures.</div></details>
+
+<details class="qa"><summary>9. Why does a mismatched host rule silently fall through to a default backend instead of erroring?</summary>
+<div class="qa-body"><strong>Short answer:</strong> If no Ingress rule matches the request's Host header, the controller falls back to its configured default backend (often a 404 page), not an explicit error.
+<br><strong>Detailed explanation:</strong> This is by design so the controller always has somewhere to send unmatched traffic, but it means typos in <code>host:</code> fields produce confusing generic 404s rather than obvious configuration errors.
+<br><strong>Production example:</strong> A typo like <code>shop.exmaple.com</code> in the Ingress silently routes real traffic for <code>shop.example.com</code> to the default backend instead of the intended Service.
+<br><strong>Common mistake:</strong> Debugging a "the Service isn't working" ticket without first checking <code>kubectl describe ingress</code> for the exact host string.</div></details>
+
+<details class="qa"><summary>10. Why is exposing every HTTP Service via its own LoadBalancer Service considered expensive and unmanageable?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Each LoadBalancer Service typically provisions its own cloud load balancer and IP, multiplying cost and operational overhead per service.
+<br><strong>Detailed explanation:</strong> Ingress consolidates many HTTP services behind a single L7 entry point and a single cloud LB, fanning traffic out internally based on host/path instead of provisioning infrastructure per service.
+<br><strong>Production example:</strong> A cluster running 40 HTTP microservices needs only one Ingress Controller LoadBalancer instead of 40 separate cloud load balancers.
+<br><strong>Common mistake:</strong> Defaulting every new HTTP Service to type <code>LoadBalancer</code> instead of routing it through the shared Ingress.</div></details>
+
+<details class="qa"><summary>11–50. Additional rapid-fire questions</summary>
+<div class="qa-body">
+<strong>11.</strong> What API group does the Ingress resource belong to? — <code>networking.k8s.io/v1</code>.<br>
+<strong>12.</strong> Can an Ingress route to a Service in a different namespace? — No, an Ingress can only reference Services in its own namespace.<br>
+<strong>13.</strong> What's the difference between <code>pathType: Prefix</code> and <code>pathType: Exact</code>? — Prefix matches any path starting with the given segment; Exact requires a literal full match.<br>
+<strong>14.</strong> What does the <code>is-default-class</code> annotation on IngressClass do? — Marks that controller as the fallback for any Ingress that omits <code>ingressClassName</code>.<br>
+<strong>15.</strong> Why does an Ingress Controller need to watch Service and EndpointSlice objects, not just Ingress? — It must resolve backend Service names into actual routable Pod IPs/ports.<br>
+<strong>16.</strong> How would you find the external IP of your Ingress Controller? — <code>kubectl get svc -n ingress-nginx</code> to see its LoadBalancer Service's external IP.<br>
+<strong>17.</strong> What object type does the Ingress's <code>tls.secretName</code> field expect? — A Secret of type <code>kubernetes.io/tls</code> containing <code>tls.crt</code> and <code>tls.key</code>.<br>
+<strong>18.</strong> Can one Ingress object handle multiple hostnames? — Yes, via multiple entries under <code>spec.rules</code>, each with its own <code>host</code>.<br>
+<strong>19.</strong> Why might Ingress reconciliation involve a config reload for NGINX but not for Envoy-based controllers? — NGINX reloads its worker config file on change; Envoy-based controllers (e.g. Contour, Istio) push updates via xDS without a reload.<br>
+<strong>20.</strong> What's a practical reason to run a dedicated node pool for Ingress Controller Pods? — Isolates edge traffic load from application workloads and protects it from noisy-neighbor resource contention.<br>
+<strong>21.</strong> How does canary/traffic-splitting typically get implemented at the Ingress layer? — Via controller-specific annotations that weight traffic between two Ingress objects or backend Services.<br>
+<strong>22.</strong> What happens to in-flight requests when Ingress Controller Pods are rolling-updated? — Depends on graceful shutdown/PreStop hooks and readiness gates; without them, requests can be dropped mid-update.<br>
+<strong>23.</strong> Why is rate limiting usually enforced at the Ingress layer rather than in application code? — Centralizes protection at the single edge entry point instead of duplicating logic across every backend service.<br>
+<strong>24.</strong> What's the risk of a WAF rule configured incorrectly on the Ingress Controller? — It can block legitimate production traffic cluster-wide since it sits in front of every routed Service.<br>
+<strong>25.</strong> How do you check which controller actually implements an Ingress? — <code>kubectl get ingress <name> -o yaml</code> and inspect <code>spec.ingressClassName</code>, then <code>kubectl get ingressclass</code> to see its controller field.<br>
+<strong>26.</strong> Why does Ingress not support raw TCP/UDP routing? — It's an L7 (HTTP-aware) abstraction; non-HTTP protocols need a Service of type LoadBalancer/NodePort or a controller-specific TCP/UDP ConfigMap extension.<br>
+<strong>27.</strong> What's a common cause of 502/504 errors from an Ingress Controller? — Backend Pods not ready, wrong Service port mapping, or backend timeouts exceeding the controller's proxy timeout settings.<br>
+<strong>28.</strong> How can you test Ingress routing without waiting for DNS propagation? — Use <code>curl --resolve host:port:IP</code> or set a local <code>/etc/hosts</code> entry pointing to the controller's external IP.<br>
+<strong>29.</strong> Why might a cloud-provider Ingress Controller (like ALB) not need a separate LoadBalancer Service? — It provisions and manages the cloud load balancer directly via annotations, without an intermediate Kubernetes Service.<br>
+<strong>30.</strong> What's the purpose of centralized access logging at the Ingress layer? — Gives a single place to observe all HTTP traffic entering the cluster instead of instrumenting every service individually.<br>
+<strong>31.</strong> Can Ingress enforce mutual TLS (mTLS) to clients? — Yes, many controllers support client-certificate verification via annotations/configuration at the edge.<br>
+<strong>32.</strong> Why must the Ingress Controller itself have proper resource requests/limits set? — Without them it can be starved or OOM-killed under load, taking down routing for every backend Service.<br>
+<strong>33.</strong> What does <code>kubectl describe ingress</code> show that <code>kubectl get ingress</code> doesn't? — Detailed rule breakdown, backend resolution status, and sync/admission events.<br>
+<strong>34.</strong> Why is it risky to rely on an "is-default-class" IngressClass in a multi-team cluster? — A new Ingress that forgets <code>ingressClassName</code> could silently land on the wrong controller.<br>
+<strong>35.</strong> How does an Ingress interact with NetworkPolicies? — NetworkPolicies still apply to traffic from the controller Pods to backend Pods, so overly strict policies can block legitimate Ingress-routed traffic.<br>
+<strong>36.</strong> What's the operational value of running the Ingress Controller as a Deployment with multiple replicas? — High availability — one replica crashing doesn't take down edge routing entirely.<br>
+<strong>37.</strong> Why would you prefer path-based routing over separate subdomains for microservices? — Fewer DNS records and certificates to manage, and a single Ingress can express the whole routing table.<br>
+<strong>38.</strong> What's a security reason to avoid wildcard TLS certs referenced by many Ingress objects? — A single compromised private key exposes every hostname covered by that wildcard, unlike scoped per-host certs.<br>
+<strong>39.</strong> How would a rolling DNS-based blue/green switch differ from Ingress-based traffic splitting? — DNS switching is coarse and slow to propagate/rollback; Ingress-layer splitting gives instant, fine-grained control without DNS TTL delays.<br>
+<strong>40.</strong> What field would you check first if an Ingress shows no address after creation? — Ingress Controller Pod health and its LoadBalancer Service's <code>status.loadBalancer</code> field.<br>
+<strong>41.</strong> Why does annotation-driven configuration make GitOps auditing of Ingress behavior harder? — Meaningful routing/security behavior lives in opaque annotation strings rather than structured, versioned spec fields.<br>
+<strong>42.</strong> What is the effect of setting an overly aggressive proxy-read-timeout annotation? — Long-running backend requests get killed early, causing spurious client-facing timeouts.<br>
+<strong>43.</strong> Why might two teams' Ingress objects in different namespaces need coordination even though Ingress is namespaced? — They can still collide on the same hostname served by the same shared controller.<br>
+<strong>44.</strong> What's the benefit of the aggregation of TLS termination at Ingress versus per-Pod TLS? — Centralizes certificate management and reduces CPU overhead of TLS handshakes duplicated across every Pod.<br>
+<strong>45.</strong> How do sticky sessions typically get implemented at the Ingress layer? — Via controller-specific cookie-based affinity annotations that pin a client to the same backend Pod.<br>
+<strong>46.</strong> Why is it good practice to keep the Ingress Controller's version in step with the Kubernetes API version? — Newer Ingress API fields/behaviors may require a controller version that understands them, per the compatibility matrix.<br>
+<strong>47.</strong> What's a quick way to confirm an Ingress Controller is actually watching a given Ingress object? — Check the controller's logs/events for a reconciliation entry referencing that Ingress's name and namespace.<br>
+<strong>48.</strong> Why would you choose Contour/Envoy over NGINX Ingress for very high-churn Ingress environments? — Envoy-based xDS updates avoid full config reloads, reducing latency spikes when Ingress rules change frequently.<br>
+<strong>49.</strong> What's the risk of not setting a PodDisruptionBudget on the Ingress Controller Deployment? — A voluntary disruption (node drain, cluster upgrade) could evict all replicas simultaneously, causing an outage.<br>
+<strong>50.</strong> How would you debug an Ingress that routes correctly for HTTP but fails for HTTPS? — Check the TLS Secret exists and is valid, matches the requested host (SAN), and that the controller's TLS listener/annotations are correctly configured.
+</div></details>
+
+<footer class="course-footer">Next: Topic 23 — Storage (how PV, PVC, StorageClass, and CSI fit together).</footer>
+
+<script>
+  mermaid.initialize({ startOnLoad: true, theme: 'dark' });
+</script>
+
+</body>
+</html>

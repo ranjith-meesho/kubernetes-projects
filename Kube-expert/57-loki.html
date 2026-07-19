@@ -1,0 +1,290 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Topic 57: Loki — Kubernetes Expert Course</title>
+<link rel="stylesheet" href="styles.css">
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+</head>
+<body>
+
+<header class="course-header">
+  <div class="kicker">Topic 57 of 70</div>
+  <h1>Loki</h1>
+  <div class="subtitle">A log aggregation system that indexes only labels, not full text, keeping cost and operational complexity dramatically lower than traditional log search.</div>
+</header>
+
+<nav class="topic-nav">
+  <a href="56-fluent-bit.html">&larr; Fluent Bit</a>
+  <a href="index.html">Course Index</a>
+  <a href="58-distributed-tracing.html">Distributed Tracing &rarr;</a>
+</nav>
+
+<h2 id="explanation">Explanation</h2>
+<p>Loki is a horizontally scalable log aggregation system built by Grafana Labs, designed explicitly to be
+"Prometheus, but for logs." Its defining architectural decision is that it does <strong>not</strong> index the full
+text of every log line the way Elasticsearch does. Instead, Loki indexes only a small set of <strong>labels</strong>
+(e.g. <code>namespace</code>, <code>pod</code>, <code>app</code>) — the same kind of low-cardinality label set
+Prometheus uses for metrics — and stores the actual log content compressed, in chunks, unindexed. Queries then
+combine a fast label-based lookup (which chunks to even look at) with a grep-style scan of only the matching chunks.</p>
+
+<p>This trade-off is the whole point: full-text indexing (Elasticsearch's approach) is powerful for arbitrary text
+search but extremely expensive in storage and operational overhead at scale — the index is often larger than the raw
+logs themselves. Loki accepts slightly slower ad-hoc full-text search in exchange for an order-of-magnitude cheaper
+storage footprint and much simpler operations, which is the right trade for the common case: engineers overwhelmingly
+filter logs by <em>which pod/namespace/deployment</em> first, then read/grep within that already-narrow set — exactly
+what Loki is optimized for.</p>
+
+<p>Kubernetes needs Loki (or an equivalent) because, as established in the Logging topic, logs must be shipped off-node
+to survive pod/node churn and be searchable. Loki fits Kubernetes' label-heavy metadata model unusually well: every log
+line arriving from Fluent Bit or Promtail is already tagged with <code>namespace</code>, <code>pod</code>, and custom
+labels pulled straight from Kubernetes object metadata — the exact same labels Prometheus already uses for metrics — so
+a team standardized on label-based Prometheus queries can reuse that mental model immediately for logs via
+<strong>LogQL</strong>, Loki's query language, which looks deliberately like PromQL: a label selector
+(<code>{namespace="checkout", app="payments"}</code>) followed by optional line filters (<code>|= "error"</code>) and
+aggregation functions (<code>rate(...)</code>).</p>
+
+<p>Loki's own agent, <strong>Promtail</strong>, is purpose-built for shipping to Loki (discovering Kubernetes pods,
+reading their log files, attaching labels), though Fluent Bit and the OpenTelemetry Collector can also ship to Loki via
+their respective Loki output plugins — teams often choose whichever agent they've already standardized on for other
+reasons (Fluent Bit's plugin breadth, or OTel's unification with traces/metrics) rather than being locked into
+Promtail specifically.</p>
+
+<p>In the ecosystem, Loki occupies the same slot Prometheus/VictoriaMetrics occupy for metrics: Grafana queries it
+directly as a native datasource, dashboards mix log panels next to metric panels, and derived-field configuration
+(covered in the Grafana topic) lets an engineer click from a log line straight into a corresponding trace in Tempo.</p>
+
+<h2 id="internal-working">Internal Working / Interactions</h2>
+<ul>
+  <li><strong>Distributor</strong> — receives incoming log streams (from Promtail/Fluent Bit/OTel Collector), validates and hands them off to ingesters, sharding by label set hash.</li>
+  <li><strong>Ingester</strong> — batches incoming logs per stream into compressed chunks in memory, periodically flushing them to long-term object storage (S3/GCS/local disk).</li>
+  <li><strong>Index</strong> — a much smaller structure than the logs themselves, mapping label sets to chunk locations (stored in a key-value store or, in newer versions, embedded via TSDB-style index files alongside chunks).</li>
+  <li><strong>Querier</strong> — parses LogQL, looks up relevant chunks via the index, and scans only those chunks for the actual line filter, merging results across ingesters/storage.</li>
+  <li><strong>Promtail / Fluent Bit / OTel Collector</strong> — agents that discover Kubernetes pods, tail their logs, attach labels, and push to Loki's distributor via HTTP.</li>
+</ul>
+
+<h2 id="architecture-diagram">Architecture Diagram</h2>
+<pre class="mermaid">
+flowchart TB
+    subgraph Agents["Log Agents (per node)"]
+      PT["Promtail / Fluent Bit"]
+    end
+
+    PT -->|push, labeled| DIST["Distributor<br/>(validates, shards by labels)"]
+    DIST --> ING["Ingester<br/>(batches into compressed chunks)"]
+    ING -->|flush| OBJ[("Object Storage<br/>S3 / GCS / disk")]
+    ING --> IDX[("Index<br/>label set -> chunk location")]
+
+    GF["Grafana<br/>(LogQL queries)"] --> QR["Querier"]
+    QR --> IDX
+    QR --> OBJ
+</pre>
+
+<h2 id="code-example">Code Example</h2>
+<pre><code># Loki config (single-binary / monolithic mode) — simplest production-ready deployment,
+# storing chunks and index locally or in object storage.
+auth_enabled: false                      # disable multi-tenant auth for a single-team cluster
+
+server:
+  http_listen_port: 3100
+
+ingester:
+  chunk_idle_period: 5m                  # flush a stream's chunk after 5m of inactivity
+  chunk_retain_period: 30s
+  lifecycler:
+    ring:
+      kvstore: { store: inmemory }       # fine for single-binary mode; use consul/etcd for HA clusters
+
+schema_config:
+  configs:
+    - from: 2024-01-01
+      store: tsdb                        # modern index type: index embedded alongside chunks
+      object_store: filesystem           # swap for s3/gcs in production for durability + scale
+      schema: v13
+      index:
+        prefix: index_
+        period: 24h
+
+storage_config:
+  tsdb_shipper:
+    active_index_directory: /loki/index
+    cache_location: /loki/index_cache
+  filesystem:
+    directory: /loki/chunks
+
+limits_config:
+  retention_period: 720h                 # 30 days; enforce via the compactor below
+  ingestion_rate_mb: 16                   # per-tenant ingestion cap, protects Loki from a noisy source
+
+compactor:
+  retention_enabled: true                 # actually deletes chunks past retention_period
+  delete_request_store: filesystem
+---
+# Promtail scrape config — discovers Kubernetes pods and ships their logs to Loki, labeling
+# each stream with namespace/pod/container, the same labels used in LogQL queries.
+scrape_configs:
+  - job_name: kubernetes-pods
+    kubernetes_sd_configs:
+      - role: pod                        # same SD mechanism Prometheus uses
+    pipeline_stages:
+      - cri: {}                          # parse containerd's CRI log format
+    relabel_configs:
+      - source_labels: [__meta_kubernetes_namespace]
+        target_label: namespace
+      - source_labels: [__meta_kubernetes_pod_name]
+        target_label: pod
+      - source_labels: [__meta_kubernetes_pod_container_name]
+        target_label: container
+</code></pre>
+
+<h2 id="kubectl-cli-commands">kubectl / CLI Commands</h2>
+<pre><code>kubectl get pods -n logging -l app=loki                       # check Loki components are Running
+kubectl port-forward -n logging svc/loki 3100:3100             # query Loki API locally
+curl -G -s "http://localhost:3100/loki/api/v1/query" \
+  --data-urlencode 'query={namespace="checkout"} |= "error"'   # ad-hoc LogQL query via HTTP API
+kubectl logs -n logging deploy/promtail --tail=50               # check log-shipping agent for push errors
+kubectl exec -n logging loki-0 -- du -sh /loki/chunks           # inspect chunk storage usage
+kubectl get pvc -n logging -l app=loki                          # check storage volumes if using persistent disk
+kubectl logs -n logging deploy/loki --tail=100 | grep -i compactor   # verify retention/compaction is running
+</code></pre>
+
+<h2 id="best-practices">Best Practices &amp; Common Pitfalls</h2>
+<div class="grid-2">
+<div>
+<h4>Best Practices</h4>
+<ul>
+  <li>Keep label cardinality low and deliberate — labels should be things you filter by (namespace, app), not high-cardinality fields like request IDs.</li>
+  <li>Use object storage (S3/GCS) for chunks in production rather than local disk, for durability and easy scaling.</li>
+  <li>Enable the compactor with a defined retention period so old chunks are actually deleted, not just aged out logically.</li>
+  <li>Standardize label names across Promtail/Fluent Bit configs so LogQL queries are consistent cluster-wide.</li>
+  <li>Use line filters (<code>|=</code>, <code>!=</code>) generously — they're cheap because they run only on already-narrowed chunks.</li>
+</ul>
+</div>
+<div>
+<h4>Pitfalls</h4>
+<ul>
+  <li>Putting high-cardinality fields (user ID, request ID, trace ID) into labels instead of the log line — this defeats Loki's entire cost model and can crash the index.</li>
+  <li>Expecting Elasticsearch-grade arbitrary full-text search performance — Loki trades that off deliberately for cost.</li>
+  <li>Running ingesters without a durable ring store (etcd/consul) in multi-replica production setups, causing chunk loss on restart.</li>
+  <li>Not setting <code>ingestion_rate_mb</code> limits, letting one noisy namespace starve ingestion for everyone else.</li>
+</ul>
+</div>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="interview-questions">50 Interview Questions</h2>
+
+<details class="qa"><summary>1. What is Loki's defining architectural decision compared to Elasticsearch?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Loki does not index the full text of every log line; it only indexes labels.
+<br><strong>Detail:</strong> Log content is stored compressed in chunks, unindexed, while only a small low-cardinality label set (namespace, pod, app) is indexed for lookup.
+<br><strong>Production example:</strong> Querying <code>{namespace="checkout"}</code> is a fast label lookup, followed by a scan of only the matching chunks.
+<br><strong>Common mistake:</strong> Expecting Loki to support arbitrary full-text search as fast as Elasticsearch — it deliberately trades that off for cost.</div></details>
+
+<details class="qa"><summary>2. Why is Loki described as "Prometheus, but for logs"?</summary>
+<div class="qa-body"><strong>Short answer:</strong> It reuses the same low-cardinality label model Prometheus uses for metrics, applied to logs instead.
+<br><strong>Detail:</strong> Teams already using label-based PromQL queries can reuse that mental model immediately via LogQL, Loki's PromQL-like query language.
+<br><strong>Production example:</strong> The same <code>namespace</code>/<code>app</code> labels used in Prometheus alerts are reused directly in LogQL queries against Loki.
+<br><strong>Common mistake:</strong> Treating Loki's label design as arbitrary rather than intentionally mirroring Prometheus's cardinality discipline.</div></details>
+
+<details class="qa"><summary>3. What is the core cost/performance trade-off Loki makes versus full-text indexing?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Slightly slower ad-hoc full-text search in exchange for dramatically cheaper storage and simpler operations.
+<br><strong>Detail:</strong> Full-text indexes (like Elasticsearch's) are often larger than the raw logs themselves; Loki avoids that entirely by not indexing content.
+<br><strong>Production example:</strong> A team filtering logs by pod/namespace first, then grepping within that narrow set, sees no practical downside from Loki's approach.
+<br><strong>Common mistake:</strong> Choosing Loki for a workload that primarily needs arbitrary cross-cluster full-text search without label narrowing.</div></details>
+
+<details class="qa"><summary>4. What is LogQL and how does it structure a query?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Loki's PromQL-like query language: a label selector followed by optional line filters and aggregation functions.
+<br><strong>Detail:</strong> A query like <code>{namespace="checkout", app="payments"} |= "error"</code> first narrows by labels, then filters lines, optionally wrapped in functions like <code>rate(...)</code>.
+<br><strong>Production example:</strong> Alerting on error rate per service using <code>rate({app="payments"} |= "error" [5m])</code>-style LogQL.
+<br><strong>Common mistake:</strong> Writing a line filter without a sufficiently narrow label selector first, forcing an expensive scan across too many chunks.</div></details>
+
+<details class="qa"><summary>5. What are the four main internal components of Loki, and what does each do?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Distributor, Ingester, Index, and Querier.
+<br><strong>Detail:</strong> Distributor receives and shards incoming streams by label hash; Ingester batches logs into compressed chunks and flushes to object storage; Index maps label sets to chunk locations; Querier parses LogQL, uses the index to find chunks, and scans them.
+<br><strong>Production example:</strong> A push from Promtail hits the distributor, is sharded to an ingester, batched into a chunk, flushed to S3, and later located via the index when a Grafana query runs through the querier.
+<br><strong>Common mistake:</strong> Assuming Loki is a single monolithic process rather than a set of distinct, independently scalable components (even in single-binary mode).</div></details>
+
+<details class="qa"><summary>6. Why is keeping label cardinality low so critical in Loki, unlike in Elasticsearch?</summary>
+<div class="qa-body"><strong>Short answer:</strong> High-cardinality labels defeat Loki's entire cost model and can crash the index.
+<br><strong>Detail:</strong> Labels are meant to be things you filter by (namespace, app) — putting per-request identifiers like user ID or trace ID into labels creates enormous numbers of unique streams, each needing index entries.
+<br><strong>Production example:</strong> Putting <code>request_id</code> as a label instead of leaving it in the log line causes an explosion of unique label sets and index bloat.
+<br><strong>Common mistake:</strong> Adding high-cardinality fields (user ID, request ID, trace ID) as labels instead of keeping them in the unindexed log line — an explicitly called-out pitfall.</div></details>
+
+<details class="qa"><summary>7. What is the role of the compactor, and why must it be explicitly enabled?</summary>
+<div class="qa-body"><strong>Short answer:</strong> The compactor enforces retention by actually deleting chunks past the configured retention period.
+<br><strong>Detail:</strong> Without <code>retention_enabled: true</code> on the compactor, chunks past <code>retention_period</code> are only logically aged out, not physically deleted.
+<br><strong>Production example:</strong> Setting <code>retention_period: 720h</code> (30 days) with the compactor enabled ensures old chunks are actually removed from object storage.
+<br><strong>Common mistake:</strong> Setting a retention_period without enabling the compactor and assuming storage is automatically reclaimed.</div></details>
+
+<details class="qa"><summary>8. Why does the ring store (kvstore) matter for the ingester's lifecycler in production?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Running ingesters without a durable ring store like etcd/consul in multi-replica setups causes chunk loss on restart.
+<br><strong>Detail:</strong> The in-memory kvstore is fine for single-binary mode, but production HA clusters need a durable store so ingester membership/state survives restarts.
+<br><strong>Production example:</strong> A 3-replica ingester deployment backed by etcd for the ring avoids losing in-flight chunk data when one ingester restarts.
+<br><strong>Common mistake:</strong> Leaving <code>kvstore: { store: inmemory }</code> in a multi-replica production deployment — an explicit pitfall in the file.</div></details>
+
+<details class="qa"><summary>9. What does <code>ingestion_rate_mb</code> protect against?</summary>
+<div class="qa-body"><strong>Short answer:</strong> A per-tenant ingestion cap that protects Loki from a noisy source overwhelming ingestion.
+<br><strong>Detail:</strong> Without this limit, one high-volume or misbehaving namespace/application could starve ingestion capacity for every other tenant/namespace.
+<br><strong>Production example:</strong> A runaway debug-logging deployment is rate-limited rather than degrading log ingestion cluster-wide.
+<br><strong>Common mistake:</strong> Not setting <code>ingestion_rate_mb</code>, letting one noisy namespace starve ingestion for everyone else — an explicit pitfall.</div></details>
+
+<details class="qa"><summary>10. Why does Loki use object storage (S3/GCS) rather than local disk for chunks in production?</summary>
+<div class="qa-body"><strong>Short answer:</strong> For durability and easy scaling, versus the fragility and scaling limits of local disk.
+<br><strong>Detail:</strong> Local <code>filesystem</code> storage is fine for a single-binary demo, but production deployments need chunks to survive node/pod loss and scale independent of any one node's disk.
+<br><strong>Production example:</strong> Swapping <code>object_store: filesystem</code> for S3/GCS in the schema_config to move from a demo setup to a durable production one.
+<br><strong>Common mistake:</strong> Running production Loki on local disk storage, risking data loss if the underlying node/volume fails.</div></details>
+
+<details class="qa"><summary>11–50. Additional rapid-fire questions</summary>
+<div class="qa-body">
+<strong>11.</strong> What company built Loki? — Grafana Labs.<br>
+<strong>12.</strong> What does Loki store logs as internally? — Compressed, unindexed chunks in object storage (or local disk).<br>
+<strong>13.</strong> What is the TSDB schema/index type mentioned in the config, and what's notable about it? — A modern index type where the index is embedded alongside chunks, rather than a separate key-value store.<br>
+<strong>14.</strong> Why does Loki fit Kubernetes' metadata model unusually well? — Every log line already arrives tagged with namespace/pod/custom labels pulled straight from Kubernetes object metadata, matching Loki's label-based design.<br>
+<strong>15.</strong> What agent is purpose-built specifically for shipping to Loki? — Promtail, which discovers Kubernetes pods, reads their log files, and attaches labels.<br>
+<strong>16.</strong> Besides Promtail, what other agents can ship logs to Loki? — Fluent Bit and the OpenTelemetry Collector, via their respective Loki output plugins.<br>
+<strong>17.</strong> Why might a team choose Fluent Bit over Promtail even when targeting Loki? — For Fluent Bit's broader plugin breadth, or for OTel's unification with traces/metrics, rather than being locked into Promtail.<br>
+<strong>18.</strong> What does the distributor do with incoming log streams? — Validates them and shards them to ingesters by label set hash.<br>
+<strong>19.</strong> What does the ingester do before data reaches durable storage? — Batches incoming logs per stream into compressed chunks in memory, then periodically flushes them.<br>
+<strong>20.</strong> What does <code>chunk_idle_period: 5m</code> control? — Flushes a stream's chunk after 5 minutes of inactivity on that stream.<br>
+<strong>21.</strong> What does the querier do when a LogQL query comes in? — Parses the query, looks up relevant chunks via the index, scans only those chunks for line filters, and merges results.<br>
+<strong>22.</strong> How does Grafana interact with Loki? — Grafana queries Loki directly as a native datasource, mixing log panels next to metric panels on dashboards.<br>
+<strong>23.</strong> What lets an engineer click from a Loki log line into a corresponding trace in Tempo? — Derived-field configuration in Grafana.<br>
+<strong>24.</strong> Why are line filters like <code>|=</code> and <code>!=</code> described as "cheap" in LogQL? — Because they run only on chunks already narrowed down by the label selector, not the full log corpus.<br>
+<strong>25.</strong> What relabeling does the Promtail scrape config perform? — Maps <code>__meta_kubernetes_namespace</code>, <code>__meta_kubernetes_pod_name</code>, and <code>__meta_kubernetes_pod_container_name</code> to <code>namespace</code>, <code>pod</code>, and <code>container</code> labels.<br>
+<strong>26.</strong> What does the <code>cri</code> pipeline stage in the Promtail config do? — Parses containerd's CRI log format, the same runtime format Fluent Bit's cri parser handles.<br>
+<strong>27.</strong> What service discovery mechanism does Promtail use, and where does it come from? — <code>kubernetes_sd_configs</code> with <code>role: pod</code> — the same SD mechanism Prometheus uses.<br>
+<strong>28.</strong> Why is <code>auth_enabled: false</code> reasonable for a single-team cluster but not multi-tenant ones? — Multi-tenant Loki needs per-tenant auth/isolation; a single-team cluster has no tenant boundary to enforce.<br>
+<strong>29.</strong> What does <code>chunk_retain_period: 30s</code> do? — Keeps a recently flushed chunk retained briefly in the ingester, likely to serve very recent queries before eviction.<br>
+<strong>30.</strong> Why is "single-binary / monolithic mode" mentioned as the simplest production-ready deployment? — All components (distributor, ingester, querier) run in one process, simplifying operations at the cost of independent scaling.<br>
+<strong>31.</strong> What's the tradeoff of running Loki as monolithic mode versus microservices mode? — Monolithic is simpler to operate but can't scale each component (ingester vs querier) independently under differing load.<br>
+<strong>32.</strong> How would you check if Loki components are running? — <code>kubectl get pods -n logging -l app=loki</code>.<br>
+<strong>33.</strong> How would you run an ad-hoc LogQL query against a local Loki instance? — <code>kubectl port-forward -n logging svc/loki 3100:3100</code> then <code>curl</code> the <code>/loki/api/v1/query</code> endpoint with a URL-encoded LogQL query.<br>
+<strong>34.</strong> How would you check chunk storage usage on disk? — <code>kubectl exec -n logging loki-0 -- du -sh /loki/chunks</code>.<br>
+<strong>35.</strong> How would you verify the compactor is actively enforcing retention? — <code>kubectl logs -n logging deploy/loki --tail=100 | grep -i compactor</code>.<br>
+<strong>36.</strong> How would you troubleshoot a log-shipping agent that isn't pushing to Loki? — <code>kubectl logs -n logging deploy/promtail --tail=50</code> to check for push errors.<br>
+<strong>37.</strong> When would you check PVCs related to Loki? — When Loki uses persistent disk for storage rather than object storage, to check volume health/capacity.<br>
+<strong>38.</strong> What is the practical effect of standardizing label names across Promtail/Fluent Bit configs? — LogQL queries stay consistent cluster-wide instead of fragmenting by which agent shipped a given stream.<br>
+<strong>39.</strong> What happens to Loki's index if you don't control label cardinality? — It can grow enormously and, in the extreme, crash the index, since every unique label combination becomes its own stream/series.<br>
+<strong>40.</strong> Why might using a request ID as a label seem tempting but be wrong? — It seems useful for exact lookup, but it turns every single request into a unique stream, exploding cardinality instead of using a cheap in-line search.<br>
+<strong>41.</strong> How should you search by request ID correctly in Loki instead of labeling it? — Keep request ID in the log line and use a line filter (<code>|= "requestID"</code>) within an already label-narrowed query.<br>
+<strong>42.</strong> What's the operational risk of expecting Elasticsearch-grade full-text search from Loki? — Users may be surprised by slower ad-hoc searches across unindexed content — an explicit pitfall/expectation mismatch.<br>
+<strong>43.</strong> Why does Loki's index need to be much smaller than the logs themselves? — Because it only maps label sets to chunk locations, not indexing log content — this is the core of Loki's cost advantage.<br>
+<strong>44.</strong> What does <code>schema: v13</code> combined with <code>store: tsdb</code> represent? — A specific, versioned schema configuration selecting the modern TSDB-based indexing approach.<br>
+<strong>45.</strong> Why does the schema_config use dated entries (<code>from: 2024-01-01</code>)? — Schema configuration is applied from a given date forward, allowing schema/index format upgrades without rewriting historical data.<br>
+<strong>46.</strong> What's the risk of setting retention_period without object storage durability guarantees? — Retention only controls deletion timing; without durable storage, data can be lost before retention even expires.<br>
+<strong>47.</strong> Why does Loki pair naturally with Prometheus/VictoriaMetrics in a monitoring stack? — Loki occupies the same architectural slot for logs that Prometheus/VictoriaMetrics occupy for metrics, sharing the label-based query model.<br>
+<strong>48.</strong> What would you check first if a LogQL query returns no results despite logs existing? — Whether the label selector matches the actual labels attached by the shipping agent (e.g. namespace/pod naming/casing mismatches).<br>
+<strong>49.</strong> Why is Loki considered operationally simpler than Elasticsearch at scale? — It avoids maintaining a large full-text index; only labels are indexed, and chunks are just compressed blobs in object storage.<br>
+<strong>50.</strong> What's the first thing to check when ingesters are losing data on restart? — Whether the ring store (kvstore) is a durable backend like etcd/consul rather than the in-memory default meant only for single-binary mode.
+</div></details>
+
+
+<footer class="course-footer">Next: Topic 58 — Distributed Tracing, following a single request across microservices.</footer>
+
+<script>
+  mermaid.initialize({ startOnLoad: true, theme: 'dark' });
+</script>
+
+</body>
+</html>

@@ -1,0 +1,319 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Topic 68: AKS — Kubernetes Expert Course</title>
+<link rel="stylesheet" href="styles.css">
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+</head>
+<body>
+
+<header class="course-header">
+  <div class="kicker">Topic 68 of 70</div>
+  <h1>AKS (Azure Kubernetes Service)</h1>
+  <div class="subtitle">Azure's managed Kubernetes: node pools, Azure AD-integrated RBAC, and the Azure CNI vs kubenet networking tradeoff.</div>
+</header>
+
+<nav class="topic-nav">
+  <a href="67-eks.html">&larr; EKS</a>
+  <a href="index.html">Course Index</a>
+  <a href="69-cka-exam-prep.html">CKA Exam Preparation &rarr;</a>
+</nav>
+
+<h2 id="explanation">Explanation</h2>
+<p>AKS is unique among the big three managed offerings in that Azure does not charge for the control plane itself
+(you pay only for node VMs and any add-ons/uptime SLA tier), which changes cost calculus for small clusters. Like
+GKE and EKS, Azure fully manages etcd, the API server, and control-plane upgrades; your operational surface is node
+pools, networking mode, and identity integration.</p>
+
+<p><strong>Node pools</strong> in AKS work similarly to the other providers: a <strong>system node pool</strong> is
+mandatory and runs critical system Pods (CoreDNS, metrics-server, tunnelfront/konnectivity), while one or more
+<strong>user node pools</strong> run your actual application workloads — Azure explicitly recommends never scaling
+the system pool to zero or scheduling arbitrary user workloads onto it, since starving it of resources can take down
+cluster-critical add-ons. User node pools can be scaled independently, mix VM sizes (including GPU-enabled SKUs), use
+Spot VMs for fault-tolerant workloads, and each can have its own taints/labels for workload isolation, exactly like
+node-pool patterns on GKE/EKS.</p>
+
+<p><strong>Azure AD integration</strong> is AKS's identity story at two distinct layers. At the cluster-access layer,
+Azure AD-integrated RBAC lets you authenticate <code>kubectl</code> users against Azure AD identities/groups instead
+of managing a separate certificate or token system, and map Azure AD groups directly to Kubernetes RBAC
+Role/ClusterRole bindings — so offboarding an employee in Azure AD immediately revokes their cluster access. At the
+workload-identity layer, <strong>Azure AD Workload Identity</strong> (the successor to the older pod-identity
+add-on) federates a Kubernetes ServiceAccount with an Azure AD application/managed identity via OIDC, letting a Pod
+exchange its projected service-account token for a short-lived Azure AD token scoped to exactly the resources that
+identity is granted — the same no-static-credentials pattern as IRSA on EKS and Workload Identity on GKE.</p>
+
+<p>Networking is where AKS has the starkest decision point: <strong>kubenet</strong> is the simpler, older option
+where Pods get IPs from a private overlay network that is NAT'd at the node for anything leaving the VNet — cheaper
+on VNet IP consumption, but with real limitations (User-Defined Routes overhead, no native Azure Network Policy
+support for some features, harder to peer/inspect Pod traffic from other VNet resources). <strong>Azure CNI</strong>
+assigns each Pod a real, routable IP directly from the VNet subnet, exactly like the EKS VPC CNI model — Pods are
+natively reachable by other VNet resources without NAT, security tools and Network Security Groups can see real Pod
+IPs, but the VNet subnet must be sized with real per-Pod IP headroom (Azure CNI Overlay, a newer mode, decouples Pod
+IP space from the VNet to solve exactly this exhaustion problem while keeping most Azure CNI benefits). For new
+production clusters, Azure now generally recommends Azure CNI (Overlay or standard) over kubenet, mirroring the
+industry's general move away from NAT-heavy overlay networking.</p>
+
+<p>Practical defaults: keep a small, dedicated system node pool with a taint reserving it for system components; add
+purpose-built user node pools per workload shape; bind Azure AD groups to Kubernetes RBAC rather than distributing
+static kubeconfigs; and default to Azure CNI (Overlay for large clusters worried about VNet IP exhaustion) over
+kubenet for new clusters.</p>
+
+<h2 id="internal-working">Internal Working / Interactions</h2>
+<ul>
+  <li><strong>Control plane:</strong> fully managed by Azure, free of charge on the Free tier (paid Standard/Premium
+  tiers add SLA guarantees and more scale headroom).</li>
+  <li><strong>System vs user node pools:</strong> the system pool runs core add-ons; the scheduler is guided by
+  taints (<code>CriticalAddonsOnly=true:NoSchedule</code>) to keep arbitrary workloads off it.</li>
+  <li><strong>Azure AD-integrated kubectl auth:</strong> <code>kubelogin</code>/<code>az aks get-credentials</code>
+  configures kubeconfig to perform an Azure AD device-code or browser login, exchanging it for a token the API
+  server validates against Azure AD.</li>
+  <li><strong>Azure AD Workload Identity:</strong> AKS's OIDC issuer + a federated identity credential on the Azure
+  AD app let a Pod's projected token be exchanged for an Azure AD access token via MSAL, without any secret material
+  ever stored in the cluster.</li>
+  <li><strong>Azure CNI:</strong> the CNI plugin requests a VNet IP for each Pod from the subnet's IP pool at Pod
+  creation; Azure CNI Overlay instead assigns Pod IPs from a separate, non-VNet-routed range, translated at the
+  node.</li>
+</ul>
+
+<h2 id="architecture-diagram">Architecture Diagram</h2>
+<pre class="mermaid">
+flowchart TB
+  subgraph Azure["Azure-managed control plane"]
+    API[AKS API server]
+    ETCD[(etcd)]
+  end
+  subgraph VNet["Customer VNet"]
+    subgraph SysPool["System Node Pool\n(taint: CriticalAddonsOnly)"]
+      CoreDNS[CoreDNS / metrics-server]
+    end
+    subgraph UserPool["User Node Pool: general"]
+      AppPod[App Pod: 10.1.2.20\nreal VNet IP - Azure CNI]
+    end
+  end
+  AAD[Azure AD]
+  Dev[kubectl user]
+
+  API --- ETCD
+  API -.schedules system pods.-> CoreDNS
+  API -.schedules.-> AppPod
+  Dev -->|az aks get-credentials + AAD login| AAD
+  AAD -->|token mapped to RBAC group| API
+  AppPod -->|federated token exchange| AAD
+  AAD -->|short-lived Azure AD token| AppPod
+</pre>
+
+<h2 id="code-example">Code Example</h2>
+<pre><code>#############################################
+# 1. az CLI - create an AKS cluster with Azure AD RBAC + Azure CNI
+#############################################
+az aks create \
+  --resource-group prod-rg \
+  --name prod-aks \
+  --network-plugin azure \                       # Azure CNI: real VNet IPs per Pod
+  --network-plugin-mode overlay \                # Overlay mode: avoids VNet IP exhaustion at scale
+  --enable-aad \                                  # Azure AD-integrated cluster authentication
+  --enable-azure-rbac \                           # enforce RBAC decisions via Azure, not just in-cluster
+  --node-count 3 \
+  --nodepool-name system \
+  --node-taints CriticalAddonsOnly=true:NoSchedule
+
+# Add a dedicated user node pool for application workloads
+az aks nodepool add \
+  --resource-group prod-rg --cluster-name prod-aks \
+  --name userpool --node-count 3 \
+  --min-count 3 --max-count 10 --enable-cluster-autoscaler \
+  --mode User                                     # explicitly a user pool, not system
+
+---
+# 2. Azure AD Workload Identity binding
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: orders-sa
+  namespace: orders
+  annotations:
+    azure.workload.identity/client-id: "11111111-2222-3333-4444-555555555555"   # Azure AD app client ID
+  labels:
+    azure.workload.identity/use: "true"           # opts the SA into the webhook injecting federated creds
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: orders-worker
+  namespace: orders
+  labels:
+    azure.workload.identity/use: "true"
+spec:
+  serviceAccountName: orders-sa
+  containers:
+    - name: worker
+      image: prodacr.azurecr.io/orders-worker:v1.4
+# Federated credential linking (one-time az command, not YAML):
+# az identity federated-credential create --name orders-fic \
+#   --identity-name orders-identity --resource-group prod-rg \
+#   --issuer <AKS OIDC issuer URL> --subject system:serviceaccount:orders:orders-sa
+</code></pre>
+
+<h2 id="kubectl-cli-commands">kubectl / CLI Commands</h2>
+<pre><code># Fetch kubeconfig with Azure AD auth wired in
+az aks get-credentials --resource-group prod-rg --name prod-aks
+
+# List node pools and their mode (System/User)
+az aks nodepool list --resource-group prod-rg --cluster-name prod-aks -o table
+
+# Confirm Azure AD group -> Kubernetes RBAC binding
+kubectl get rolebindings,clusterrolebindings -A -o wide | grep AAD_GROUP_OBJECT_ID
+
+# Check the AKS OIDC issuer URL (needed for Workload Identity federation)
+az aks show --resource-group prod-rg --name prod-aks --query "oidcIssuerProfile.issuerUrl" -o tsv
+
+# Verify Azure CNI Pod IP allocation per node
+kubectl get pods -o wide -n orders
+
+# Confirm system pool taint is respected (no stray app pods on system pool)
+kubectl get pods -A -o wide --field-selector spec.nodeName=<system-node-name>
+
+# Trigger a node pool upgrade
+az aks nodepool upgrade --resource-group prod-rg --cluster-name prod-aks --name userpool --kubernetes-version 1.29.2
+</code></pre>
+
+<h2 id="best-practices">Best Practices &amp; Common Pitfalls</h2>
+<div class="grid-2">
+  <div class="lab-card">
+    <h4>Best Practices</h4>
+    <ul>
+      <li>Keep a dedicated, tainted system node pool separate from user workloads.</li>
+      <li>Bind Azure AD groups to Kubernetes RBAC instead of distributing static kubeconfigs.</li>
+      <li>Use Azure AD Workload Identity for all Pod-level Azure resource access.</li>
+      <li>Default to Azure CNI (Overlay for large clusters) over kubenet for new production clusters.</li>
+      <li>Use separate user node pools per workload shape (GPU, memory-optimized, spot/batch).</li>
+    </ul>
+  </div>
+  <div class="lab-card">
+    <h4>Common Pitfalls</h4>
+    <ul>
+      <li>Scheduling application workloads onto the system node pool, starving critical add-ons.</li>
+      <li>Choosing plain Azure CNI on a large VNet without Overlay and running out of subnet IPs.</li>
+      <li>Skipping Azure AD RBAC and relying on shared static kubeconfigs for cluster access.</li>
+      <li>Storing Azure credentials as Kubernetes Secrets instead of using Workload Identity federation.</li>
+      <li>Forgetting the system node pool still needs its own min/max autoscaler bounds.</li>
+    </ul>
+  </div>
+</div>
+
+<h2 id="interview-questions">50 Interview Questions</h2>
+
+<details class="qa"><summary>1. Why is AKS's control-plane billing model distinctive among the big three cloud providers?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Azure does not charge for the control plane itself (Free tier) — you pay only for node VMs and any paid uptime-SLA add-ons, unlike EKS's flat per-cluster hourly control-plane fee.
+<br><strong>Detail:</strong> This changes cost calculus specifically for small clusters or many-cluster setups, since running additional clusters doesn't automatically add flat control-plane cost the way it does on EKS.
+<br><strong>Production example:</strong> A team running several small dev/test AKS clusters incurs no extra control-plane charge per cluster, only the underlying node VM cost.
+<br><strong>Common mistake:</strong> Assuming all three major clouds charge for the control plane identically when comparing AKS/EKS/GKE costs.</div></details>
+
+<details class="qa"><summary>2. Why must the system node pool never be scaled to zero or share space with user workloads?</summary>
+<div class="qa-body"><strong>Short answer:</strong> The system node pool runs critical system Pods (CoreDNS, metrics-server, tunnelfront/konnectivity); starving it of resources by scheduling arbitrary workloads there can take down cluster-critical add-ons.
+<br><strong>Detail:</strong> Azure enforces this via the `CriticalAddonsOnly=true:NoSchedule` taint pattern, actively repelling non-system Pods so the system pool's capacity stays reserved for what keeps the cluster itself functioning.
+<br><strong>Production example:</strong> A cluster created with `--node-taints CriticalAddonsOnly=true:NoSchedule` on the system pool ensures application Deployments can never accidentally land there and crowd out CoreDNS.
+<br><strong>Common mistake:</strong> Scheduling application workloads onto the system node pool "since it has spare capacity," starving critical add-ons under load.</div></details>
+
+<details class="qa"><summary>3. What are the two distinct layers of Azure AD integration in AKS?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Cluster-access layer (Azure AD-integrated RBAC for kubectl users/groups) and workload-identity layer (Azure AD Workload Identity for Pod-level Azure resource access) — solving different problems with the same identity provider.
+<br><strong>Detail:</strong> The access layer maps Azure AD groups directly to Kubernetes RBAC bindings so offboarding in Azure AD immediately revokes cluster access; the workload layer federates a ServiceAccount with an Azure AD app/managed identity via OIDC for API calls.
+<br><strong>Production example:</strong> An engineer's Azure AD group membership controls their `kubectl` RBAC permissions, while a completely separate `orders-sa` ServiceAccount federation controls what Azure resources the `orders-worker` Pod can call.
+<br><strong>Common mistake:</strong> Conflating "we use Azure AD for kubectl login" with "our Pods use Workload Identity" — they are two independent integrations that must each be configured.</div></details>
+
+<details class="qa"><summary>4. How does Azure AD Workload Identity let a Pod get an Azure AD token without stored credentials?</summary>
+<div class="qa-body"><strong>Short answer:</strong> It federates a Kubernetes ServiceAccount with an Azure AD application/managed identity via OIDC; a Pod exchanges its projected service-account token for a short-lived Azure AD token scoped to exactly the resources that identity is granted.
+<br><strong>Detail:</strong> This is the successor to the older pod-identity add-on, and mirrors IRSA on EKS and Workload Identity on GKE — the same no-static-credentials pattern implemented via AKS's OIDC issuer and a federated identity credential.
+<br><strong>Production example:</strong> A ServiceAccount labeled `azure.workload.identity/use: "true"` and annotated with a client-id gets a webhook-injected federated credential, with the actual linkage created via `az identity federated-credential create`.
+<br><strong>Common mistake:</strong> Storing Azure credentials as Kubernetes Secrets instead of configuring Workload Identity federation, leaving long-lived credentials sitting in the cluster.</div></details>
+
+<details class="qa"><summary>5. What's the core tradeoff between kubenet and Azure CNI?</summary>
+<div class="qa-body"><strong>Short answer:</strong> kubenet uses a NAT'd overlay network (cheaper on VNet IP consumption but with routing/inspection limitations); Azure CNI assigns each Pod a real, routable VNet IP (natively reachable, but requires real per-Pod IP headroom in the subnet).
+<br><strong>Detail:</strong> kubenet has real limitations — User-Defined Routes overhead, no native Azure Network Policy support for some features, and difficulty peering/inspecting Pod traffic from other VNet resources — which is why Azure now generally recommends Azure CNI for new production clusters.
+<br><strong>Production example:</strong> A cluster needing other VNet resources (a database VM, a security appliance) to see real Pod IPs directly chooses Azure CNI over kubenet.
+<br><strong>Common mistake:</strong> Choosing kubenet by default for "IP savings" without weighing its routing and network-policy limitations against actual production needs.</div></details>
+
+<details class="qa"><summary>6. What problem does Azure CNI Overlay mode solve compared to standard Azure CNI?</summary>
+<div class="qa-body"><strong>Short answer:</strong> It decouples Pod IP space from the VNet (assigning Pod IPs from a separate, non-VNet-routed range) to avoid VNet subnet exhaustion, while keeping most Azure CNI benefits.
+<br><strong>Detail:</strong> Standard Azure CNI consumes a real VNet IP per Pod, which at scale can exhaust even generously sized subnets; Overlay mode keeps the "real reachability" benefits largely intact while removing the direct 1:1 VNet IP consumption per Pod.
+<br><strong>Production example:</strong> `az aks create --network-plugin azure --network-plugin-mode overlay` is used specifically for large clusters worried about VNet IP exhaustion.
+<br><strong>Common mistake:</strong> Choosing standard (non-overlay) Azure CNI for a large-scale cluster and later hitting the same VNet IP exhaustion problem overlay mode was designed to avoid.</div></details>
+
+<details class="qa"><summary>7. Why does Azure recommend binding Azure AD groups to Kubernetes RBAC instead of distributing static kubeconfigs?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Static kubeconfigs persist access independent of employment status; Azure AD group bindings mean offboarding an employee in Azure AD immediately revokes their cluster access.
+<br><strong>Detail:</strong> This ties cluster authorization to a single, centrally managed identity source rather than distributing long-lived credential files that must be manually revoked/rotated per person.
+<br><strong>Production example:</strong> An employee leaving the company has their Azure AD account disabled, which alone (without any Kubernetes-side action) removes their `kubectl` access.
+<br><strong>Common mistake:</strong> Skipping Azure AD RBAC setup and relying on shared static kubeconfig files for cluster access, which don't get revoked when someone leaves.</div></details>
+
+<details class="qa"><summary>8. What's `kubelogin`'s role in AKS's Azure AD authentication flow?</summary>
+<div class="qa-body"><strong>Short answer:</strong> It (alongside `az aks get-credentials`) configures kubeconfig to perform an Azure AD device-code or browser login, exchanging that login for a token the API server validates against Azure AD.
+<br><strong>Detail:</strong> This is the mechanical piece that makes Azure AD-integrated RBAC actually work at the `kubectl` command level — without it, kubeconfig would have no way to obtain an Azure AD-backed token for API server authentication.
+<br><strong>Production example:</strong> A developer running `az aks get-credentials --resource-group prod-rg --name prod-aks` gets a kubeconfig wired to prompt an Azure AD login on first use.
+<br><strong>Common mistake:</strong> Assuming a standard kubeconfig (like on a non-AAD cluster) works unmodified against an AAD-enabled AKS cluster without the AAD-aware auth plugin configured.</div></details>
+
+<details class="qa"><summary>9. Why does the system node pool need its own min/max autoscaler bounds separate from user pools?</summary>
+<div class="qa-body"><strong>Short answer:</strong> The system pool has its own resource needs driven by cluster-critical add-ons, independent of application workload scaling patterns governed by user pool autoscaling.
+<br><strong>Detail:</strong> Forgetting to configure autoscaler bounds specifically on the system pool (assuming user-pool autoscaling "covers everything") can leave system-critical capacity under-provisioned as add-on resource needs grow.
+<br><strong>Production example:</strong> A cluster carefully autoscales its user pool for application load but leaves the system pool fixed at its initial node count, missing added system-pool pressure from newly enabled add-ons.
+<br><strong>Common mistake:</strong> Forgetting the system node pool still needs its own explicit min/max autoscaler bounds, treating it as a "set once and forget" fixed pool.</div></details>
+
+<details class="qa"><summary>10. What are this topic's practical default recommendations for a new production AKS cluster?</summary>
+<div class="qa-body"><strong>Short answer:</strong> A small, dedicated tainted system node pool; purpose-built user node pools per workload shape; Azure AD groups bound to RBAC instead of static kubeconfigs; and Azure CNI (Overlay for large clusters) over kubenet.
+<br><strong>Detail:</strong> These map directly to the topic's core risk areas: starving system add-ons (solved by tainting the system pool), unrevoked access (solved by Azure AD RBAC), and VNet IP exhaustion (solved by CNI Overlay mode).
+<br><strong>Production example:</strong> A new cluster is created with `--enable-aad --enable-azure-rbac --network-plugin azure --network-plugin-mode overlay` and a tainted system pool, plus a separate autoscaling user pool.
+<br><strong>Common mistake:</strong> Treating these as later hardening steps to retrofit, rather than defaults established at cluster creation before workloads onboard.</div></details>
+
+<details class="qa"><summary>11–50. Additional rapid-fire questions</summary>
+<div class="qa-body">
+<strong>11.</strong> Does Azure charge for the AKS control plane on the Free tier? — No — you pay only for node VMs and optional paid-tier SLA add-ons.<br>
+<strong>12.</strong> What system Pods typically run in the mandatory system node pool? — CoreDNS, metrics-server, tunnelfront/konnectivity.<br>
+<strong>13.</strong> What taint keeps arbitrary workloads off the system node pool? — `CriticalAddonsOnly=true:NoSchedule`.<br>
+<strong>14.</strong> Can user node pools use Spot VMs? — Yes, for fault-tolerant workloads.<br>
+<strong>15.</strong> Can user node pools include GPU-enabled SKUs? — Yes.<br>
+<strong>16.</strong> What replaced the older AKS pod-identity add-on? — Azure AD Workload Identity.<br>
+<strong>17.</strong> What federation protocol does Azure AD Workload Identity use? — OIDC.<br>
+<strong>18.</strong> What library does a Pod use to exchange its token for an Azure AD access token? — MSAL.<br>
+<strong>19.</strong> What label opts a ServiceAccount into the Workload Identity webhook? — `azure.workload.identity/use: "true"`.<br>
+<strong>20.</strong> What annotation on a ServiceAccount specifies the Azure AD app's client ID? — `azure.workload.identity/client-id`.<br>
+<strong>21.</strong> What command creates the one-time federated credential linkage? — `az identity federated-credential create`.<br>
+<strong>22.</strong> What's the simpler, older AKS networking option? — kubenet.<br>
+<strong>23.</strong> What's the newer default-recommended networking option? — Azure CNI (standard or Overlay).<br>
+<strong>24.</strong> What flag enables Azure CNI Overlay mode at cluster creation? — `--network-plugin azure --network-plugin-mode overlay`.<br>
+<strong>25.</strong> What flag enables Azure AD-integrated cluster authentication? — `--enable-aad`.<br>
+<strong>26.</strong> What flag enforces RBAC decisions via Azure rather than only in-cluster? — `--enable-azure-rbac`.<br>
+<strong>27.</strong> What command fetches kubeconfig wired for Azure AD auth? — `az aks get-credentials --resource-group <rg> --name <cluster>`.<br>
+<strong>28.</strong> What command lists node pools and their mode (System/User)? — `az aks nodepool list --resource-group <rg> --cluster-name <cluster> -o table`.<br>
+<strong>29.</strong> What command shows the AKS OIDC issuer URL needed for Workload Identity federation? — `az aks show --query "oidcIssuerProfile.issuerUrl"`.<br>
+<strong>30.</strong> What command triggers a node pool version upgrade? — `az aks nodepool upgrade --resource-group <rg> --cluster-name <cluster> --name <pool> --kubernetes-version <version>`.<br>
+<strong>31.</strong> How do you confirm an Azure AD group is mapped to Kubernetes RBAC? — `kubectl get rolebindings,clusterrolebindings -A -o wide | grep <AAD_GROUP_OBJECT_ID>`.<br>
+<strong>32.</strong> How do you confirm no stray app Pods landed on the system pool? — `kubectl get pods -A -o wide --field-selector spec.nodeName=<system-node-name>`.<br>
+<strong>33.</strong> What Kubernetes object type does the system pool taint pair with on workloads that need to run there? — A matching toleration.<br>
+<strong>34.</strong> What's the risk of choosing plain (non-overlay) Azure CNI on a large VNet? — Running out of subnet IPs as Pod count grows, since every Pod consumes a real VNet IP.<br>
+<strong>35.</strong> Is Azure CNI Overlay's Pod IP range routed within the VNet? — No — it's a separate, non-VNet-routed range, translated at the node.<br>
+<strong>36.</strong> What mode flag explicitly marks a node pool as a user pool rather than system? — `--mode User`.<br>
+<strong>37.</strong> What's the purpose of separate user node pools per workload shape? — Workload isolation via independent scaling, machine types, and taints/labels (GPU, memory-optimized, spot/batch).<br>
+<strong>38.</strong> Why is Azure AD Workload Identity described as having "no secret material ever stored in the cluster"? — Because the federated credential exchange happens via OIDC token federation, not a stored Azure credential/Secret.<br>
+<strong>39.</strong> What's a symptom of a missing or misconfigured federated identity credential? — The Pod's calls to Azure APIs fail with authentication/permission errors despite the ServiceAccount annotation looking correct.<br>
+<strong>40.</strong> Why is the system pool described as needing to stay small and dedicated? — To minimize cost/footprint while reserving guaranteed capacity purely for cluster-critical add-ons, not application workloads.<br>
+<strong>41.</strong> What's the general industry trend AKS's CNI recommendation reflects? — A move away from NAT-heavy overlay networking toward real, routable Pod IPs (mirrored by EKS's VPC CNI and GKE's alias IP model).<br>
+<strong>42.</strong> Why does AKS's lack of control-plane charge matter more for small clusters specifically? — The relative cost savings vs a flat per-cluster fee (as on EKS) is proportionally larger when node cost itself is already small.<br>
+<strong>43.</strong> What's the AKS equivalent concept to EKS's IRSA and GKE's Workload Identity? — Azure AD Workload Identity.<br>
+<strong>44.</strong> Why is checking the OIDC issuer URL part of setting up Workload Identity? — The federated credential's `--issuer` parameter must match the cluster's actual OIDC issuer for the trust relationship to validate.<br>
+<strong>45.</strong> What happens if application workloads are scheduled onto an untainted system pool under load? — Critical add-ons (CoreDNS, metrics-server) can be starved of resources, potentially breaking cluster-wide functionality.<br>
+<strong>46.</strong> Why might a team keep both kubenet and Azure CNI clusters in the same fleet? — Legacy clusters may still run kubenet, while new production clusters default to Azure CNI (Overlay) per current guidance.<br>
+<strong>47.</strong> What's the practical benefit of mapping Azure AD groups (not individual users) to RBAC bindings? — Group membership changes automatically propagate access changes without per-user Kubernetes RBAC edits.<br>
+<strong>48.</strong> What's a reasonable interview answer for "why not just use kubenet everywhere for cost savings"? — kubenet's NAT/UDR overhead and limited Network Policy/inspection support outweigh its IP savings for most production networking needs today.<br>
+<strong>49.</strong> Why is per-Pod real VNet IP reachability valuable operationally, despite the subnet sizing cost? — It lets security tools, NSGs, and other VNet resources interact with Pods directly without NAT translation complicating visibility or connectivity.<br>
+<strong>50.</strong> What's the single biggest operational decision point this topic emphasizes for new AKS clusters? — Networking mode (kubenet vs Azure CNI/Overlay) plus system/user node pool separation — together they shape scalability, security visibility, and cluster stability more than any other early decision.
+</div></details>
+
+<footer class="course-footer">Continue to Topic 69: CKA Exam Preparation.</footer>
+
+<script>
+  mermaid.initialize({ startOnLoad: true, theme: 'dark' });
+</script>
+
+</body>
+</html>

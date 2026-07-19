@@ -1,0 +1,254 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Topic 24: PersistentVolume (PV) — Kubernetes Expert Course</title>
+<link rel="stylesheet" href="styles.css">
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+</head>
+<body>
+
+<header class="course-header">
+  <div class="kicker">Topic 24 of 70</div>
+  <h1>PersistentVolume (PV)</h1>
+  <div class="subtitle">The cluster-level storage object: lifecycle states, reclaim policies, and static vs dynamic provisioning.</div>
+</header>
+
+<nav class="topic-nav">
+  <a href="23-storage.html">&larr; Storage</a>
+  <a href="index.html">Course Index</a>
+  <a href="25-pvc.html">PersistentVolumeClaim &rarr;</a>
+</nav>
+
+<h2 id="explanation">Explanation</h2>
+<p>A <strong>PersistentVolume (PV)</strong> is a cluster-scoped API object representing one concrete piece of storage — an actual EBS volume ID, an NFS export path, a Ceph RBD image. It is not namespaced because storage is a cluster resource, provisioned by an admin or a provisioner, and later claimed by any namespace. This is the layer where the physical/cloud details live: capacity, access modes, the CSI driver reference, mount options, and the reclaim policy.</p>
+<p>Kubernetes needs this separation because Pods and PVCs are ephemeral and namespaced, but the underlying disk is neither — it can outlive many Pods, be reused across claims, or need to be preserved even after the workload that used it is deleted. The PV is the stable record of "this storage exists and here's how to attach it," independent of who's currently using it.</p>
+<p>Every PV moves through a small lifecycle: <code>Available</code> (provisioned, not yet claimed), <code>Bound</code> (matched to a PVC), <code>Released</code> (the PVC was deleted but the PV — and its data — still exists, pending cleanup), and <code>Failed</code> (automatic reclamation failed). This state machine matters operationally: a "Released" PV with <code>Retain</code> policy is not immediately reusable and not automatically deleted — a human (or automation) must decide what happens to that data next.</p>
+<p>The <strong>reclaim policy</strong> is the single most consequential field on a PV. <code>Delete</code> (the default for most dynamically-provisioned classes) destroys both the PV object and the backing storage the instant its PVC is deleted — convenient for stateless-ish workloads, catastrophic if applied carelessly to a production database. <code>Retain</code> keeps the underlying disk and data intact, requiring manual intervention to either scrub-and-reuse it or delete it outright. There used to be a <code>Recycle</code> policy (basic scrub-and-reuse); it's deprecated in favor of dynamic provisioning entirely replacing that use case.</p>
+<p>Historically PVs were <strong>statically</strong> provisioned: an admin created the disk out-of-band and hand-wrote a PV object pointing at it, useful for importing existing data or exotic on-prem storage. Nearly everywhere else today, PVs are created by <strong>dynamic provisioning</strong> — a PVC references a StorageClass, and the external-provisioner sidecar (part of the CSI driver deployment) creates both the backing disk and the PV object automatically, with no admin in the loop per-request.</p>
+
+<h2 id="internal-working">Internal Working / Interactions</h2>
+<ul>
+<li><strong>PersistentVolume controller</strong> (in kube-controller-manager) — watches PV and PVC objects and performs the binding match.</li>
+<li><strong>External provisioner (CSI sidecar)</strong> — for dynamic provisioning, creates the PV object once the backend disk exists.</li>
+<li><strong>CSI driver controller plugin</strong> — issues the actual CreateVolume/DeleteVolume gRPC calls against the cloud/storage API.</li>
+<li><strong>kubelet + CSI node plugin</strong> — stage/mount the PV's volume onto the node once a Pod using its PVC is scheduled there.</li>
+</ul>
+
+<h2 id="architecture-diagram">Architecture Diagram</h2>
+<pre class="mermaid">
+stateDiagram-v2
+  [*] --> Available: PV created (static or dynamic)
+  Available --> Bound: PVC matches capacity/accessMode/class
+  Bound --> Released: PVC deleted, PV not yet reclaimed
+  Released --> Available: manual admin reset (Retain policy)
+  Released --> [*]: storage + PV object deleted (Delete policy)
+  Bound --> Failed: automatic reclamation error
+  Failed --> [*]: manual cleanup
+</pre>
+
+<pre class="mermaid">
+sequenceDiagram
+  participant Admin as Admin / StorageClass
+  participant PVCtl as PV Controller
+  participant Prov as External Provisioner
+  participant CSI as CSI Driver
+  participant Cloud as Cloud Storage API
+  Admin->>PVCtl: PVC created referencing StorageClass "fast-ssd"
+  PVCtl->>Prov: no matching PV found -> trigger dynamic provisioning
+  Prov->>CSI: CreateVolume(params)
+  CSI->>Cloud: allocate disk (e.g. gp3 EBS volume)
+  Cloud-->>CSI: volume ID
+  CSI-->>Prov: volume handle
+  Prov->>PVCtl: create PV object bound to new volume
+  PVCtl->>PVCtl: bind PV <-> PVC (state: Bound)
+</pre>
+
+<h2 id="code-example">Code Example</h2>
+<pre><code># Statically provisioned PV — admin hand-creates it for a pre-existing disk
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: pv-legacy-nfs
+spec:
+  capacity:
+    storage: 100Gi                        # must be >= what any binding PVC requests
+  accessModes:
+    - ReadWriteMany                       # NFS supports many readers/writers concurrently
+  persistentVolumeReclaimPolicy: Retain   # keep data even after the PVC is deleted
+  nfs:
+    server: nfs.internal.example.com
+    path: /exports/shared-data
+  mountOptions:
+    - nfsvers=4.1
+
+---
+# Dynamically-provisioned-style PV (normally auto-created by the provisioner — shown for clarity)
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: pvc-a1b2c3d4-auto-generated
+  labels:
+    type: dynamic
+spec:
+  capacity:
+    storage: 20Gi
+  accessModes:
+    - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Delete    # default for cloud-disk StorageClasses
+  storageClassName: fast-ssd
+  csi:
+    driver: ebs.csi.aws.com
+    volumeHandle: vol-0abcd1234efgh5678     # the actual cloud disk ID
+    fsType: ext4
+</code></pre>
+
+<h2 id="kubectl-commands">kubectl Commands</h2>
+<pre><code>kubectl get pv                                   # list PVs and their phase (Available/Bound/Released)
+kubectl describe pv pv-legacy-nfs                # full spec, reclaim policy, claimRef
+kubectl get pv -o custom-columns=NAME:.metadata.name,STATUS:.status.phase,CLAIM:.spec.claimRef.name
+kubectl patch pv pv-legacy-nfs -p '{"spec":{"persistentVolumeReclaimPolicy":"Retain"}}'  # change reclaim policy
+kubectl delete pv pv-legacy-nfs                  # remove a Released PV after manual data cleanup
+kubectl get events --field-selector involvedObject.kind=PersistentVolume  # provisioning/binding events
+</code></pre>
+
+<h2 id="best-practices">Best Practices &amp; Common Pitfalls</h2>
+<div class="grid-2">
+<div class="callout good">
+<strong>Do</strong>
+<ul>
+<li>Use <code>Retain</code> for anything holding data you can't regenerate (databases, user uploads).</li>
+<li>Prefer dynamic provisioning; reserve static PVs for importing pre-existing storage.</li>
+<li>Label/annotate PVs with owning team and criticality for audit and cleanup.</li>
+<li>Monitor for PVs stuck in <code>Released</code> — they represent orphaned cost and blocked capacity.</li>
+</ul>
+</div>
+<div class="callout warn">
+<strong>Pitfalls</strong>
+<ul>
+<li>Leaving <code>Delete</code> as the reclaim policy on a StorageClass backing production databases.</li>
+<li>Assuming a PVC deletion is instantly safe — check reclaim policy before deleting in prod.</li>
+<li>Capacity mismatch: a PVC requesting more than any Available PV offers will stay Pending forever with static provisioning.</li>
+<li>Access mode mismatch (requesting RWX against a PV that only supports RWO) blocks binding silently.</li>
+</ul>
+</div>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="interview-questions">50 Interview Questions</h2>
+
+<details class="qa"><summary>1. Why is PersistentVolume a cluster-scoped object instead of a namespaced one?</summary>
+<div class="qa-body"><strong>Short answer:</strong> A PV represents a real, physical piece of storage (a disk, an NFS export) that isn't owned by any single namespace and can outlive or be reused across namespaces.
+<br><strong>Detailed explanation:</strong> Namespaces are a logical boundary for organizing workloads; storage provisioning is an infrastructure concern that sits above that boundary. Making PV cluster-scoped lets an admin (or a provisioner) allocate storage once and let any namespace's PVC bind to it, mirroring how a cloud disk or SAN LUN isn't "owned" by an application team.
+<br><strong>Production example:</strong> A shared NFS export provisioned once as a PV can be bound by a PVC in the `data-eng` namespace today and, after release, rebound by a PVC in `analytics` next quarter.
+<br><strong>Common mistake:</strong> Expecting `kubectl get pv -n <namespace>` to filter results — PVs ignore `-n` entirely since they aren't namespaced.</div></details>
+
+<details class="qa"><summary>2. What exactly transitions a PV from Available to Bound, and can you force it?</summary>
+<div class="qa-body"><strong>Short answer:</strong> The PersistentVolume controller in kube-controller-manager matches an unbound PVC to an Available PV whose capacity, access modes, and StorageClass satisfy the claim, then sets both objects' `claimRef`/`volumeName` fields.
+<br><strong>Detailed explanation:</strong> This is a one-time, one-way match — once bound, the pairing is exclusive and sticky even if a "better fitting" PV later appears. You can force a specific pairing by setting `spec.volumeName` on the PVC (or `claimRef` on the PV) ahead of time, bypassing the controller's normal best-fit search.
+<br><strong>Production example:</strong> Pre-binding a PVC to a specific pre-provisioned PV by name ensures a StatefulSet Pod always gets the exact disk that already holds its data, rather than an arbitrary matching PV.
+<br><strong>Common mistake:</strong> Assuming binding re-evaluates over time — a PVC stuck bound to an undersized PV won't automatically rebind to a better one later.</div></details>
+
+<details class="qa"><summary>3. Why does a Released PV not automatically become Available again?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Released means the PVC was deleted but the underlying data may still be present; Kubernetes won't silently hand that data to a new, unrelated claim.
+<br><strong>Detailed explanation:</strong> The PV controller has no way to know if the old data is safe to expose to whoever binds next, so with `Retain` it deliberately stops and leaves the PV in `Released` state with a stale `claimRef`, requiring a human to clear `claimRef` and decide the volume's fate before it can be Available again.
+<br><strong>Production example:</strong> A Released PV backing a decommissioned database keeps its data intact for 30 days per compliance policy before an admin manually clears it and returns it to the pool.
+<br><strong>Common mistake:</strong> Deleting and recreating a PVC expecting it to instantly rebind to its old PV — it stays Released until the claimRef is manually cleared.</div></details>
+
+<details class="qa"><summary>4. What's the real-world difference between the Delete and Retain reclaim policies, and why does the default matter?</summary>
+<div class="qa-body"><strong>Short answer:</strong> `Delete` destroys both the PV object and the backing storage the moment the bound PVC is deleted; `Retain` keeps the disk and its data, leaving the PV in `Released` state for manual handling.
+<br><strong>Detailed explanation:</strong> Most dynamically-provisioned StorageClasses default to `Delete` because it's convenient for disposable, stateless-adjacent workloads — but that same default is dangerous for anything holding irreplaceable data, since a PVC deletion (accidental or scripted) permanently destroys the disk with no recycle bin.
+<br><strong>Production example:</strong> A namespace cleanup script that deletes all PVCs in a decommissioned environment silently destroys production-grade data if any of those PVCs pointed at PVs still using `Delete`.
+<br><strong>Common mistake:</strong> Never checking or overriding the reclaim policy inherited from a StorageClass before running it against stateful production workloads.</div></details>
+
+<details class="qa"><summary>5. Why was the Recycle reclaim policy deprecated, and what replaced its purpose?</summary>
+<div class="qa-body"><strong>Short answer:</strong> `Recycle` did a basic `rm -rf` scrub of the volume's contents so the PV could be reused, but it was a coarse, insecure, and storage-plugin-specific mechanism.
+<br><strong>Detailed explanation:</strong> It only worked with a handful of in-tree volume plugins, offered no guarantee of secure erasure, and didn't fit cleanly into the CSI model. Dynamic provisioning replaced the need for "reuse an old PV" entirely — instead of scrubbing and rebinding an old volume, you just provision a fresh one via a StorageClass and delete the old one properly.
+<br><strong>Production example:</strong> Instead of relying on Recycle to wipe and reuse a volume for a new tenant, a cluster using CSI dynamic provisioning simply deletes the old PV/disk and lets a new PVC trigger a brand-new volume.
+<br><strong>Common mistake:</strong> Writing new manifests with `persistentVolumeReclaimPolicy: Recycle`, not realizing it's deprecated and unsupported by most modern CSI drivers.</div></details>
+
+<details class="qa"><summary>6. When would you deliberately choose static provisioning over dynamic provisioning for a PV?</summary>
+<div class="qa-body"><strong>Short answer:</strong> When the storage already exists outside Kubernetes' control — a legacy NFS export, an imported snapshot, or storage that must be hand-picked for compliance/performance reasons.
+<br><strong>Detailed explanation:</strong> Static provisioning means an admin manually writes the PV object pointing at pre-existing storage, giving full control over exactly which disk gets used. Dynamic provisioning is preferable for on-demand, self-service storage, but it can't be used when the disk already has meaningful data or when the storage backend has no CSI provisioner at all.
+<br><strong>Production example:</strong> Migrating an on-prem NFS share containing years of shared research data into Kubernetes by hand-writing a static PV pointing at that exact export path, rather than provisioning a fresh empty volume.
+<br><strong>Common mistake:</strong> Statically provisioning PVs for routine, everyday application storage needs — creating unnecessary manual toil where dynamic provisioning would just work.</div></details>
+
+<details class="qa"><summary>7. What actually creates the PV object during dynamic provisioning, and in what order do things happen?</summary>
+<div class="qa-body"><strong>Short answer:</strong> The external-provisioner CSI sidecar watches for unbound PVCs referencing its StorageClass, calls the CSI driver's `CreateVolume` gRPC method to allocate the backing disk, and only then creates the PV object pointing at that new volume.
+<br><strong>Detailed explanation:</strong> The PV controller never creates the disk itself — it just performs binding. The actual creation order is: PVC created with no matching PV → external-provisioner notices → calls CSI controller plugin's `CreateVolume` → cloud API allocates disk and returns a volume handle → provisioner creates the PV object embedding that handle → PV controller binds the new PV to the waiting PVC.
+<br><strong>Production example:</strong> Creating a PVC against `fast-ssd` StorageClass results in a brand-new EBS volume appearing in the AWS console seconds later, with a PV auto-named like `pvc-a1b2c3d4...` referencing its volume ID.
+<br><strong>Common mistake:</strong> Assuming the PV object exists the instant the PVC is created — there's an asynchronous provisioning delay during which the PVC sits Pending.</div></details>
+
+<details class="qa"><summary>8. Why can a PVC stay stuck in Pending even though matching-looking PVs exist in the cluster?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Binding requires an exact match on capacity (PV capacity must be >= requested), access modes, and StorageClass name (or lack thereof) — a mismatch on any one silently blocks binding with no PV picked.
+<br><strong>Detailed explanation:</strong> The PV controller doesn't partially match or negotiate; if a PVC requests `ReadWriteMany` but only `ReadWriteOnce` PVs are Available, or requests 50Gi but the only free PV offers 20Gi, the claim simply waits indefinitely with no PV assigned, and there's no error surfaced beyond the Pending status and an event.
+<br><strong>Production example:</strong> A PVC requesting `storageClassName: ""` (meaning "match an unclassed static PV") stays Pending forever in a cluster where every PV has a StorageClass set, since it won't match by omission.
+<br><strong>Common mistake:</strong> Debugging a Pending PVC by checking the PVC's events but not cross-checking the actual capacity/accessMode/class fields on candidate PVs.</div></details>
+
+<details class="qa"><summary>9. How does kubelet actually attach a PV's volume to a Pod once binding has occurred?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Once a Pod using the bound PVC is scheduled to a node, kubelet invokes the CSI node plugin to stage (attach/format) and then publish (bind-mount into the Pod's directory) the volume referenced by the PV.
+<br><strong>Detailed explanation:</strong> Binding a PVC to a PV is purely a control-plane bookkeeping step — no data path work happens yet. The actual attach/mount only happens per-node, per-Pod, driven by kubelet calling `NodeStageVolume` then `NodePublishVolume` on the CSI node plugin, using the volume handle stored in the PV spec.
+<br><strong>Production example:</strong> A Pod referencing an already-Bound PVC still takes a few seconds to go Running because kubelet is waiting on the CSI node plugin to attach and format the EBS volume before starting the container.
+<br><strong>Common mistake:</strong> Assuming a Bound PVC/PV means the volume is already attached and ready — attachment only happens once a Pod actually needs it on a specific node.</div></details>
+
+<details class="qa"><summary>10. Why is monitoring PVs stuck in the Released state considered a production best practice?</summary>
+<div class="qa-body"><strong>Short answer:</strong> A Released PV with `Retain` policy keeps its backing disk allocated and billed, but is unusable by anything until a human clears its claimRef — left unchecked, these silently accumulate as orphaned cost and blocked capacity.
+<br><strong>Detailed explanation:</strong> Because Released PVs require manual intervention by design (to protect data), they're easy to forget about after the PVC that created them is cleaned up. Over time, a cluster can accumulate dozens of Released PVs each still holding a real cloud disk that nobody is using or paying attention to.
+<br><strong>Production example:</strong> A cost audit finds 40 Released PVs from six months of decommissioned test environments, each still holding a provisioned EBS volume that was never actually deleted.
+<br><strong>Common mistake:</strong> Only alerting on Pending PVCs (a user-facing symptom) while never alerting on Released PVs (a silent, ongoing cost/capacity leak).</div></details>
+
+<details class="qa"><summary>11–50. Additional rapid-fire questions</summary>
+<div class="qa-body">
+<strong>11.</strong> What are the four phases in a PV's lifecycle? — Available, Bound, Released, Failed.<br>
+<strong>12.</strong> Which field on a PV records which PVC it's bound to? — `spec.claimRef`.<br>
+<strong>13.</strong> What does the Failed phase actually indicate? — The automatic reclamation process (e.g. a Delete operation) itself errored out.<br>
+<strong>14.</strong> Is `persistentVolumeReclaimPolicy` mutable on an existing PV? — Yes, it can be patched at any time, e.g. `kubectl patch pv ... -p '{"spec":{"persistentVolumeReclaimPolicy":"Retain"}}'`.<br>
+<strong>15.</strong> Why would you patch a PV's reclaim policy from Delete to Retain just before deleting its PVC? — To prevent accidental data loss when decommissioning, without having to fully recreate the PV.<br>
+<strong>16.</strong> What access mode does a typical single-node cloud block volume (like an EBS gp3 disk) support? — `ReadWriteOnce`.<br>
+<strong>17.</strong> What access mode does NFS-backed storage commonly support that block storage usually doesn't? — `ReadWriteMany`.<br>
+<strong>18.</strong> Does a PV's `capacity.storage` need to exactly equal the PVC's requested size? — No, the PV's capacity only needs to be greater than or equal to what's requested.<br>
+<strong>19.</strong> What CSI gRPC call does the external-provisioner trigger to allocate a new disk? — `CreateVolume`.<br>
+<strong>20.</strong> What CSI gRPC call runs when a Delete-policy PV's backing storage is destroyed? — `DeleteVolume`.<br>
+<strong>21.</strong> What kubectl command shows a PV's current phase alongside its bound claim? — `kubectl get pv -o custom-columns=NAME:.metadata.name,STATUS:.status.phase,CLAIM:.spec.claimRef.name`.<br>
+<strong>22.</strong> Can two different PVCs bind to the same PV simultaneously? — No, binding is strictly one-to-one.<br>
+<strong>23.</strong> What identifies the actual cloud disk inside a CSI-backed PV spec? — The `csi.volumeHandle` field.<br>
+<strong>24.</strong> Why is `storageClassName` on a PV relevant to binding, even for statically-provisioned PVs? — A PVC's StorageClass request must match the PV's (including empty string for "no class") for binding to succeed.<br>
+<strong>25.</strong> What happens to a Pod's data if its PVC's underlying PV uses Delete policy and someone deletes the PVC? — The data is permanently destroyed along with the disk, with no recovery path.<br>
+<strong>26.</strong> Who typically creates the PV object in a static provisioning workflow? — A cluster admin, hand-writing the manifest to reference pre-existing storage.<br>
+<strong>27.</strong> Who (or what) typically creates the PV object in a dynamic provisioning workflow? — The external-provisioner CSI sidecar, automatically, after calling CreateVolume.<br>
+<strong>28.</strong> What naming convention do dynamically-provisioned PVs commonly follow? — A generated name like `pvc-<uuid>`, tying it back to the triggering PVC.<br>
+<strong>29.</strong> Why doesn't deleting a Bound PV directly remove its backing storage immediately? — Kubernetes protects Bound PVs from casual deletion mid-use; the object is typically finalized/blocked until unbound.<br>
+<strong>30.</strong> What field would you check to see why a PVC hasn't bound to any PV? — `kubectl describe pvc` events, cross-referenced against candidate PVs' capacity/accessModes/storageClassName.<br>
+<strong>31.</strong> Does the PV controller ever "upgrade" a bound PVC to a better-fitting PV later? — No, binding is a one-time decision that persists even if a better match appears afterward.<br>
+<strong>32.</strong> What's a mountOptions field used for on a PV? — Passing filesystem/mount-specific flags (e.g. `nfsvers=4.1`) applied when the volume is mounted on a node.<br>
+<strong>33.</strong> Why might an admin pre-bind a PVC to a specific PV using `spec.volumeName`? — To guarantee a StatefulSet Pod reconnects to the exact disk holding its prior data, rather than an arbitrary matching PV.<br>
+<strong>34.</strong> What component actually performs the PV-to-PVC binding decision? — The PersistentVolume controller running inside kube-controller-manager.<br>
+<strong>35.</strong> Why is `Retain` generally recommended for database or user-upload storage? — It prevents automatic, irreversible destruction of data if the PVC is deleted intentionally or accidentally.<br>
+<strong>36.</strong> What's the operational cost of leaving many Released PVs unaddressed? — Continued cloud billing for unused disks plus reduced available capacity for new claims.<br>
+<strong>37.</strong> Can a PV be created without any PVC ever binding to it? — Yes, it simply sits in `Available` phase until a matching claim appears.<br>
+<strong>38.</strong> What kubectl command lists provisioning and binding events for PVs cluster-wide? — `kubectl get events --field-selector involvedObject.kind=PersistentVolume`.<br>
+<strong>39.</strong> Why is a PV's `nfs.server` / `nfs.path` (or equivalent CSI fields) considered immutable in practice? — Changing where a PV points after it's bound would silently redirect an application to different data mid-flight.<br>
+<strong>40.</strong> What's the risk of applying a StorageClass with `Delete` reclaim policy to short-lived dev/test environments that get torn down often? — Minimal risk there — Delete is actually well-suited to disposable environments, unlike production data stores.<br>
+<strong>41.</strong> How would you safely migrate data off a PV before letting its reclaim policy delete it? — Snapshot or copy the data out via a temporary Pod/job before deleting the PVC, or patch the policy to Retain first.<br>
+<strong>42.</strong> What does `kubectl describe pv <name>` show that `kubectl get pv` doesn't? — Full spec detail including reclaim policy, claimRef, source (NFS/CSI details), and related events.<br>
+<strong>43.</strong> Why can't a namespaced RBAC Role restrict access to PV objects the way it can for PVCs? — PVs are cluster-scoped, so restricting them requires a ClusterRole, not a namespaced Role.<br>
+<strong>44.</strong> What happens if a dynamically-provisioned PV's backing cloud disk is deleted manually out-of-band? — The PV object remains but becomes unusable/orphaned, since its `volumeHandle` no longer points to real storage.<br>
+<strong>45.</strong> Why is capacity planning at the PV level relevant even with dynamic provisioning? — Total allocated PV capacity still consumes real cloud storage quota/cost, regardless of how automatically it was created.<br>
+<strong>46.</strong> What's a sign in `kubectl get pv` output that a PV was statically provisioned rather than dynamically? — Its name is human-chosen (not the `pvc-<uuid>` pattern) and it typically lacks a StorageClass-driven annotation trail.<br>
+<strong>47.</strong> Why should reclaim policy be reviewed per-environment rather than left at the StorageClass default everywhere? — Production and dev/test have very different tolerances for data loss, so a single blanket policy is often wrong for one of them.<br>
+<strong>48.</strong> What's the relationship between a PV's `accessModes` list and what a binding PVC can request? — The PVC's requested access mode(s) must be a subset of what the PV declares it supports.<br>
+<strong>49.</strong> Why would an admin label PVs with owning team and criticality metadata? — To make audits, cost attribution, and cleanup decisions on Released PVs faster and less error-prone.<br>
+<strong>50.</strong> How would you confirm whether a stuck-Pending PVC is a capacity problem or an access-mode problem? — Compare the PVC's requested `resources.requests.storage` and `accessModes` against every Available PV's matching fields directly.
+</div></details>
+
+
+
+<footer class="course-footer">Next: Topic 25 — PersistentVolumeClaim (binding process, access modes, Pod consumption).</footer>
+
+<script>
+  mermaid.initialize({ startOnLoad: true, theme: 'dark' });
+</script>
+
+</body>
+</html>

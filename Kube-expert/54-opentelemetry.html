@@ -1,0 +1,285 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Topic 54: OpenTelemetry — Kubernetes Expert Course</title>
+<link rel="stylesheet" href="styles.css">
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+</head>
+<body>
+
+<header class="course-header">
+  <div class="kicker">Topic 54 of 70</div>
+  <h1>OpenTelemetry</h1>
+  <div class="subtitle">A vendor-neutral standard and toolset for instrumenting, collecting, and exporting metrics, logs, and traces under one spec.</div>
+</header>
+
+<nav class="topic-nav">
+  <a href="53-grafana.html">&larr; Grafana</a>
+  <a href="index.html">Course Index</a>
+  <a href="55-logging.html">Logging &rarr;</a>
+</nav>
+
+<h2 id="explanation">Explanation</h2>
+<p>OpenTelemetry (OTel) is a CNCF project that standardizes how applications generate telemetry — metrics, logs, and
+distributed traces — and how that telemetry is transported, processed, and exported to backends like Prometheus,
+VictoriaMetrics, Loki, Tempo, Jaeger, or commercial vendors. Before OTel, every signal type had its own competing
+instrumentation library and wire format (StatsD for metrics, OpenTracing and OpenCensus for traces, ad-hoc logging
+libraries), forcing teams to instrument code differently per backend and re-instrument entirely when switching vendors.
+OTel merges OpenTracing and OpenCensus into one spec and extends it to cover metrics and logs, giving one instrumentation
+API, one wire protocol (OTLP), and one deployable pipeline component (the Collector) for all three signal types.</p>
+
+<p>Kubernetes needs this because a modern cluster runs polyglot microservices (Go, Java, Python, Node) each historically
+emitting telemetry in incompatible formats. Without a common standard, correlating "this trace is slow" with "this pod's
+CPU spiked" with "this log line has an error" requires stitching together three separate toolchains by hand. OTel's
+common semantic conventions (e.g. every span and log line can carry the same <code>k8s.pod.name</code>,
+<code>service.name</code> resource attributes) make cross-signal correlation possible by default rather than by
+convention teams invent themselves.</p>
+
+<p>The centerpiece most platform teams deploy is the <strong>OpenTelemetry Collector</strong>: a vendor-agnostic proxy
+that receives telemetry (via OTLP, but also Prometheus scrape, Jaeger, Zipkin, and other protocols), applies processing
+(batching, filtering, sampling, adding Kubernetes metadata via the <code>k8sattributes</code> processor), and exports it
+to one or more backends. This decouples application code from backend choice entirely — apps emit OTLP to a local
+Collector (often a DaemonSet agent), and platform teams can swap Loki for Elasticsearch, or Tempo for a commercial APM,
+by changing Collector config only, with zero application redeploys.</p>
+
+<p>OTel SDKs, embedded in application code, auto-instrument common frameworks (HTTP servers, gRPC, database clients) to
+emit spans and metrics with minimal manual code, and expose an API for custom spans/metrics where auto-instrumentation
+isn't enough. This is the layer application developers actually interact with; the Collector is what platform/SRE teams
+operate.</p>
+
+<p>Within the ecosystem, OpenTelemetry is the connective tissue: it doesn't replace Prometheus, Loki, or Tempo — it
+standardizes how telemetry gets to them, often more efficiently and with richer context than each tool's native agent
+alone (e.g. richer trace-to-log correlation than a hand-rolled Fluent Bit + Prometheus setup provides).</p>
+
+<h2 id="internal-working">Internal Working / Interactions</h2>
+<ul>
+  <li><strong>SDK / auto-instrumentation</strong> in the application process generates spans, metrics, and logs, exporting them via OTLP (gRPC or HTTP) to a local Collector.</li>
+  <li><strong>Collector receivers</strong> accept OTLP, Prometheus-format scrapes, Jaeger, Zipkin, and other protocols — often deployed as both a DaemonSet (node-local agent, low-latency hop) and a central Gateway Deployment (cluster-wide aggregation, sampling, fan-out).</li>
+  <li><strong>Collector processors</strong> — <code>batch</code> (efficiency), <code>k8sattributes</code> (enriches telemetry with pod/namespace/node metadata by querying the Kubernetes API), <code>tail_sampling</code> (keep only interesting traces), <code>memory_limiter</code> (backpressure protection).</li>
+  <li><strong>Collector exporters</strong> send processed data onward — <code>prometheusremotewrite</code> to VictoriaMetrics, <code>loki</code> for logs, <code>otlp</code> to Tempo/Jaeger for traces.</li>
+  <li>The Collector itself is often managed via the <strong>OpenTelemetry Operator</strong>, which also handles auto-injecting SDK sidecars into application Pods.</li>
+</ul>
+
+<h2 id="architecture-diagram">Architecture Diagram</h2>
+<pre class="mermaid">
+flowchart LR
+    subgraph App["Application Pod"]
+      SDK["OTel SDK<br/>(auto-instrumentation)"]
+    end
+
+    SDK -->|OTLP gRPC| Agent["Collector Agent<br/>(DaemonSet, per-node)"]
+
+    Agent -->|batched OTLP| GW["Collector Gateway<br/>(Deployment, cluster-wide)"]
+
+    subgraph Processing["Gateway Processors"]
+      direction TB
+      P1["k8sattributes"] --> P2["tail_sampling"] --> P3["batch"]
+    end
+
+    GW --> Processing
+
+    Processing -->|metrics| VM["VictoriaMetrics / Prometheus"]
+    Processing -->|traces| TP["Tempo / Jaeger"]
+    Processing -->|logs| LK["Loki"]
+</pre>
+
+<h2 id="code-example">Code Example</h2>
+<pre><code># OpenTelemetry Collector config — receives OTLP from apps, enriches with k8s metadata,
+# and fans out metrics/traces/logs to their respective backends.
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317      # apps send traces/metrics/logs here via OTLP/gRPC
+      http:
+        endpoint: 0.0.0.0:4318      # OTLP/HTTP alternative for clients that can't do gRPC
+
+processors:
+  k8sattributes:                    # enriches every span/log/metric with pod, namespace, node labels
+    extract:
+      metadata:
+        - k8s.pod.name
+        - k8s.namespace.name
+        - k8s.deployment.name
+  batch:
+    timeout: 5s                     # batches telemetry before export to reduce network overhead
+    send_batch_size: 1000
+  memory_limiter:                   # protects the Collector itself from OOM under telemetry bursts
+    check_interval: 1s
+    limit_mib: 512
+
+exporters:
+  prometheusremotewrite:
+    endpoint: "http://vminsert.monitoring.svc:8480/insert/0/prometheus/"
+  otlp/tempo:
+    endpoint: "tempo.monitoring.svc:4317"
+    tls: { insecure: true }
+  loki:
+    endpoint: "http://loki.monitoring.svc:3100/loki/api/v1/push"
+
+service:
+  pipelines:
+    metrics:
+      receivers: [otlp]
+      processors: [k8sattributes, memory_limiter, batch]
+      exporters: [prometheusremotewrite]
+    traces:
+      receivers: [otlp]
+      processors: [k8sattributes, memory_limiter, batch]
+      exporters: [otlp/tempo]
+    logs:
+      receivers: [otlp]
+      processors: [k8sattributes, memory_limiter, batch]
+      exporters: [loki]
+</code></pre>
+
+<h2 id="kubectl-cli-commands">kubectl / CLI Commands</h2>
+<pre><code>kubectl get pods -n monitoring -l app=otel-collector          # check agent + gateway collector health
+kubectl logs -n monitoring daemonset/otel-collector-agent      # inspect receive/export errors
+kubectl get otelcol -n monitoring                               # if using the OpenTelemetry Operator CRD
+kubectl describe pod -n monitoring otel-collector-gateway-xxxx  # check resource limits / memory_limiter drops
+kubectl port-forward -n monitoring svc/otel-collector 4318:4318 # send a test OTLP/HTTP span locally
+kubectl get instrumentation -n default                          # Operator CRD controlling auto-instrumentation injection
+kubectl top pod -n monitoring -l app=otel-collector              # verify Collector isn't CPU/memory starved
+</code></pre>
+
+<h2 id="best-practices">Best Practices &amp; Common Pitfalls</h2>
+<div class="grid-2">
+<div>
+<h4>Best Practices</h4>
+<ul>
+  <li>Deploy a two-tier Collector topology: node-local agent (DaemonSet) plus a central gateway for heavier processing.</li>
+  <li>Always include <code>memory_limiter</code> as the first processor to prevent OOMs during traffic spikes.</li>
+  <li>Use <code>k8sattributes</code> so every signal carries consistent pod/namespace context for correlation.</li>
+  <li>Use tail-based sampling for traces to keep only error/slow traces instead of sampling uniformly.</li>
+  <li>Standardize <code>service.name</code> resource attributes across teams for consistent dashboards.</li>
+</ul>
+</div>
+<div>
+<h4>Pitfalls</h4>
+<ul>
+  <li>Sending 100% of traces to the backend uninspected — cost and storage explode at scale.</li>
+  <li>Running the Collector without resource limits, letting a telemetry burst take down the node.</li>
+  <li>Mixing OTel auto-instrumentation with hand-rolled StatsD/custom metrics, causing duplicate/conflicting series.</li>
+  <li>Not versioning Collector config alongside app deploys, causing silent pipeline breakage after upgrades.</li>
+</ul>
+</div>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="interview-questions">50 Interview Questions</h2>
+
+<details class="qa"><summary>1. What problem does OpenTelemetry actually solve that Prometheus, Loki, and Tempo don't?</summary>
+<div class="qa-body"><strong>Short answer:</strong> It standardizes instrumentation and transport across all three signal types instead of replacing any of the backends.
+<br><strong>Detail:</strong> Before OTel, metrics/traces/logs each had their own competing instrumentation library and wire format (StatsD, OpenTracing, OpenCensus, ad-hoc logging), forcing re-instrumentation per vendor.
+<br><strong>Production example:</strong> Swapping Loki for Elasticsearch, or Tempo for a commercial APM, by changing Collector exporter config only, with zero app redeploys.
+<br><strong>Common mistake:</strong> Thinking OTel is a monitoring backend — it's the connective tissue that feeds Prometheus/Loki/Tempo, not a replacement for them.</div></details>
+
+<details class="qa"><summary>2. What is OTLP and why does it matter?</summary>
+<div class="qa-body"><strong>Short answer:</strong> OTLP is OpenTelemetry's own wire protocol (gRPC or HTTP) for transporting metrics, traces, and logs.
+<br><strong>Detail:</strong> It's the one common protocol apps emit to and Collectors receive on, replacing the need for a separate protocol per signal type.
+<br><strong>Production example:</strong> An app's OTel SDK exports spans/metrics/logs over OTLP/gRPC to a local Collector on port 4317, or OTLP/HTTP on 4318 for clients that can't do gRPC.
+<br><strong>Common mistake:</strong> Assuming OTLP is required end-to-end — the Collector's receivers also accept Prometheus scrape, Jaeger, and Zipkin formats from legacy sources.</div></details>
+
+<details class="qa"><summary>3. What are the three stages of an OpenTelemetry Collector pipeline?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Receivers, processors, and exporters, wired together per signal type under <code>service.pipelines</code>.
+<br><strong>Detail:</strong> Receivers accept incoming telemetry (OTLP, Prometheus, Jaeger, Zipkin), processors transform/enrich/filter it in-flight, and exporters send it onward to one or more backends.
+<br><strong>Production example:</strong> The example config's traces pipeline: <code>receivers: [otlp]</code> → <code>processors: [k8sattributes, memory_limiter, batch]</code> → <code>exporters: [otlp/tempo]</code>.
+<br><strong>Common mistake:</strong> Forgetting each signal type (metrics/traces/logs) needs its own pipeline entry, even if they share the same receiver.</div></details>
+
+<details class="qa"><summary>4. Why deploy the Collector as both a DaemonSet agent and a central Gateway Deployment?</summary>
+<div class="qa-body"><strong>Short answer:</strong> The DaemonSet agent gives every node a low-latency local hop; the Gateway does cluster-wide aggregation, sampling, and fan-out.
+<br><strong>Detail:</strong> Apps emit OTLP to the node-local agent first (cheap, no cross-node hop), which batches and forwards to a central Gateway for heavier processing like tail-based sampling.
+<br><strong>Production example:</strong> Agent DaemonSet receives OTLP from every pod on its node, forwards batched OTLP onward to the Gateway Deployment which applies k8sattributes/tail_sampling/batch before exporting.
+<br><strong>Common mistake:</strong> Running only a Gateway with no local agent, forcing every application pod to reach across the cluster network for every span/metric emitted.</div></details>
+
+<details class="qa"><summary>5. What does the k8sattributes processor actually do, and why put it early in the pipeline?</summary>
+<div class="qa-body"><strong>Short answer:</strong> It enriches every span, metric, and log with pod, namespace, and node metadata by querying the Kubernetes API.
+<br><strong>Detail:</strong> Without it, telemetry arrives with no cluster context — you can't correlate a slow trace or CPU spike to a specific pod/deployment.
+<br><strong>Production example:</strong> The example extracts <code>k8s.pod.name</code>, <code>k8s.namespace.name</code>, <code>k8s.deployment.name</code> onto every signal, enabling cross-signal correlation in dashboards.
+<br><strong>Common mistake:</strong> Adding k8sattributes only to the metrics pipeline and forgetting traces/logs, breaking the promised cross-signal correlation.</div></details>
+
+<details class="qa"><summary>6. Why should memory_limiter be the first processor in a Collector pipeline?</summary>
+<div class="qa-body"><strong>Short answer:</strong> It protects the Collector itself from OOMing under a telemetry burst, before any other processing happens.
+<br><strong>Detail:</strong> memory_limiter checks memory usage on an interval and starts refusing/dropping data before the process is killed, acting as backpressure.
+<br><strong>Production example:</strong> The example config sets <code>check_interval: 1s</code> and <code>limit_mib: 512</code> to bound Collector memory during traffic spikes.
+<br><strong>Common mistake:</strong> Running the Collector with no resource limits and no memory_limiter, letting a telemetry burst take down the node it runs on.</div></details>
+
+<details class="qa"><summary>7. What is tail_sampling and why use it instead of uniform sampling?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Tail-based sampling decides which traces to keep after seeing the whole trace, so it can retain only error/slow traces instead of a random percentage.
+<br><strong>Detail:</strong> Uniform (head) sampling might drop the exact trace that shows a production incident; tail sampling inspects outcome first.
+<br><strong>Production example:</strong> Gateway processors chain includes <code>tail_sampling</code> before <code>batch</code>, keeping "interesting" traces while discarding routine successful ones.
+<br><strong>Common mistake:</strong> Sending 100% of traces to the backend uninspected — cost and storage explode at scale without any sampling strategy.</div></details>
+
+<details class="qa"><summary>8. What role does the OpenTelemetry Operator play beyond running the Collector?</summary>
+<div class="qa-body"><strong>Short answer:</strong> It manages Collector deployments via a CRD and also auto-injects SDK instrumentation into application Pods.
+<br><strong>Detail:</strong> Rather than hand-writing Collector Deployments/DaemonSets, teams manage an <code>otelcol</code> custom resource; the Operator also handles auto-instrumentation injection via an <code>Instrumentation</code> CRD.
+<br><strong>Production example:</strong> <code>kubectl get otelcol -n monitoring</code> and <code>kubectl get instrumentation -n default</code> show the Operator-managed Collector and auto-instrumentation config respectively.
+<br><strong>Common mistake:</strong> Manually maintaining Collector YAML alongside an installed Operator, causing drift between the CRD's desired state and what's actually running.</div></details>
+
+<details class="qa"><summary>9. Why does OTel's semantic conventions concept (e.g. service.name) matter operationally?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Consistent resource attributes across every span/metric/log make cross-signal correlation and dashboarding possible by default.
+<br><strong>Detail:</strong> If every team names their service attribute differently, dashboards and correlation queries break per-team instead of working cluster-wide.
+<br><strong>Production example:</strong> Standardizing <code>service.name</code> so Grafana dashboards built for one service work unmodified for any other instrumented service.
+<br><strong>Common mistake:</strong> Mixing OTel auto-instrumentation with hand-rolled StatsD or custom metrics, causing duplicate or conflicting series with inconsistent labels.</div></details>
+
+<details class="qa"><summary>10. If Collector logs show export errors, what's the systematic way to diagnose it?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Check agent and gateway pod health, then inspect logs for receive/export errors, then check resource pressure.
+<br><strong>Detail:</strong> A failure could originate at receipt (bad OTLP payload), in a processor (memory_limiter dropping data), or at export (backend unreachable).
+<br><strong>Production example:</strong> <code>kubectl logs -n monitoring daemonset/otel-collector-agent</code> to inspect errors, then <code>kubectl top pod -n monitoring -l app=otel-collector</code> and <code>kubectl describe pod</code> to check for memory_limiter-driven drops from CPU/memory starvation.
+<br><strong>Common mistake:</strong> Assuming a missing trace/metric is an app instrumentation bug before checking whether the Collector itself dropped it under memory pressure.</div></details>
+
+<details class="qa"><summary>11–50. Additional rapid-fire questions</summary>
+<div class="qa-body">
+<strong>11.</strong> What two projects did OpenTelemetry merge to form its tracing spec? — OpenTracing and OpenCensus.<br>
+<strong>12.</strong> What three signal types does OTel standardize? — Metrics, logs, and distributed traces.<br>
+<strong>13.</strong> What is the OTel SDK responsible for vs. the Collector? — SDK auto-instruments app code and emits telemetry via OTLP; the Collector receives, processes, and exports it — SDK is a dev concern, Collector is a platform/SRE concern.<br>
+<strong>14.</strong> Why does the Collector accept Prometheus-format scrapes as a receiver? — To ingest telemetry from legacy/non-OTLP sources without requiring every app to be re-instrumented.<br>
+<strong>15.</strong> What ports does the example Collector config expose for OTLP? — 4317 for gRPC, 4318 for HTTP.<br>
+<strong>16.</strong> What does the batch processor do and why does it matter? — Groups telemetry before export to reduce network overhead; example uses a 5s timeout and 1000-item batch size.<br>
+<strong>17.</strong> What exporter sends metrics to VictoriaMetrics in the example config? — <code>prometheusremotewrite</code>, pointed at the vminsert endpoint.<br>
+<strong>18.</strong> What exporter sends traces to Tempo? — <code>otlp/tempo</code>, an OTLP exporter configured with the Tempo service endpoint.<br>
+<strong>19.</strong> What exporter sends logs to Loki? — The <code>loki</code> exporter, pushing to Loki's <code>/loki/api/v1/push</code> endpoint.<br>
+<strong>20.</strong> Why can one Collector config define three separate pipelines (metrics/traces/logs)? — Each signal type needs its own receiver/processor/exporter chain even when they share the same underlying receiver.<br>
+<strong>21.</strong> How does OTel let platform teams change backends without app redeploys? — Apps only ever talk to the local Collector via OTLP; backend changes are Collector exporter config changes only.<br>
+<strong>22.</strong> What's the risk of running a Collector without memory_limiter during a traffic spike? — It can OOM and crash, taking down telemetry collection (and potentially destabilizing the node) exactly when observability matters most.<br>
+<strong>23.</strong> Why is auto-instrumentation useful for polyglot microservices? — It instruments common frameworks (HTTP servers, gRPC, DB clients) automatically across Go/Java/Python/Node without hand-writing spans per language.<br>
+<strong>24.</strong> What's the difference between the OTel API and OTel SDK? — The API is what app code calls to create custom spans/metrics; the SDK is the implementation that actually processes and exports them.<br>
+<strong>25.</strong> Why is richer trace-to-log correlation possible with OTel vs. a hand-rolled Fluent Bit + Prometheus setup? — Common resource attributes (like k8s.pod.name, service.name) are attached consistently across all three signals by design, not bolted on per-tool.<br>
+<strong>26.</strong> What command checks whether the Collector DaemonSet and Gateway are healthy? — <code>kubectl get pods -n monitoring -l app=otel-collector</code>.<br>
+<strong>27.</strong> How would you send a test span/metric to a running Collector locally? — <code>kubectl port-forward -n monitoring svc/otel-collector 4318:4318</code> then send an OTLP/HTTP request.<br>
+<strong>28.</strong> What does <code>kubectl get instrumentation -n default</code> show? — The Operator's Instrumentation CRD controlling auto-instrumentation injection for that namespace.<br>
+<strong>29.</strong> Why deploy k8sattributes on every pipeline (metrics, traces, and logs) rather than just one? — So all three signal types carry the same pod/namespace/node context, which is what enables cross-signal correlation.<br>
+<strong>30.</strong> What happens if you don't version Collector config alongside app deploys? — Silent pipeline breakage after upgrades — telemetry can stop flowing without any obvious app-level error.<br>
+<strong>31.</strong> Why might a team choose a two-tier (agent + gateway) topology over a single Collector? — Agents keep the per-app hop cheap and local; the gateway centralizes expensive operations like tail sampling that need visibility across a whole trace.<br>
+<strong>32.</strong> What's a symptom that the memory_limiter processor is actively dropping data? — Missing telemetry combined with Collector pod resource usage near its configured limit_mib, visible via <code>kubectl top pod</code>.<br>
+<strong>33.</strong> Why does the Collector need Kubernetes API access for k8sattributes to work? — It queries the API server to resolve pod/namespace/node metadata for whatever telemetry it receives.<br>
+<strong>34.</strong> What's the tradeoff of tail_sampling versus head-based (uniform) sampling? — Tail sampling needs to buffer/see the full trace before deciding, costing more Collector resources, but preserves the traces that actually matter (errors/slow requests).<br>
+<strong>35.</strong> Why standardize on OTLP instead of each backend's native agent format? — One instrumentation and wire format means one set of SDKs to maintain instead of a different exporter per backend per language.<br>
+<strong>36.</strong> What's a common outcome of mixing OTel auto-instrumentation with hand-rolled StatsD metrics? — Duplicate or conflicting metric series for the same underlying signal.<br>
+<strong>37.</strong> Why is the OpenTelemetry Collector described as "vendor-agnostic"? — It receives and exports via config-driven receivers/exporters, so no backend vendor is hardcoded into the pipeline design.<br>
+<strong>38.</strong> What does the Collector's describe output help diagnose that logs alone might not show? — Resource limits and memory_limiter-driven drops, visible via <code>kubectl describe pod</code> on the Collector.<br>
+<strong>39.</strong> Why is the Collector often the single most critical add-on in an observability stack? — Every signal — metrics, traces, and logs — for every app flows through it; if it's down or dropping data, all three go dark simultaneously.<br>
+<strong>40.</strong> What's the first thing to check if dashboards suddenly stop correlating traces with logs for a service? — Whether the k8sattributes processor (or its metadata extraction config) is still applied consistently across all three pipelines.<br>
+<strong>41.</strong> Why does the example Collector config define separate exporters per signal (prometheusremotewrite, otlp/tempo, loki) instead of one universal exporter? — Each backend speaks its own ingestion protocol/format, so metrics, traces, and logs each need an exporter matching their destination.<br>
+<strong>42.</strong> What's the operational benefit of apps only ever needing to know about a local Collector endpoint? — Application code is fully decoupled from backend choice — no redeploy needed when the platform team changes where telemetry ultimately lands.<br>
+<strong>43.</strong> Why might a Collector Gateway need more CPU/memory than the per-node agents? — It performs heavier processing like tail_sampling across aggregated traffic from every agent, not just a single node's local telemetry.<br>
+<strong>44.</strong> What's a sign that the k8sattributes processor is failing to enrich telemetry? — Spans, metrics, or logs arriving at the backend with missing or generic pod/namespace/node context, breaking correlation.<br>
+<strong>45.</strong> Why is a receiver capable of accepting both OTLP and Prometheus scrape formats useful during a migration? — It lets teams onboard legacy Prometheus-scraped services onto the same Collector pipeline before fully re-instrumenting with OTel SDKs.<br>
+<strong>46.</strong> What's the purpose of the batch processor's send_batch_size setting? — It caps how many items accumulate before a batch is flushed, balancing latency against network efficiency.<br>
+<strong>47.</strong> Why would a platform team prefer otlp/tempo over a generic otlp exporter name in config? — Naming the exporter instance conveys its destination intent (Tempo) when multiple otlp exporters target different backends in the same pipeline set.<br>
+<strong>48.</strong> What's a reasonable way to validate Collector connectivity without a real application? — Port-forward to the Collector's OTLP/HTTP port and send a manually crafted test span/metric.<br>
+<strong>49.</strong> Why is memory_limiter placed before k8sattributes and batch in the processor chain? — So backpressure protection applies before more expensive enrichment/batching work is done on data that might get dropped anyway.<br>
+<strong>50.</strong> What's the risk of an Operator-injected auto-instrumentation sidecar going unnoticed by app teams? — Increased pod resource consumption and potential startup behavior changes that the app team didn't explicitly provision for or expect.
+</div></details>
+
+<footer class="course-footer">Next: Topic 55 — Logging, the broader architecture for collecting container stdout/stderr cluster-wide.</footer>
+
+<script>
+  mermaid.initialize({ startOnLoad: true, theme: 'dark' });
+</script>
+
+</body>
+</html>

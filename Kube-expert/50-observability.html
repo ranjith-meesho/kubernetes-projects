@@ -1,0 +1,269 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Topic 50: Observability — Kubernetes Expert Course</title>
+<link rel="stylesheet" href="styles.css">
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+</head>
+<body>
+
+<header class="course-header">
+  <div class="kicker">Topic 50 of 70</div>
+  <h1>Observability</h1>
+  <div class="subtitle">Metrics, logs, and traces — the three pillars that turn a black-box cluster into something you can actually debug.</div>
+</header>
+
+<nav class="topic-nav">
+  <a href="49-argocd.html">&larr; Argo CD</a>
+  <a href="index.html">Course Index</a>
+  <a href="51-prometheus.html">Prometheus &rarr;</a>
+</nav>
+
+<h2 id="explanation">Explanation</h2>
+
+<p>A Kubernetes cluster hides an enormous amount of dynamic behavior: Pods get rescheduled, IPs change, containers
+restart, requests hop between dozens of microservices. <strong>Observability</strong> is the umbrella capability of
+being able to ask arbitrary questions about a system's internal state from its external outputs, without having to
+ship new code to answer them. It's traditionally broken into three complementary pillars — <strong>metrics</strong>,
+<strong>logs</strong>, and <strong>traces</strong> — and this topic is the conceptual map before the following
+topics dig into the specific tools (Prometheus, VictoriaMetrics, and beyond) that implement each pillar.</p>
+
+<p>Kubernetes needs observability far more than a static server fleet does, precisely because of the properties that
+make it powerful: workloads move between nodes, scale up/down dynamically, and get replaced constantly by
+self-healing. Without observability tooling, you cannot answer basic operational questions like "which Pod handled
+this failed request" or "did that OOMKilled container happen once or is it a pattern" — the infrastructure's own
+churn destroys the evidence you'd otherwise get from a long-lived server.</p>
+
+<p><strong>Metrics</strong> are numeric, timestamped measurements aggregated over time — CPU/memory usage, request
+rate, error rate, latency percentiles. They're cheap to store and query at scale, ideal for dashboards, alerting
+thresholds, and spotting trends ("error rate has climbed steadily for 20 minutes"), but they tell you <em>that</em>
+something is wrong, rarely <em>why</em> for any single request. <strong>Logs</strong> are discrete, timestamped
+text/structured events emitted by applications and system components — they carry rich per-event detail (a stack
+trace, a specific error message, a request ID) but are expensive to store/search at high volume and hard to correlate
+across services without a shared identifier. <strong>Traces</strong> follow a single request as it flows through
+multiple services, recording each hop ("span") with timing — they're the only pillar that directly answers "why was
+this one request slow," showing exactly which downstream call in a distributed chain was the bottleneck.</p>
+
+<p>The pillars compose: a spike in an error-rate <em>metric</em> tells you something broke; you then query
+<em>logs</em> filtered to that time window and service for the specific error; if the issue is latency across a
+distributed call chain, a <em>trace</em> for a slow request shows exactly which downstream hop consumed the time.
+Modern practice increasingly correlates all three via shared identifiers (trace ID embedded in logs, exemplars linking
+metrics to traces) so you can pivot between them without re-deriving context.</p>
+
+<p>In Kubernetes specifically, observability tooling has to account for the platform layer too, not just application
+code: node-level metrics (kubelet's cAdvisor), control-plane metrics (API Server request latency, etcd fsync
+latency), and Kubernetes events (Scheduled, Pulled, OOMKilled) are all part of a complete picture alongside your
+application's own instrumentation.</p>
+
+<h2 id="internal-working">Internal Working / Interactions</h2>
+<ul>
+  <li><strong>kubelet / cAdvisor:</strong> exposes per-container CPU/memory/network metrics, scraped by Prometheus-compatible tools.</li>
+  <li><strong>kube-state-metrics:</strong> a separate service that translates Kubernetes object state (Deployment replica counts, Pod phase, etc.) into Prometheus-format metrics — distinct from cAdvisor's resource-usage metrics.</li>
+  <li><strong>API Server:</strong> exposes its own <code>/metrics</code> endpoint (request latency, etcd interaction latency) — critical for control-plane observability.</li>
+  <li><strong>Log shippers (Fluent Bit/Fluentd/Vector):</strong> run as a DaemonSet on every node, tailing container stdout/stderr and forwarding to a log backend (Loki, Elasticsearch).</li>
+  <li><strong>Tracing SDKs/sidecars (OpenTelemetry):</strong> instrument application code or auto-inject via sidecar, propagating trace context across service calls and exporting spans to a tracing backend (Jaeger, Tempo).</li>
+</ul>
+
+<h2 id="architecture-diagram">Architecture Diagram</h2>
+<pre class="mermaid">
+flowchart TB
+    subgraph Cluster["Kubernetes Cluster"]
+        App["Application Pods\n(metrics endpoint, stdout logs,\nOpenTelemetry spans)"]
+        KSM["kube-state-metrics"]
+        cAdvisor["kubelet / cAdvisor"]
+        Fluent["Log shipper DaemonSet"]
+    end
+    Prom["Metrics backend\n(Prometheus / VictoriaMetrics)"]
+    Logs["Log backend\n(Loki / Elasticsearch)"]
+    Trace["Tracing backend\n(Jaeger / Tempo)"]
+    Dash["Grafana\n(unified dashboards + correlation)"]
+
+    App -->|scrape :metrics| Prom
+    KSM -->|scrape| Prom
+    cAdvisor -->|scrape| Prom
+    App -->|stdout/stderr| Fluent --> Logs
+    App -->|spans| Trace
+    Prom --> Dash
+    Logs --> Dash
+    Trace --> Dash
+</pre>
+
+<h2 id="code-example">Code Example</h2>
+<pre><code># A Pod exposing all three pillars: a /metrics endpoint, structured stdout logs, and OpenTelemetry tracing
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: checkout-service
+  namespace: payments
+spec:
+  replicas: 3
+  selector:
+    matchLabels: { app: checkout-service }
+  template:
+    metadata:
+      labels: { app: checkout-service }
+      annotations:
+        prometheus.io/scrape: "true"     # Tells a Prometheus scrape-config to pick this Pod up.
+        prometheus.io/port: "9100"        # Metrics endpoint port.
+    spec:
+      containers:
+        - name: checkout
+          image: registry.internal/checkout-service:2.4.1
+          ports:
+            - containerPort: 8080          # Application traffic.
+            - containerPort: 9100          # /metrics — Prometheus-format counters/histograms.
+          env:
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT   # OpenTelemetry SDK exports spans here.
+              value: "http://otel-collector.observability:4317"
+            - name: LOG_FORMAT
+              value: "json"                  # Structured JSON logs -> stdout, scraped by the node's log shipper.
+</code></pre>
+
+<h2 id="kubectl-commands">kubectl Commands</h2>
+<pre><code>kubectl top pods -n payments                          # Quick metrics snapshot (requires metrics-server)
+kubectl logs checkout-service-abc123 -n payments --since=10m   # Raw application logs for a specific Pod
+kubectl logs -l app=checkout-service -n payments --all-containers --prefix   # Aggregate logs across all replicas
+kubectl get events -n payments --sort-by=.lastTimestamp   # Kubernetes-level "what happened" events
+kubectl port-forward svc/prometheus 9090 -n observability   # Access Prometheus UI/API locally
+kubectl get pods -n observability -l app=kube-state-metrics  # Confirm kube-state-metrics is running
+kubectl describe pod checkout-service-abc123 -n payments      # Cross-reference events with metrics/log timestamps
+</code></pre>
+
+<h2 id="best-practices">Best Practices &amp; Common Pitfalls</h2>
+<div class="grid-2">
+<div>
+<h4>Best Practices</h4>
+<ul>
+  <li>Instrument applications with all three pillars from day one — retrofitting tracing/structured logs later is far more expensive.</li>
+  <li>Use a shared trace ID propagated into log lines so metrics-to-logs-to-traces pivoting is possible during an incident.</li>
+  <li>Alert on metrics (fast, cheap, aggregate signal); use logs and traces for root-cause investigation, not primary alerting.</li>
+  <li>Separately monitor the platform layer (API Server, etcd, kubelet) — not just application-level observability.</li>
+</ul>
+</div>
+<div>
+<h4>Pitfalls</h4>
+<ul>
+  <li>Treating logs as the primary alerting mechanism — slow to query at scale and expensive compared to metrics-based alerting.</li>
+  <li>Emitting unstructured, freeform log lines that can't be reliably filtered/queried under incident pressure.</li>
+  <li>Ignoring cardinality — high-cardinality labels (e.g. per-user-ID metric labels) can silently blow up metrics storage cost.</li>
+  <li>Adding tracing everywhere with 100% sampling in high-traffic services, overwhelming the tracing backend and budget.</li>
+</ul>
+</div>
+</div>
+
+<h2 id="interview-questions">50 Interview Questions</h2>
+
+<details class="qa"><summary>1. What are the three pillars of observability and what does each one answer?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Metrics (is something wrong, and what's the trend), logs (what exactly happened, in detail, for one event), traces (why was this one request slow across services).
+<br><strong>Detail:</strong> Metrics are cheap numeric aggregates ideal for dashboards/alerting; logs are rich but expensive per-event detail; traces follow a single request's path through a distributed system, showing which hop consumed the time.
+<br><strong>Production example:</strong> A latency alert (metric) leads to filtering logs for the affected window, then a trace for one slow request pinpoints the exact downstream service responsible.
+<br><strong>Common mistake:</strong> Treating the three pillars as redundant rather than complementary — each answers a different class of question.</div></details>
+
+<details class="qa"><summary>2. Why does Kubernetes specifically make observability harder than a static server fleet?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Workloads move between nodes, scale dynamically, and get replaced constantly by self-healing — the churn destroys evidence a long-lived server would otherwise retain.
+<br><strong>Detail:</strong> Questions like "which Pod handled this failed request" become meaningless once that Pod no longer exists; observability tooling has to capture and correlate signals continuously, since the infrastructure itself won't preserve state for you.
+<br><strong>Production example:</strong> An OOMKilled Pod is instantly replaced by a ReplicaSet controller, so without shipped logs/metrics beforehand, the evidence of what happened is gone.
+<br><strong>Common mistake:</strong> Debugging a transient Pod after the fact via `kubectl logs` on a Pod that's already been recreated, expecting the old logs to still be there.</div></details>
+
+<details class="qa"><summary>3. Why do metrics tell you "that" something is wrong but rarely "why" for a single request?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Metrics are aggregated numeric measurements over time, losing per-request identity and context in exchange for cheap, scalable storage and querying.
+<br><strong>Detail:</strong> A rising error-rate metric confirms a problem exists and roughly when it started, but has no way to show you the specific stack trace or request that failed — that detail lives in logs or traces.
+<br><strong>Production example:</strong> A latency p99 metric climbing steadily for 20 minutes tells you "there's a trend," while a trace for one specific slow request tells you which exact downstream call caused it.
+<br><strong>Common mistake:</strong> Trying to root-cause a single failed request purely from dashboards instead of pivoting to logs/traces for that specific window.</div></details>
+
+<details class="qa"><summary>4. What's the difference between kubelet's cAdvisor metrics and kube-state-metrics?</summary>
+<div class="qa-body"><strong>Short answer:</strong> cAdvisor exposes per-container resource-usage metrics (CPU/memory/network); kube-state-metrics exposes Kubernetes object state (replica counts, Pod phase) — entirely distinct data sources.
+<br><strong>Detail:</strong> cAdvisor answers "how much CPU is this container actually using," while kube-state-metrics answers "does this Deployment currently have the replica count it's supposed to" — both are Prometheus-scrapable but represent fundamentally different signal categories.
+<br><strong>Production example:</strong> Alerting on high per-container memory usage via cAdvisor metrics, separate from alerting on `kube_deployment_status_replicas_unavailable` from kube-state-metrics.
+<br><strong>Common mistake:</strong> Assuming kube-state-metrics reports resource usage — it only reports object/API state, not runtime resource consumption.</div></details>
+
+<details class="qa"><summary>5. Why is cardinality a critical concern for the metrics pillar specifically?</summary>
+<div class="qa-body"><strong>Short answer:</strong> High-cardinality labels (e.g. per-user-ID or per-request-ID) can silently multiply the number of stored time series, blowing up storage cost and query performance.
+<br><strong>Detail:</strong> A metric with a label carrying unbounded values effectively creates a near-infinite number of distinct time series, which time-series databases handle far worse than a bounded set of label values.
+<br><strong>Production example:</strong> Adding a raw user_id label to a request-count metric causing the metrics backend's storage to grow unsustainably within days.
+<br><strong>Common mistake:</strong> Adding high-cardinality identifiers as metric labels instead of keeping that detail in logs/traces where per-event granularity belongs.</div></details>
+
+<details class="qa"><summary>6. Why should logs generally not be the primary alerting mechanism?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Logs are slow and expensive to query at scale compared to metrics, making them a poor fit for fast, cheap, aggregate alerting signals.
+<br><strong>Detail:</strong> Metrics are pre-aggregated and designed for threshold-based alerting; logs require scanning/searching potentially huge volumes of text, which is fine for investigation but too slow/costly as a primary trigger.
+<br><strong>Production example:</strong> Alerting on an error-rate metric crossing 5% rather than trying to alert directly on "count of ERROR log lines per minute" via a log query.
+<br><strong>Common mistake:</strong> Building primary paging alerts on log-search queries instead of metrics, incurring high query cost and slower alert latency.</div></details>
+
+<details class="qa"><summary>7. What role does a shared trace ID play in correlating the three pillars?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Embedding the same trace ID in log lines and linking it via exemplars to metrics lets you pivot directly between all three pillars for the same request without re-deriving context.
+<br><strong>Detail:</strong> Without a shared identifier, correlating "this specific trace" to "these specific log lines" to "this specific metric spike" requires manual, error-prone time-window guessing across separate systems.
+<br><strong>Production example:</strong> Clicking a trace ID in a Grafana dashboard exemplar to jump directly to the exact log lines for that request in Loki.
+<br><strong>Common mistake:</strong> Instrumenting metrics, logs, and traces independently without propagating a shared identifier, leaving them siloed and hard to correlate during an incident.</div></details>
+
+<details class="qa"><summary>8. Why does 100% trace sampling in a high-traffic service create operational problems?</summary>
+<div class="qa-body"><strong>Short answer:</strong> It overwhelms the tracing backend's storage and cost budget, since every single request generates a full multi-span trace.
+<br><strong>Detail:</strong> Most production tracing setups use sampling strategies (e.g. tail-based sampling favoring error/slow traces) rather than capturing every request at full fidelity, trading some completeness for sustainable cost and backend load.
+<br><strong>Production example:</strong> A high-throughput checkout-service reducing trace sampling to 5% of normal requests while always sampling error responses.
+<br><strong>Common mistake:</strong> Enabling 100% sampling everywhere "to be thorough" and then hitting tracing backend cost/performance limits within days.</div></details>
+
+<details class="qa"><summary>9. Why must platform-layer observability (API Server, etcd, kubelet) be monitored separately from application-level observability?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Application instrumentation says nothing about the health of the control plane or node runtime beneath it, which can independently degrade or fail.
+<br><strong>Detail:</strong> API Server request latency and etcd fsync latency are control-plane health signals that application-level dashboards would never surface, yet control-plane degradation can affect every workload in the cluster.
+<br><strong>Production example:</strong> Monitoring etcd's fsync latency metric separately from any application dashboard, since a slow etcd disk can degrade the entire cluster's responsiveness regardless of application code.
+<br><strong>Common mistake:</strong> Building comprehensive application dashboards while having zero visibility into API Server or etcd health, missing a whole class of cluster-wide incidents.</div></details>
+
+<details class="qa"><summary>10. How do the three pillars typically compose during a real incident investigation?</summary>
+<div class="qa-body"><strong>Short answer:</strong> A metric spike signals something broke; logs filtered to that window/service surface the specific error; a trace for a slow/failing request pinpoints the exact bottleneck hop.
+<br><strong>Detail:</strong> This is a deliberate workflow, not a coincidence — each pillar is optimized for a different granularity of question, and mature incident response moves through them in that "detect, narrow, pinpoint" order.
+<br><strong>Production example:</strong> An error-rate alert fires (metric) → logs for that 5-minute window filtered by service=checkout show a specific exception (log) → a trace for one such failed request shows the downstream payment-gateway call timing out (trace).
+<br><strong>Common mistake:</strong> Jumping straight into logs or traces without first using metrics to narrow down the relevant time window and affected service, wasting investigation time searching broadly.</div></details>
+
+<details class="qa"><summary>11–50. Additional rapid-fire questions</summary>
+<div class="qa-body">
+<strong>11.</strong> What are the three pillars of observability? — Metrics, logs, and traces.<br>
+<strong>12.</strong> What exposes per-container CPU/memory/network metrics? — kubelet's cAdvisor.<br>
+<strong>13.</strong> What translates Kubernetes object state into Prometheus-format metrics? — kube-state-metrics.<br>
+<strong>14.</strong> What component commonly ships container stdout/stderr logs off-node? — A log shipper DaemonSet (Fluent Bit, Fluentd, Vector).<br>
+<strong>15.</strong> What's a common tracing SDK/standard used to instrument applications? — OpenTelemetry.<br>
+<strong>16.</strong> What kubectl command gives a quick metrics snapshot (requires metrics-server)? — <code>kubectl top pods</code>.<br>
+<strong>17.</strong> What kubectl command aggregates logs across all replicas of a label selector? — <code>kubectl logs -l app=&lt;name&gt; --all-containers --prefix</code>.<br>
+<strong>18.</strong> What kubectl command shows Kubernetes-level "what happened" events? — <code>kubectl get events --sort-by=.lastTimestamp</code>.<br>
+<strong>19.</strong> Which pillar is cheapest to store and query at scale? — Metrics.<br>
+<strong>20.</strong> Which pillar carries the richest per-event detail like a stack trace? — Logs.<br>
+<strong>21.</strong> Which pillar shows exactly which downstream service call was the bottleneck? — Traces.<br>
+<strong>22.</strong> What's a "span" in distributed tracing? — One recorded hop/unit of work within a trace, with its own timing.<br>
+<strong>23.</strong> Does the API Server expose its own /metrics endpoint? — Yes, exposing request latency and etcd interaction latency among other signals.<br>
+<strong>24.</strong> What Kubernetes-level signal complements metrics/logs/traces for platform visibility? — Kubernetes Events (Scheduled, Pulled, OOMKilled, etc.).<br>
+<strong>25.</strong> What's the risk of unstructured, freeform log lines? — They can't be reliably filtered/queried under incident pressure.<br>
+<strong>26.</strong> Why retrofit tracing/structured logs later rather than from day one? — It's far more expensive — instrumenting after the fact means gaps in historical data and rushed implementation under pressure.<br>
+<strong>27.</strong> What's a Grafana "exemplar"? — A link embedded in a metric data point pointing to a representative trace for that measurement.<br>
+<strong>28.</strong> Is Grafana itself a metrics/log/trace storage backend? — No, it's a stateless visualization layer querying separate backends (Prometheus, Loki, Jaeger/Tempo).<br>
+<strong>29.</strong> What annotation commonly tells a Prometheus scrape config to pick up a Pod? — <code>prometheus.io/scrape: "true"</code>.<br>
+<strong>30.</strong> What's the operational cost tradeoff of storing logs at high volume? — Expensive storage and slower search compared to metrics' cheap aggregation.<br>
+<strong>31.</strong> Why are counters in metrics considered "meaningless" without a rate function? — Raw counters only ever increase; you need a rate over a time window to get a meaningful per-second measure.<br>
+<strong>32.</strong> What's a common log backend paired with Kubernetes log shippers? — Loki or Elasticsearch.<br>
+<strong>33.</strong> What's a common tracing backend paired with OpenTelemetry? — Jaeger or Tempo.<br>
+<strong>34.</strong> Does observability require shipping new code to answer new questions? — Ideally no — that's the definition of good observability: answering arbitrary questions from existing external outputs.<br>
+<strong>35.</strong> What's the risk of only alerting on application-level metrics and ignoring platform metrics? — Missing control-plane-level incidents (API Server or etcd degradation) that affect every workload.<br>
+<strong>36.</strong> Why is correlating metrics-to-traces valuable during an incident? — It lets you jump from "something is statistically wrong" directly to "here's a concrete example request showing why."<br>
+<strong>37.</strong> What's a common mistake when instrumenting metrics with labels? — Using unbounded-value fields (user IDs, request IDs) as labels, causing cardinality explosion.<br>
+<strong>38.</strong> Does `kubectl describe pod` pull from logs, metrics, or traces? — None directly — it shows spec/status and Events, useful for cross-referencing timestamps against the other pillars.<br>
+<strong>39.</strong> What's the benefit of structured (JSON) logs over freeform text logs? — Reliable field-based filtering/querying at scale instead of fragile text pattern matching.<br>
+<strong>40.</strong> Why might full 100% trace sampling be acceptable for a low-traffic internal service? — The overall trace volume stays low enough that backend cost/performance isn't a concern.<br>
+<strong>41.</strong> What's the relationship between OOMKilled events and the three pillars? — The Event itself is a platform signal; metrics show the memory trend leading up to it; logs may show the process's last output before termination.<br>
+<strong>42.</strong> Can traces alone tell you the aggregate error rate across all requests? — Not efficiently — that's what metrics are optimized for; traces are best for deep-diving individual requests.<br>
+<strong>43.</strong> What's a "tail-based" sampling strategy in tracing? — Deciding whether to keep a trace after seeing its full outcome (e.g. always keep error/slow traces, sample the rest).<br>
+<strong>44.</strong> Why is kubelet's cAdvisor data considered node-level rather than purely application-level? — It measures actual container resource consumption on the node's cgroups, not application-emitted business metrics.<br>
+<strong>45.</strong> What's a good first alerting signal for "something is degrading" cluster-wide? — Aggregate error-rate or latency metrics, rather than individual log lines.<br>
+<strong>46.</strong> Does observability tooling need to account for Pods being rescheduled mid-incident? — Yes — correlation must survive Pod identity changes, which is why centralized aggregation (not per-Pod log files) is essential.<br>
+<strong>47.</strong> What's the danger of only monitoring averages instead of percentiles for latency? — Averages hide tail latency spikes that a small but significant fraction of users actually experience.<br>
+<strong>48.</strong> How does correlating metrics/logs/traces reduce mean-time-to-resolution (MTTR)? — It collapses what would be several manual context-switches and time-window guesses into direct pivots between systems.<br>
+<strong>49.</strong> What's a reasonable order of investigation during an incident using the three pillars? — Metrics to detect and scope, logs to narrow the specific error, traces to pinpoint the exact bottleneck.<br>
+<strong>50.</strong> What's the first thing to check when a service's dashboard shows nothing at all (no data)? — Whether the scrape/log-shipping/tracing pipeline itself is functioning — e.g. missing prometheus.io annotations, a crashed log shipper DaemonSet, or a misconfigured OTEL exporter endpoint.
+</div></details>
+
+<footer class="course-footer">Next: Topic 51 — Prometheus, the de facto standard for Kubernetes metrics collection.</footer>
+
+<script>
+  mermaid.initialize({ startOnLoad: true, theme: 'dark' });
+</script>
+
+</body>
+</html>

@@ -1,0 +1,322 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Topic 41: RBAC — Kubernetes Expert Course</title>
+<link rel="stylesheet" href="styles.css">
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+</head>
+<body>
+
+<header class="course-header">
+  <div class="kicker">Topic 41 of 70</div>
+  <h1>RBAC (Role-Based Access Control)</h1>
+  <div class="subtitle">Who can do what, to which resources, in which namespaces — enforced at the API Server on every single request.</div>
+</header>
+
+<nav class="topic-nav">
+  <a href="40-health-probes.html">&larr; Health Probes</a>
+  <a href="index.html">Course Index</a>
+  <a href="42-service-accounts.html">Service Accounts &rarr;</a>
+</nav>
+
+<h2 id="explanation">Explanation</h2>
+<p><strong>RBAC (Role-Based Access Control)</strong> is Kubernetes' native authorization system: it decides, for every
+request that reaches the API Server, whether the authenticated identity is allowed to perform the requested verb
+(get, list, create, delete, etc.) on the requested resource (pods, secrets, deployments, etc.) in the requested
+namespace. RBAC runs as the <strong>authorization</strong> step of the API Server's request pipeline — strictly after
+authentication (who are you?) and strictly before admission control (should this specific object be allowed?). If
+RBAC denies a request, it never even reaches admission webhooks or etcd.</p>
+
+<p>Kubernetes needs RBAC because a cluster is a shared, multi-tenant system by default — every user, CI pipeline,
+in-cluster controller, and Pod-attached identity (via a ServiceAccount, topic 42) talks to the exact same API Server.
+Without an authorization layer, anyone who could authenticate at all could do anything: read every Secret, delete any
+Deployment, escalate their own privileges. RBAC is what makes "least privilege" enforceable rather than aspirational —
+every identity gets exactly the verbs on exactly the resources it needs, nothing more.</p>
+
+<p>RBAC is built from four object types, always used in pairs:</p>
+<ul>
+  <li><strong>Role</strong> — a set of permission rules (verbs + resources + apiGroups) scoped to a single namespace.</li>
+  <li><strong>ClusterRole</strong> — the same kind of rule set, but scoped cluster-wide (or reusable across namespaces); required for cluster-scoped resources like Nodes or PersistentVolumes, which have no namespace to bind a Role to.</li>
+  <li><strong>RoleBinding</strong> — grants the permissions in a Role (or a ClusterRole, used namespace-scoped) to a specific user, group, or ServiceAccount, within one namespace.</li>
+  <li><strong>ClusterRoleBinding</strong> — grants the permissions in a ClusterRole to a subject cluster-wide, across every namespace.</li>
+</ul>
+
+<p>A Role/ClusterRole's rules are built from three dimensions that must all match for a permission to apply:
+<code>apiGroups</code> (e.g. <code>""</code> for core resources like Pods, <code>apps</code> for Deployments,
+<code>rbac.authorization.k8s.io</code> for RBAC objects themselves), <code>resources</code> (the plural resource name,
+e.g. <code>pods</code>, <code>pods/log</code> for the log subresource, <code>secrets</code>), and <code>verbs</code>
+(<code>get</code>, <code>list</code>, <code>watch</code>, <code>create</code>, <code>update</code>, <code>patch</code>,
+<code>delete</code>, <code>deletecollection</code>). RBAC in Kubernetes is purely additive/allow-based — there is no
+explicit "deny" rule; a request is authorized if <em>any</em> binding grants it, and denied by default otherwise.</p>
+
+<p>In production, least-privilege RBAC design means granting the narrowest possible <code>resources</code>/<code>verbs</code>
+combination per identity — a monitoring ServiceAccount gets <code>get, list, watch</code> on Pods/Nodes/metrics, never
+<code>create</code> or <code>delete</code>; a CI/CD ServiceAccount deploying to one namespace gets a Role (not a
+ClusterRole) scoped to that namespace only. A common and dangerous anti-pattern is binding
+<code>cluster-admin</code> broadly "to get things working," which silently grants unrestricted access to every
+resource in every namespace, including Secrets and RBAC objects themselves (a direct privilege-escalation path).</p>
+
+<div class="callout danger">
+  <strong>Privilege escalation risk:</strong> any identity with <code>create</code>/<code>update</code> permission on
+  <code>roles</code>, <code>rolebindings</code>, <code>clusterroles</code>, or <code>clusterrolebindings</code> can, in
+  many configurations, grant itself additional permissions — Kubernetes has explicit escalation-prevention checks, but
+  the safest posture is to treat RBAC-object write access itself as one of the most sensitive permissions in the
+  cluster and restrict it to platform admins only.
+</div>
+
+<h2 id="internal-working">Internal Working / Interactions</h2>
+<ul>
+  <li><strong>API Server:</strong> runs the RBAC authorizer as part of its request-handling chain, for every single request, immediately after authentication and before admission control — this happens on the hot path of literally every API call.</li>
+  <li><strong>Authentication layer:</strong> supplies the identity (username, groups, or ServiceAccount) that RBAC then checks bindings against — RBAC never authenticates, it only authorizes an already-established identity.</li>
+  <li><strong>etcd:</strong> Roles, ClusterRoles, RoleBindings, and ClusterRoleBindings are ordinary API objects stored in etcd like anything else, watched/cached by the API Server for fast lookup on every request.</li>
+  <li><strong>ServiceAccount controller / kubelet:</strong> ServiceAccounts (topic 42) are the identity RBAC most commonly authorizes for in-cluster callers (Pods, controllers) — the RBAC layer treats a ServiceAccount exactly like a user for binding purposes.</li>
+  <li><strong>Admission webhooks:</strong> run strictly after RBAC authorization succeeds — a webhook can further restrict or mutate a request, but RBAC has already gated whether the request is considered at all.</li>
+</ul>
+
+<h2 id="architecture-diagram">Architecture Diagram</h2>
+<pre class="mermaid">
+flowchart TB
+    REQ["Request: get pods in ns=payments\nas ServiceAccount ci-deployer"] --> AUTHN["Authentication\n(verify token/cert)"]
+    AUTHN --> AUTHZ["RBAC Authorizer"]
+    AUTHZ --> LOOKUP["Find all RoleBindings/ClusterRoleBindings\nfor subject 'ci-deployer' in namespace 'payments'"]
+    LOOKUP --> ROLE["Role: payments/deployer-role\nverbs: get,list,create,update on deployments,pods"]
+    ROLE --> MATCH{"Does any rule match\nverb=get, resource=pods?"}
+    MATCH -->|"Yes"| ALLOW["Request allowed - continue to Admission Control"]
+    MATCH -->|"No matching rule anywhere"| DENY["403 Forbidden"]
+</pre>
+
+<pre class="mermaid">
+sequenceDiagram
+    participant U as ci-deployer (ServiceAccount)
+    participant A as API Server
+    participant Authn as Authn Module
+    participant Authz as RBAC Authorizer
+    participant E as etcd
+
+    U->>A: GET /api/v1/namespaces/payments/pods (Bearer token)
+    A->>Authn: Verify token, resolve identity
+    Authn-->>A: Identity = system:serviceaccount:payments:ci-deployer
+    A->>Authz: Is this identity allowed verb=get resource=pods ns=payments?
+    Authz->>E: Look up RoleBindings for this subject
+    E-->>Authz: RoleBinding -> Role "deployer-role" (get,list,create,update)
+    Authz-->>A: Allowed
+    A->>E: Fetch pods
+    E-->>A: Pod list
+    A-->>U: 200 OK with pod list
+</pre>
+
+<h2 id="code-example">Code Example</h2>
+<pre><code>apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: deployer-role
+  namespace: payments             # Role is namespace-scoped - only applies within "payments"
+rules:
+  - apiGroups: ["apps"]            # Deployments live in the "apps" API group
+    resources: ["deployments"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+  - apiGroups: [""]                # core API group (empty string) for Pods
+    resources: ["pods", "pods/log"]
+    verbs: ["get", "list", "watch"]
+    # Deliberately NO "delete" or "create" on pods - CI can update Deployments,
+    # but pod lifecycle is left to the Deployment controller, not the CI identity directly.
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ci-deployer-binding
+  namespace: payments
+subjects:
+  - kind: ServiceAccount
+    name: ci-deployer
+    namespace: payments
+roleRef:                          # binds the Role above to the subject above
+  kind: Role
+  name: deployer-role
+  apiGroup: rbac.authorization.k8s.io
+</code></pre>
+
+<pre><code>apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: read-only-monitoring
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "nodes", "services", "endpoints"]
+    verbs: ["get", "list", "watch"]      # strictly read-only, cluster-wide
+  - apiGroups: ["metrics.k8s.io"]
+    resources: ["pods", "nodes"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: monitoring-binding
+subjects:
+  - kind: ServiceAccount
+    name: prometheus
+    namespace: monitoring
+roleRef:
+  kind: ClusterRole
+  name: read-only-monitoring
+  apiGroup: rbac.authorization.k8s.io
+</code></pre>
+
+<h2 id="kubectl-commands">kubectl Commands</h2>
+<pre><code># Check whether an identity CAN perform an action (the single most useful RBAC debug command)
+kubectl auth can-i create deployments --namespace payments --as system:serviceaccount:payments:ci-deployer
+
+# List all roles/rolebindings in a namespace
+kubectl get roles,rolebindings -n payments
+
+# List all clusterroles/clusterrolebindings cluster-wide
+kubectl get clusterroles,clusterrolebindings
+
+# Describe a role to see exact rules granted
+kubectl describe role deployer-role -n payments
+
+# Find every binding referencing a specific ServiceAccount
+kubectl get rolebindings,clusterrolebindings -A -o json | jq '.items[] | select(.subjects[]?.name=="ci-deployer")'
+
+# Audit who has cluster-admin (a critical security review command)
+kubectl get clusterrolebindings -o json | jq '.items[] | select(.roleRef.name=="cluster-admin")'
+</code></pre>
+
+<h2 id="best-practices">Best Practices &amp; Common Pitfalls</h2>
+<div class="grid-2">
+<div>
+<h4>Do's</h4>
+<ul>
+  <li>Design Roles around the minimum verb/resource set an identity actually needs — audit and tighten regularly.</li>
+  <li>Prefer namespaced Role + RoleBinding over ClusterRole + ClusterRoleBinding unless cluster-wide scope is genuinely required.</li>
+  <li>Use <code>kubectl auth can-i</code> in CI to validate expected permissions before deploying RBAC changes.</li>
+  <li>Treat write access to RBAC objects themselves (roles, bindings) as a highly privileged permission, restricted to platform admins.</li>
+</ul>
+</div>
+<div>
+<h4>Don'ts</h4>
+<ul>
+  <li>Don't bind <code>cluster-admin</code> to application ServiceAccounts "to unblock" a permission error — diagnose the actual missing rule instead.</li>
+  <li>Don't grant wildcard <code>resources: ["*"]</code>/<code>verbs: ["*"]</code> rules except for genuinely cluster-admin-equivalent identities.</li>
+  <li>Don't forget Secrets read access is extremely sensitive — <code>get</code> on <code>secrets</code> is close to equivalent to broad credential access.</li>
+  <li>Don't assume RBAC alone is sufficient isolation — combine with NetworkPolicies and Pod Security Standards for full workload isolation.</li>
+</ul>
+</div>
+</div>
+
+<h2 id="interview-questions">50 Interview Questions</h2>
+
+<details class="qa"><summary>1. Where does RBAC fit in the API Server's request pipeline?</summary>
+<div class="qa-body"><strong>Short answer:</strong> RBAC runs as the authorization step, strictly after authentication (who are you?) and strictly before admission control (should this specific object be allowed?).
+<br><strong>Detail:</strong> If RBAC denies a request, it never reaches admission webhooks or etcd — authorization is a hard gate that happens on every single API request.
+<br><strong>Production example:</strong> A request to <code>get pods</code> as ServiceAccount ci-deployer passes authentication, then RBAC checks bindings before the request is ever considered by any admission webhook.
+<br><strong>Common mistake:</strong> Assuming admission webhooks run before or independently of RBAC — they strictly run after RBAC has already authorized the request.</div></details>
+
+<details class="qa"><summary>2. Name RBAC's four object types and explain how they pair up.</summary>
+<div class="qa-body"><strong>Short answer:</strong> Role (namespaced rule set) pairs with RoleBinding (grants it to a subject within one namespace); ClusterRole (cluster-wide rule set) pairs with ClusterRoleBinding (grants it to a subject cluster-wide).
+<br><strong>Detail:</strong> A ClusterRole can also be used namespace-scoped via a RoleBinding — useful for reusing a common rule set across many namespaces without duplicating it as separate Roles.
+<br><strong>Production example:</strong> deployer-role (Role) + ci-deployer-binding (RoleBinding) scope CI's permissions to the payments namespace only; read-only-monitoring (ClusterRole) + monitoring-binding (ClusterRoleBinding) grant Prometheus cluster-wide read access.
+<br><strong>Common mistake:</strong> Assuming a ClusterRole always grants cluster-wide access — it only does so when bound via a ClusterRoleBinding; bound via a RoleBinding, its scope is limited to that one namespace.</div></details>
+
+<details class="qa"><summary>3. Why must ClusterRole be used for resources like Nodes or PersistentVolumes?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Because those resources are cluster-scoped — they have no namespace at all, so there's no namespace to bind a Role to.
+<br><strong>Detail:</strong> A Role's rules can only ever apply within the single namespace it's created in; any resource kind without a namespace field is structurally incompatible with a Role, requiring a ClusterRole regardless of how it's bound.
+<br><strong>Production example:</strong> read-only-monitoring includes <code>nodes</code> in its rules, which only makes sense as a ClusterRole since Nodes aren't namespaced.
+<br><strong>Common mistake:</strong> Attempting to grant access to a cluster-scoped resource via a namespaced Role — it simply can't reference such resources correctly.</div></details>
+
+<details class="qa"><summary>4. What three dimensions must all match for an RBAC rule to authorize a request?</summary>
+<div class="qa-body"><strong>Short answer:</strong> <code>apiGroups</code> (e.g. <code>""</code> for core, <code>apps</code> for Deployments), <code>resources</code> (plural resource name, e.g. <code>pods</code>, <code>pods/log</code>), and <code>verbs</code> (get, list, watch, create, update, patch, delete, deletecollection).
+<br><strong>Detail:</strong> All three must match simultaneously — a rule granting <code>get</code> on <code>pods</code> in the core group says nothing about <code>get</code> on <code>pods/log</code>, which is a distinct resource requiring its own explicit grant.
+<br><strong>Production example:</strong> deployer-role explicitly lists both <code>pods</code> and <code>pods/log</code> as separate resource entries because the log subresource needs its own rule.
+<br><strong>Common mistake:</strong> Assuming a grant on a resource automatically covers its subresources (like <code>/log</code> or <code>/exec</code>) — subresources require explicit separate entries.</div></details>
+
+<details class="qa"><summary>5. Is RBAC allow-based or deny-based, and what does that imply about combining rules?</summary>
+<div class="qa-body"><strong>Short answer:</strong> RBAC is purely additive/allow-based — there is no explicit "deny" rule; a request is authorized if any binding grants it, denied by default otherwise.
+<br><strong>Detail:</strong> This means multiple Roles/ClusterRoles bound to the same subject are cumulative — you can't use a second binding to subtract or restrict a permission already granted elsewhere.
+<br><strong>Production example:</strong> If ci-deployer somehow had two RoleBindings, one broad and one narrow, the broad one's grants still apply — the narrow one can't revoke them.
+<br><strong>Common mistake:</strong> Trying to "restrict" an identity's access by adding a more limited binding, expecting it to override a broader one already in place — RBAC has no such override/deny mechanism.</div></details>
+
+<details class="qa"><summary>6. Why is granting an identity write access to RBAC objects themselves considered high-risk?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Any identity with <code>create</code>/<code>update</code> permission on roles, rolebindings, clusterroles, or clusterrolebindings can, in many configurations, grant itself additional permissions — a direct privilege-escalation path.
+<br><strong>Detail:</strong> Kubernetes has explicit escalation-prevention checks, but the safest posture is treating RBAC-object write access as one of the most sensitive permissions in the cluster, restricted to platform admins only.
+<br><strong>Production example:</strong> A ServiceAccount able to create RoleBindings could bind itself to a broader ClusterRole it wasn't originally granted, effectively escalating its own privileges.
+<br><strong>Common mistake:</strong> Granting a CI/CD identity broad create/update access on RBAC objects "to manage its own permissions," inadvertently opening a self-escalation path.</div></details>
+
+<details class="qa"><summary>7. Why does RBAC treat a ServiceAccount exactly like a user for binding purposes?</summary>
+<div class="qa-body"><strong>Short answer:</strong> ServiceAccounts (topic 42) are the identity RBAC most commonly authorizes for in-cluster callers (Pods, controllers), and the RBAC layer subjects them to the exact same Role/ClusterRole binding mechanism as human users or groups.
+<br><strong>Detail:</strong> This uniformity means the same least-privilege design principles apply regardless of whether the "subject" in a binding is a human, a group, or a ServiceAccount.
+<br><strong>Production example:</strong> ci-deployer-binding lists a ServiceAccount as its subject in exactly the same <code>subjects</code> array shape a User or Group subject would use.
+<br><strong>Common mistake:</strong> Assuming ServiceAccounts get special implicit permissions beyond what's explicitly bound — they're authorized through the identical RBAC mechanism as any other subject.</div></details>
+
+<details class="qa"><summary>8. What is the most useful single command for debugging an RBAC permission issue, and why?</summary>
+<div class="qa-body"><strong>Short answer:</strong> <code>kubectl auth can-i &lt;verb&gt; &lt;resource&gt; --as &lt;identity&gt;</code> — it directly answers "would this specific request be authorized" without needing to manually trace bindings and rules.
+<br><strong>Detail:</strong> It's also usable proactively in CI to validate expected permissions before deploying RBAC changes, rather than discovering a gap only when a real deployment fails with 403.
+<br><strong>Production example:</strong> <code>kubectl auth can-i create deployments --namespace payments --as system:serviceaccount:payments:ci-deployer</code> confirms whether ci-deployer-binding actually grants the expected access.
+<br><strong>Common mistake:</strong> Manually cross-referencing Roles and RoleBindings by hand to guess whether access is granted, instead of directly asking the API Server via <code>auth can-i</code>.</div></details>
+
+<details class="qa"><summary>9. Why is binding <code>cluster-admin</code> broadly considered a dangerous anti-pattern?</summary>
+<div class="qa-body"><strong>Short answer:</strong> It silently grants unrestricted access to every resource in every namespace, including Secrets and RBAC objects themselves — a direct privilege-escalation path if bound to anything less than a fully trusted platform-admin identity.
+<br><strong>Detail:</strong> Teams often reach for it "to get things working" when they hit an unexpected 403, which papers over the real missing rule instead of diagnosing and granting the specific narrow permission actually needed.
+<br><strong>Production example:</strong> Auditing via <code>kubectl get clusterrolebindings -o json | jq '.items[] | select(.roleRef.name=="cluster-admin")'</code> is called out as a critical security review command specifically because of this risk.
+<br><strong>Common mistake:</strong> Binding <code>cluster-admin</code> to an application ServiceAccount to unblock a permission error rather than diagnosing the actual missing rule.</div></details>
+
+<details class="qa"><summary>10. Why is read access to Secrets treated as an especially sensitive RBAC grant?</summary>
+<div class="qa-body"><strong>Short answer:</strong> <code>get</code> on <code>secrets</code> is close to equivalent to broad credential access, since Secrets typically store the very credentials that would otherwise require separate compromise to obtain.
+<br><strong>Detail:</strong> This makes Secret-read grants deserve the same scrutiny as granting direct credential access, not routine data-read access — the resource name matters as much as the verb.
+<br><strong>Production example:</strong> deployer-role deliberately grants no access to Secrets at all, keeping the CI identity's blast radius limited to Deployments and read-only Pod visibility.
+<br><strong>Common mistake:</strong> Treating <code>get</code>/<code>list</code> on Secrets as routine read access equivalent in sensitivity to reading Pods or Deployments.</div></details>
+
+<details class="qa"><summary>11–50. Additional rapid-fire questions</summary>
+<div class="qa-body">
+<strong>11.</strong> What does RBAC stand for? — Role-Based Access Control.<br>
+<strong>12.</strong> What API group serves RBAC objects themselves? — <code>rbac.authorization.k8s.io</code>.<br>
+<strong>13.</strong> What apiVersion is used for Role/ClusterRole/RoleBinding/ClusterRoleBinding? — <code>rbac.authorization.k8s.io/v1</code>.<br>
+<strong>14.</strong> What apiGroup value refers to core resources like Pods? — The empty string <code>""</code>.<br>
+<strong>15.</strong> What apiGroup do Deployments belong to? — <code>apps</code>.<br>
+<strong>16.</strong> What field on a RoleBinding/ClusterRoleBinding names the Role/ClusterRole being granted? — <code>roleRef</code>.<br>
+<strong>17.</strong> What field on a RoleBinding/ClusterRoleBinding lists who receives the grant? — <code>subjects</code>.<br>
+<strong>18.</strong> What kinds of subjects can appear in a binding? — User, Group, or ServiceAccount.<br>
+<strong>19.</strong> Is a Role's <code>metadata.namespace</code> field required? — Yes — a Role is inherently scoped to the namespace it's created in.<br>
+<strong>20.</strong> Does a ClusterRole have a namespace field? — No — it's cluster-scoped by definition.<br>
+<strong>21.</strong> What command lists all roles/rolebindings in a namespace? — <code>kubectl get roles,rolebindings -n &lt;namespace&gt;</code>.<br>
+<strong>22.</strong> What command lists all clusterroles/clusterrolebindings cluster-wide? — <code>kubectl get clusterroles,clusterrolebindings</code>.<br>
+<strong>23.</strong> What command describes a Role to see its exact rules? — <code>kubectl describe role &lt;name&gt; -n &lt;namespace&gt;</code>.<br>
+<strong>24.</strong> How would you find every binding referencing a specific ServiceAccount? — <code>kubectl get rolebindings,clusterrolebindings -A -o json | jq</code> filtering on <code>.subjects[]?.name</code>.<br>
+<strong>25.</strong> What's a wildcard rule that should almost never be granted except to genuinely admin-equivalent identities? — <code>resources: ["*"]</code> / <code>verbs: ["*"]</code>.<br>
+<strong>26.</strong> What verb lets you delete every object matching a selector in one call? — <code>deletecollection</code>.<br>
+<strong>27.</strong> What's the minimal verb set typically granted to a monitoring ServiceAccount? — <code>get, list, watch</code> — never create or delete.<br>
+<strong>28.</strong> What API group serves metrics used by monitoring ClusterRoles? — <code>metrics.k8s.io</code>.<br>
+<strong>29.</strong> What's the preferred scope for a CI/CD ServiceAccount deploying to one namespace? — A Role scoped to that namespace, not a ClusterRole.<br>
+<strong>30.</strong> Why is namespaced Role+RoleBinding generally preferred over ClusterRole+ClusterRoleBinding? — It keeps blast radius limited to one namespace unless cluster-wide scope is genuinely required.<br>
+<strong>31.</strong> Does RBAC ever authenticate an identity itself? — No — RBAC only authorizes an already-established identity; authentication is a separate, earlier step.<br>
+<strong>32.</strong> What happens to a request if no binding grants the requested verb/resource/apiGroup combination? — It's denied by default with a 403 Forbidden.<br>
+<strong>33.</strong> Where are Role/ClusterRole/RoleBinding/ClusterRoleBinding objects stored? — In etcd, like any other ordinary API object.<br>
+<strong>34.</strong> How does the API Server perform RBAC lookups efficiently on every request? — By watching/caching these objects rather than reading etcd directly on every single authorization check.<br>
+<strong>35.</strong> What's a realistic reason a Role would deliberately omit <code>delete</code> on Pods? — To leave Pod lifecycle management to the Deployment controller rather than letting the CI identity delete Pods directly.<br>
+<strong>36.</strong> Can a single ClusterRole be reused across many namespaces via different RoleBindings? — Yes — that's one of its main advantages over duplicating the same rules as separate Roles per namespace.<br>
+<strong>37.</strong> What's the risk of granting <code>create</code>/<code>update</code> on <code>clusterrolebindings</code> broadly? — It's one of the clearest privilege-escalation paths, letting a subject grant itself cluster-wide access.<br>
+<strong>38.</strong> Why should RBAC never be treated as the sole isolation mechanism? — It governs API-level access only — combine with NetworkPolicies and Pod Security Standards for full workload isolation.<br>
+<strong>39.</strong> What's a realistic scenario where an over-broad ClusterRoleBinding causes an incident? — A monitoring ServiceAccount bound cluster-admin instead of read-only-monitoring accidentally gains delete access to every resource in every namespace.<br>
+<strong>40.</strong> What does the <code>pods/log</code> resource name represent? — The log subresource of Pods, requiring a separate explicit RBAC rule from plain <code>pods</code> access.<br>
+<strong>41.</strong> Is it possible to bind a ClusterRole via a RoleBinding instead of a ClusterRoleBinding? — Yes — this scopes the ClusterRole's rules down to just the RoleBinding's namespace.<br>
+<strong>42.</strong> What's the value of running <code>kubectl auth can-i</code> in CI before deploying RBAC changes? — It validates expected permissions proactively, catching gaps before a real deployment fails with 403.<br>
+<strong>43.</strong> Why is RBAC described as running "on the hot path of literally every API call"? — Because the API Server's authorizer chain evaluates it for every single request, not just a subset.<br>
+<strong>44.</strong> What's the danger of using overly broad resource lists like <code>["pods", "deployments", "secrets"]</code> with <code>verbs: ["*"]</code>? — It grants full CRUD including delete on highly sensitive resources like Secrets, far beyond typical least-privilege needs.<br>
+<strong>45.</strong> What's the relationship between RBAC and audit logging in a security review? — RBAC defines what's allowed; audit logs record what was actually done — reviewing cluster-admin bindings (as in the earlier example) is a proactive check that complements after-the-fact audit review.<br>
+<strong>46.</strong> Why is it good practice to audit and tighten Roles regularly rather than set once? — Actual usage patterns evolve, and unused overly-broad grants accumulate as unnecessary risk over time.<br>
+<strong>47.</strong> What's the first thing to check when a Pod's ServiceAccount gets an unexpected 403? — Whether a RoleBinding/ClusterRoleBinding actually exists for that ServiceAccount granting the specific verb/resource/apiGroup being requested.<br>
+<strong>48.</strong> Why does the order "Authn -> RBAC -> Admission" matter for security design? — It ensures unauthorized identities never even reach admission webhooks or etcd, minimizing the attack surface exposed to unauthenticated or unauthorized callers.<br>
+<strong>49.</strong> What's a good way to verify no unexpected identity holds cluster-admin? — Periodically running the jq-based audit command against <code>clusterrolebindings</code> filtering on <code>roleRef.name=="cluster-admin"</code>.<br>
+<strong>50.</strong> What's the one-line interview summary of RBAC? — An additive, allow-only authorization layer enforced on every API Server request between authentication and admission control, built from Role/ClusterRole rule sets bound to subjects via RoleBinding/ClusterRoleBinding.
+</div></details>
+
+<footer class="course-footer">Next up: Topic 42 — Service Accounts, the identity RBAC most commonly authorizes for workloads running inside the cluster.</footer>
+
+<script>
+  mermaid.initialize({ startOnLoad: true, theme: 'dark' });
+</script>
+
+</body>
+</html>

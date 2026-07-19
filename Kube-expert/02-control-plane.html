@@ -1,0 +1,283 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Topic 2: Control Plane — Kubernetes Expert Course</title>
+<link rel="stylesheet" href="styles.css">
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+</head>
+<body>
+
+<header class="course-header">
+  <div class="kicker">Topic 2 of 70</div>
+  <h1>Control Plane</h1>
+  <div class="subtitle">The brain of the cluster: how API Server, etcd, Scheduler, Controller Manager, and Cloud Controller Manager operate together as one unit.</div>
+</header>
+
+<nav class="topic-nav">
+  <a href="01-kubernetes-architecture.html">&larr; Kubernetes Architecture</a>
+  <a href="index.html">Course Index</a>
+  <a href="03-worker-nodes.html">Worker Nodes &rarr;</a>
+</nav>
+
+<h2 id="explanation">Explanation</h2>
+<p>The <strong>control plane</strong> is not a single process — it's a set of independent components that collectively
+make global decisions about the cluster and detect/respond to cluster-wide events. In a self-managed cluster (e.g.
+kubeadm), these components are: the <strong>API Server</strong> (the front door), <strong>etcd</strong> (the source of
+truth), the <strong>Scheduler</strong> (decides pod placement), the <strong>Controller Manager</strong> (runs
+reconciliation loops), and — if running on a cloud provider — the <strong>Cloud Controller Manager</strong> (bridges
+cluster concepts like LoadBalancer Services to cloud-specific APIs).</p>
+
+<p>Kubernetes needs this as a distinct layer because someone has to hold the cluster's desired state durably, decide
+where workloads run, and continuously reconcile reality toward that desired state — all while tolerating the failure
+of any individual node, including a control-plane node itself. Separating these concerns into independently
+replaceable processes (rather than one monolithic binary) is what lets each piece scale, fail, and be upgraded on its
+own schedule.</p>
+
+<p>Architecturally, every control-plane component except etcd is designed to be <strong>stateless</strong> — they hold
+no durable data of their own, only in-memory caches populated by watching the API Server. That's what makes the API
+Server horizontally scalable (any number of replicas behind a load balancer) while the Scheduler and Controller
+Manager use <strong>leader election</strong> to guarantee only one active instance makes decisions at a time, even
+though multiple replicas run for HA.</p>
+
+<p>In managed offerings (EKS, GKE, AKS) the cloud provider runs and hides all of this for you — you never SSH into a
+control-plane node. In self-managed clusters bootstrapped with <code>kubeadm</code>, these components run as
+<strong>static pods</strong>: kubelet on the control-plane node reads manifests directly from
+<code>/etc/kubernetes/manifests/</code> and starts them without needing the API Server to exist yet — solving the
+chicken-and-egg bootstrapping problem.</p>
+
+<p>Production teams treat the control plane as the single highest-value thing to protect: if it's down, nothing new
+can be scheduled, no failures self-heal, and no config changes apply — even though already-running Pods keep serving
+traffic for a while. This asymmetry (data plane survives briefly, control plane must be restored quickly) drives most
+HA design decisions for Kubernetes.</p>
+
+<h2 id="internal-working">Internal Working / Interactions</h2>
+<ul>
+  <li><strong>API Server &harr; etcd:</strong> the only component allowed to read/write etcd directly; every write goes through Raft consensus before being acknowledged.</li>
+  <li><strong>Scheduler &harr; API Server:</strong> watches for unscheduled Pods, writes back the chosen <code>nodeName</code>.</li>
+  <li><strong>Controller Manager &harr; API Server:</strong> runs dozens of independent controllers (Deployment, Node, Job, ...), each watching one resource type and reconciling it.</li>
+  <li><strong>Cloud Controller Manager &harr; Cloud APIs:</strong> provisions ELBs/ALBs for LoadBalancer Services, labels nodes with cloud topology, removes Node objects when the underlying VM is terminated.</li>
+  <li><strong>Leader election:</strong> Scheduler and Controller Manager each acquire a <code>Lease</code> object in <code>kube-system</code>; only the lease holder is active, others stand by.</li>
+</ul>
+
+<h2 id="architecture-diagram">Architecture Diagram</h2>
+<pre class="mermaid">
+flowchart TB
+    subgraph CP["Control Plane (3 replicas each, HA)"]
+        LB["Load Balancer / VIP"]
+        API1["API Server #1"]
+        API2["API Server #2"]
+        API3["API Server #3"]
+        ETCD[("etcd cluster (Raft quorum)")]
+        SCHED["Scheduler (leader-elected)"]
+        CM["Controller Manager (leader-elected)"]
+        CCM["Cloud Controller Manager (leader-elected)"]
+    end
+    Client["kubectl / controllers / kubelets"] --> LB
+    LB --> API1 & API2 & API3
+    API1 & API2 & API3 <--> ETCD
+    API1 & API2 & API3 <--> SCHED
+    API1 & API2 & API3 <--> CM
+    API1 & API2 & API3 <--> CCM
+</pre>
+
+<pre class="mermaid">
+sequenceDiagram
+    participant S as Scheduler (standby)
+    participant L as Lease (kube-system)
+    participant A as API Server
+    S->>A: Try to acquire Lease "kube-scheduler"
+    A->>L: Read current holder + expiry
+    alt Lease expired or empty
+        A-->>S: Grant leadership
+        S->>S: Become active, start scheduling loop
+    else Lease held by another replica
+        A-->>S: Denied, retry after renewal interval
+    end
+</pre>
+
+<h2 id="code-example">Code Example</h2>
+<pre><code># A control-plane component running as a static pod manifest,
+# read directly by kubelet from /etc/kubernetes/manifests/kube-apiserver.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: kube-apiserver
+  namespace: kube-system
+  labels:
+    component: kube-apiserver
+    tier: control-plane
+spec:
+  containers:
+    - name: kube-apiserver
+      image: registry.k8s.io/kube-apiserver:v1.29.0
+      command:
+        - kube-apiserver
+        - --etcd-servers=https://127.0.0.1:2379   # only the API Server talks to etcd
+        - --service-cluster-ip-range=10.96.0.0/12 # ClusterIP allocation range
+        - --client-ca-file=/etc/kubernetes/pki/ca.crt
+        - --enable-admission-plugins=NodeRestriction,ResourceQuota
+      livenessProbe:
+        httpGet:
+          path: /livez
+          port: 6443
+          scheme: HTTPS
+      resources:
+        requests:
+          cpu: 250m       # control-plane components should have guaranteed CPU
+  hostNetwork: true         # binds directly to the node's network namespace
+  priorityClassName: system-cluster-critical
+</code></pre>
+
+<h2 id="kubectl-commands">kubectl Commands</h2>
+<pre><code># List control-plane static pods (kubeadm clusters)
+kubectl get pods -n kube-system -l tier=control-plane
+
+# Check which replica currently holds each leader-election lease
+kubectl get lease -n kube-system
+
+# View raw control-plane component health
+kubectl get --raw='/healthz?verbose'
+
+# Describe a specific control-plane pod to see restarts/events
+kubectl describe pod kube-scheduler-controlplane-1 -n kube-system
+
+# Check API server version skew vs kubelet
+kubectl version --short
+
+# Watch control-plane pod status live
+kubectl get pods -n kube-system -w
+</code></pre>
+
+<h2 id="best-practices">Best Practices &amp; Common Pitfalls</h2>
+<div class="grid-2">
+<div>
+<h4>Best Practices</h4>
+<ul>
+  <li>Run 3 (or 5) control-plane nodes for etcd quorum and API Server HA.</li>
+  <li>Put a load balancer or VIP in front of multiple API Server replicas.</li>
+  <li>Reserve dedicated CPU/memory for control-plane static pods (<code>system-cluster-critical</code> priority class).</li>
+  <li>Prefer a managed control plane (EKS/GKE/AKS) unless you have a dedicated platform team.</li>
+</ul>
+</div>
+<div>
+<h4>Pitfalls</h4>
+<ul>
+  <li>Running only 1 or 2 control-plane nodes — no real quorum benefit over 1, and worse resilience than 3.</li>
+  <li>Co-locating untrusted workloads on control-plane nodes (security + noisy-neighbor risk).</li>
+  <li>Forgetting the Scheduler/Controller Manager only ever have ONE active leader — scaling replicas doesn't parallelize their work.</li>
+  <li>Ignoring leader-election flapping, which silently halts reconciliation cluster-wide.</li>
+</ul>
+</div>
+</div>
+
+<h2 id="interview-questions">50 Interview Questions</h2>
+
+<details class="qa"><summary>1. What components make up the Kubernetes control plane?</summary>
+<div class="qa-body"><strong>Short answer:</strong> API Server, etcd, Scheduler, Controller Manager, and (on cloud) Cloud Controller Manager.
+<br><strong>Detailed explanation:</strong> <strong>API Server</strong> is the front door and only component talking to etcd; <strong>etcd</strong> is the durable store; <strong>Scheduler</strong> assigns Pods to nodes; <strong>Controller Manager</strong> runs the reconciliation loops; <strong>CCM</strong> bridges cloud-specific APIs (LoadBalancers, node lifecycle) when running on a cloud provider.
+<br><strong>Production example:</strong> In a kubeadm cluster these run as static pods under <code>/etc/kubernetes/manifests/</code>, bootstrapped by kubelet before the API Server even exists.
+<br><strong>Common mistake:</strong> Thinking of "the control plane" as a single process rather than several independently replaceable components.</div></details>
+
+<details class="qa"><summary>2. Why are control-plane components (except etcd) designed to be stateless?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Statelessness lets the API Server scale horizontally behind a load balancer with no coordination needed between replicas.
+<br><strong>Detailed explanation:</strong> Each stateless component only holds in-memory caches populated from watching the API Server; durable truth lives solely in etcd. Any replica can be killed and replaced without data loss.
+<br><strong>Production example:</strong> Running 3 API Server replicas behind an ELB/VIP — any one can be terminated and traffic just reroutes.
+<br><strong>Common mistake:</strong> Assuming Scheduler/Controller Manager replicas also share load like the API Server does — they don't, only one is ever active (leader election).</div></details>
+
+<details class="qa"><summary>3. How does leader election work for the Scheduler and Controller Manager?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Each acquires a <code>Lease</code> object in <code>kube-system</code>; only the lease holder is active, others stand by.
+<br><strong>Detailed explanation:</strong> Standby replicas continuously try to acquire the lease; if the active holder fails to renew before expiry, a standby wins and becomes active, avoiding two instances making conflicting decisions.
+<br><strong>Production example:</strong> <code>kubectl get lease -n kube-system</code> shows the current holder identity and renewal time for <code>kube-scheduler</code>/<code>kube-controller-manager</code>.
+<br><strong>Common mistake:</strong> Expecting multiple Scheduler/Controller Manager replicas to parallelize work — they never do; more replicas only improve failover speed.</div></details>
+
+<details class="qa"><summary>4. What is a static pod and why does the control plane depend on it?</summary>
+<div class="qa-body"><strong>Short answer:</strong> A Pod started directly by kubelet from a local manifest file, with no API Server involved.
+<br><strong>Detailed explanation:</strong> kubeadm uses static pods to solve the chicken-and-egg bootstrap problem: kubelet needs to start kube-apiserver itself before any API Server exists to schedule it normally, by reading manifests from <code>/etc/kubernetes/manifests/</code>.
+<br><strong>Production example:</strong> <code>kubectl get pods -n kube-system -l tier=control-plane</code> lists these mirrored (read-only-from-kubectl) static pods.
+<br><strong>Common mistake:</strong> Trying to <code>kubectl delete</code> a static pod expecting it to stay gone — kubelet just recreates it from the file.</div></details>
+
+<details class="qa"><summary>5. Why does only the API Server talk to etcd directly?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Centralizing etcd access gives one enforcement point for authn/authz/admission and schema validation.
+<br><strong>Detailed explanation:</strong> If Scheduler, Controller Manager, or kubelets wrote to etcd directly, there'd be no consistent place to check RBAC or run webhooks — every write path would need to reimplement security independently.
+<br><strong>Production example:</strong> A ValidatingWebhookConfiguration blocking Pods without resource limits only works because every write is forced through the API Server.
+<br><strong>Common mistake:</strong> Editing etcd directly for a "quick fix" — this bypasses all admission control and can corrupt cluster state.</div></details>
+
+<details class="qa"><summary>6. What is the Cloud Controller Manager and why was it split from Controller Manager?</summary>
+<div class="qa-body"><strong>Short answer:</strong> CCM runs cloud-provider-specific logic (LoadBalancer provisioning, node lifecycle, topology labels) separately from core, cloud-agnostic controllers.
+<br><strong>Detailed explanation:</strong> Splitting it out lets cloud vendors version and ship their integration independently of core Kubernetes releases, keeping the core Controller Manager free of vendor-specific code.
+<br><strong>Production example:</strong> AWS's CCM provisions an ELB the moment you create a <code>type: LoadBalancer</code> Service.
+<br><strong>Common mistake:</strong> Assuming core Kubernetes controllers talk to cloud APIs directly — only CCM ever does.</div></details>
+
+<details class="qa"><summary>7. Why run 3 or 5 control-plane nodes instead of 2 or 4?</summary>
+<div class="qa-body"><strong>Short answer:</strong> etcd's Raft consensus needs a majority quorum, and even numbers add no fault tolerance over the odd number below them.
+<br><strong>Detailed explanation:</strong> A 3-node etcd cluster tolerates 1 failure (needs 2/3 for quorum); a 4-node cluster still only tolerates 1 failure (needs 3/4) while adding replication overhead — strictly worse than 3.
+<br><strong>Production example:</strong> Production kubeadm HA topologies standardize on 3 control-plane nodes across 3 AZs.
+<br><strong>Common mistake:</strong> Adding a 4th control-plane node "for extra safety" without realizing it doesn't raise fault tolerance.</div></details>
+
+<details class="qa"><summary>8. What happens to running workloads if the entire control plane goes down temporarily?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Already-running Pods keep serving traffic; nothing new can be scheduled, reconciled, or self-healed.
+<br><strong>Detailed explanation:</strong> kubelet already knows what Pods it should run and continues running/restarting them locally; but Scheduler can't place new Pods, and controllers can't reconcile drift, so this asymmetry means the data plane briefly survives while the control plane must be restored quickly.
+<br><strong>Production example:</strong> A brief EKS control-plane maintenance window doesn't crash running checkout-service Pods, but a node failure during that window wouldn't reschedule them.
+<br><strong>Common mistake:</strong> Believing a control-plane outage means total cluster downtime — it means the cluster stops changing, not stops running.</div></details>
+
+<details class="qa"><summary>9. Why should you reserve dedicated CPU for control-plane static pods?</summary>
+<div class="qa-body"><strong>Short answer:</strong> CPU starvation on a control-plane node can cause leader-election lease loss, halting reconciliation cluster-wide.
+<br><strong>Detailed explanation:</strong> Static pods run with <code>priorityClassName: system-cluster-critical</code> and guaranteed CPU requests specifically so noisy neighbors can't starve the Scheduler/Controller Manager into losing their lease.
+<br><strong>Production example:</strong> A runaway logging sidecar on a control-plane node causing scheduler leader-election flapping and stalled Pod scheduling cluster-wide.
+<br><strong>Common mistake:</strong> Co-locating untrusted or resource-hungry workloads on control-plane nodes to save cost.</div></details>
+
+<details class="qa"><summary>10–50. Additional rapid-fire questions</summary>
+<div class="qa-body">
+<strong>10.</strong> What's the difference between a managed and self-managed control plane? — Managed (EKS/GKE/AKS) hides all control-plane operations from you; self-managed (kubeadm) requires you to run and upgrade every component yourself.<br>
+<strong>11.</strong> Why is the API Server the only horizontally-scaled control-plane component in the traditional sense? — It's the only one without leader election; all replicas are simultaneously active because it's stateless.<br>
+<strong>12.</strong> What object type backs leader election? — A <code>Lease</code> object (coordination.k8s.io/v1) in the <code>kube-system</code> namespace.<br>
+<strong>13.</strong> What is the risk of running only 1 control-plane node in production? — Single point of failure — losing that node loses etcd, API Server, scheduling, and reconciliation simultaneously.<br>
+<strong>14.</strong> How do you check control-plane component health without SSH? — <code>kubectl get --raw='/healthz?verbose'</code> and <code>kubectl get pods -n kube-system -l tier=control-plane</code>.<br>
+<strong>15.</strong> What is <code>hostNetwork: true</code> used for in the API Server's static pod spec? — Binds the API Server directly to the node's network namespace/IP rather than a Pod-private IP, needed since it must be reachable before cluster networking (CNI) is even up.<br>
+<strong>16.</strong> Why does the API Server need <code>--client-ca-file</code> configured? — To validate client certificates presented during authentication (mutual TLS).<br>
+<strong>17.</strong> What does <code>--service-cluster-ip-range</code> control? — The CIDR block the API Server allocates ClusterIPs from for Services.<br>
+<strong>18.</strong> Why is control-plane version skew policy important? — kubelet, Scheduler, and Controller Manager must stay within supported minor-version distance of the API Server or undefined behavior/incompatibility can occur.<br>
+<strong>19.</strong> What's a symptom of leader-election flapping? — Repeated "leader election lost"/"became leader" log entries and stalled reconciliation despite the process itself being up.<br>
+<strong>20.</strong> Why put a load balancer/VIP in front of multiple API Server replicas? — So clients (kubectl, kubelets, controllers) have one stable endpoint regardless of which replica handles the request.<br>
+<strong>21.</strong> What's the operational risk of co-locating workloads on control-plane nodes? — Security exposure (workload compromise reaching control-plane secrets) and noisy-neighbor resource contention affecting etcd/API Server latency.<br>
+<strong>22.</strong> How does kubeadm bootstrap the very first control-plane node? — kubelet starts as a systemd service, reads static pod manifests for etcd/API Server/Scheduler/Controller Manager, and they come up without any pre-existing API Server.<br>
+<strong>23.</strong> What is the priority class typically assigned to control-plane static pods? — <code>system-cluster-critical</code>, which protects them from eviction under node resource pressure.<br>
+<strong>24.</strong> Why does the Controller Manager bundle dozens of controllers into one binary? — Pragmatic choice: one leader-election lease, one deployable artifact, shared informer caching — at the cost of shared fate if the process crashes.<br>
+<strong>25.</strong> What's the first thing to check when Pods are stuck Pending cluster-wide? — Whether the Scheduler pod is running and currently holds its leader-election lease.<br>
+<strong>26.</strong> How do you upgrade a self-managed HA control plane safely? — Upgrade one control-plane node at a time (API Server, then Controller Manager/Scheduler, then kubelet), maintaining etcd quorum throughout.<br>
+<strong>27.</strong> What's the relationship between the API Server and RBAC in the control plane? — The API Server evaluates every request's Role/ClusterRoleBindings during its authorization stage before admission/persistence.<br>
+<strong>28.</strong> Why is the control plane described as "the brain" vs worker nodes as "the muscle"? — The control plane decides what should run where; worker nodes execute that decision — a clean separation of decision-making from execution.<br>
+<strong>29.</strong> What happens if you scale the Scheduler Deployment to multiple replicas in a kubeadm cluster? — All replicas run, but leader election ensures only one is ever actively scheduling — no throughput gain.<br>
+<strong>30.</strong> Why must etcd be reachable from every API Server replica? — Every mutating and consistent-read request needs to reach etcd; if etcd is unreachable, that API Server replica can't serve authoritative reads/writes.<br>
+<strong>31.</strong> What's a common cause of "context deadline exceeded" errors from the API Server? — Slow etcd responses (often disk fsync latency) cascading into API Server request timeouts.<br>
+<strong>32.</strong> How does the control plane isolate a compromised worker node? — Cordon/drain removes it from scheduling consideration; it never gains access to control-plane-only resources like etcd directly.<br>
+<strong>33.</strong> What is the purpose of the <code>--enable-admission-plugins</code> flag on the API Server? — Enables specific admission controllers (e.g. NodeRestriction, ResourceQuota) as part of the control-plane's policy enforcement.<br>
+<strong>34.</strong> Why do managed control planes (EKS) charge a flat hourly fee regardless of node count? — The control plane's operating cost (API Server, etcd, Scheduler, Controller Manager) doesn't scale directly with worker node count up to a point.<br>
+<strong>35.</strong> What's the difference between Node Controller and Scheduler responsibilities? — Node Controller monitors node health/heartbeats and evicts Pods off unhealthy nodes; Scheduler only decides initial placement of new Pods.<br>
+<strong>36.</strong> Why is etcd excluded from the "stateless" description of the control plane? — It's the one component that must durably persist data across restarts — everything else rebuilds its view from etcd via the API Server.<br>
+<strong>37.</strong> What's the risk of a webhook with <code>failurePolicy: Fail</code> and no HA? — A single webhook outage blocks all matching API Server requests cluster-wide, effectively halting part of the control plane's write path.<br>
+<strong>38.</strong> How would you detect that the Controller Manager lost its lease? — Check <code>kubectl get lease -n kube-system kube-controller-manager</code> for holder identity/renewal time, and controller logs for "leader election lost".<br>
+<strong>39.</strong> Why does a self-managed control plane require more platform-team investment than a managed one? — You own etcd backup/restore, cert rotation, version-skew management, and HA topology design yourself.<br>
+<strong>40.</strong> What's the impact of running the control plane in a single AZ? — A single AZ outage takes down etcd quorum and the entire API Server, unlike a 3-AZ spread which tolerates one AZ loss.<br>
+<strong>41.</strong> Why does the Scheduler need to watch both Pods and Nodes? — It needs Pods with empty <code>nodeName</code> as input and current Node capacity/conditions to filter and score candidate placements.<br>
+<strong>42.</strong> What's a control-plane-specific metric worth alerting on? — API Server request latency and etcd fsync/commit latency — both are leading indicators of control-plane degradation.<br>
+<strong>43.</strong> Why is "one active leader" important for the Controller Manager specifically? — Two active instances reconciling the same Deployment/ReplicaSet could issue conflicting scale-up/scale-down actions simultaneously.<br>
+<strong>44.</strong> What's the significance of the <code>system:masters</code> group in control-plane security? — It's a built-in RBAC group with implicit cluster-admin access, typically restricted to bootstrap/emergency use only.<br>
+<strong>45.</strong> How does the control plane's design support zero-downtime upgrades? — Rolling replacement of stateless API Server replicas behind a load balancer while etcd quorum and leader-elected components fail over independently.<br>
+<strong>46.</strong> What's a symptom that indicates etcd (not the API Server itself) is the bottleneck? — API Server logs showing slow etcd request latency, and <code>etcdctl endpoint status</code> showing high fsync/commit duration.<br>
+<strong>47.</strong> Why does kubeadm store control-plane manifests in a specific well-known directory? — kubelet is configured to watch <code>/etc/kubernetes/manifests/</code> specifically for static pods — it's a hard-coded bootstrapping convention.<br>
+<strong>48.</strong> What's the difference between control-plane HA and control-plane scalability? — HA is about surviving component failure (leader election, etcd quorum); scalability is about serving more load (API Server horizontal scaling, etcd write throughput limits).<br>
+<strong>49.</strong> Why shouldn't you treat control-plane nodes like regular worker nodes for capacity planning? — They need guaranteed, isolated resources for etcd/API Server latency-sensitive operations, not bin-packed alongside arbitrary workloads.<br>
+<strong>50.</strong> What's the very first diagnostic step when the whole cluster seems "frozen" (no reconciliation happening)? — Check Controller Manager and Scheduler leader-election leases/logs — a stuck leader election halts nearly all cluster-wide reconciliation.
+</div></details>
+
+<footer class="course-footer">Next: Topic 3 — Worker Nodes, the data-plane counterpart to everything covered here.</footer>
+
+<script>
+  mermaid.initialize({ startOnLoad: true, theme: 'dark' });
+</script>
+
+</body>
+</html>

@@ -1,0 +1,343 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Topic 70: Production Best Practices — Kubernetes Expert Course</title>
+<link rel="stylesheet" href="styles.css">
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+</head>
+<body>
+
+<header class="course-header">
+  <div class="kicker">Topic 70 of 70 — Final Topic</div>
+  <h1>Production Best Practices</h1>
+  <div class="subtitle">The capstone checklist: resource management, security, observability, high availability, and cost, synthesized across the whole course.</div>
+</header>
+
+<nav class="topic-nav">
+  <a href="69-cka-exam-prep.html">&larr; CKA Exam Preparation</a>
+  <a href="index.html">Course Index</a>
+  <span>(last topic)</span>
+</nav>
+
+<h2 id="explanation">Explanation</h2>
+<p>Everything in this course has been building toward one question: what does it actually take to run Kubernetes in
+production, for real users, for years, without it becoming a source of constant incidents? The honest answer is that
+no single feature makes a cluster "production ready" — it's the compounding effect of getting five categories right
+simultaneously: <strong>resource management</strong>, <strong>security</strong>, <strong>observability</strong>,
+<strong>high availability</strong>, and <strong>cost control</strong>. Neglecting any one of them eventually produces
+an incident, no matter how well the other four are handled — a beautifully secured cluster with no resource limits
+still gets taken down by a noisy-neighbor Pod; a highly available cluster with no observability still pages someone
+at 3 AM to debug blind.</p>
+
+<p><strong>Resource management</strong> means every workload declares realistic requests and limits (not copy-pasted
+defaults), namespaces carry ResourceQuotas and LimitRanges so one team can't starve another, and the Cluster
+Autoscaler / HPA / VPA are tuned against real traffic patterns rather than left at framework defaults. The
+first-principles reason this matters: the scheduler makes placement decisions purely off requests, so wrong requests
+mean wrong bin-packing, which means either wasted capacity or, worse, real resource contention discovered only
+under production load.</p>
+
+<p><strong>Security</strong> is the sum of many small disciplines this course covered individually — RBAC scoped to
+least privilege per team/service-account, NetworkPolicies enforcing default-deny between namespaces, Pod Security
+Standards/admission enforcing non-root and no privilege escalation, Secrets encrypted at rest and never embedded in
+images, image scanning and signed/verified images in the supply chain, and Workload Identity (IRSA/Workload
+Identity/Azure AD Workload Identity) instead of static cloud credentials anywhere in the cluster. None of these
+individually stops every attack; together they mean a single mistake doesn't cascade into a full compromise.</p>
+
+<p><strong>Observability</strong> is what turns "the cluster is unhealthy" into "here is exactly what's wrong and
+where" — metrics (Prometheus/cloud-native equivalents) for the golden signals (latency, traffic, errors, saturation)
+per service, centralized logging that survives Pod restarts, distributed tracing for latency root-causing across
+service boundaries, and alerting tied to symptoms users actually feel (error rate, latency) rather than only to raw
+infrastructure metrics nobody acts on at 3 AM. The test of good observability is whether an on-call engineer with no
+prior context on the incident can find the root cause from dashboards alone within minutes.</p>
+
+<p><strong>High availability</strong> — odd-numbered etcd quorums, multi-AZ control planes and node pools,
+PodDisruptionBudgets, topology spread, tested backup/restore, and a rehearsed disaster recovery runbook with real
+RTO/RPO numbers — is what keeps the previous three categories from being undone by a single AZ failure or a bad
+upgrade. And <strong>cost control</strong> — right-sized requests, Spot/preemptible capacity for fault-tolerant
+workloads, cluster autoscaling tuned to scale down as aggressively as it scales up, and visibility into per-team/per-
+namespace spend — is what keeps the other four categories affordable enough that leadership keeps investing in them
+rather than cutting corners under budget pressure. Production readiness is not a single gate you pass once; it's an
+ongoing discipline of chaos-testing your assumptions (kill a node, fail a zone, corrupt a backup on purpose) before
+production does it for you on its own schedule.</p>
+
+<h2 id="internal-working">Internal Working / Interactions</h2>
+<ul>
+  <li><strong>Requests/limits &rarr; scheduler:</strong> the scheduler's bin-packing and the Vertical/Horizontal Pod
+  Autoscalers all key off declared requests — get these wrong and every downstream automation misbehaves.</li>
+  <li><strong>RBAC + NetworkPolicy + Pod Security &rarr; blast radius:</strong> each layer independently limits what a
+  compromised Pod or credential can reach; they compose rather than substitute for each other.</li>
+  <li><strong>Metrics/logs/traces &rarr; alerting &rarr; on-call:</strong> golden-signal alerting should page on
+  user-facing symptoms, with dashboards and traces providing the drill-down path to root cause.</li>
+  <li><strong>HA + backup/DR &rarr; incident containment:</strong> HA absorbs single-component failures automatically;
+  backup/DR is the fallback when HA itself is insufficient (data corruption, full-region loss).</li>
+  <li><strong>Cost visibility &rarr; sustained investment:</strong> without per-team cost attribution, the other four
+  pillars quietly erode over time as "we can't afford it" becomes the path of least resistance.</li>
+</ul>
+
+<h2 id="architecture-diagram">Architecture Diagram</h2>
+<pre class="mermaid">
+flowchart TB
+  Prod["Production-Ready Cluster"]
+  Prod --> RM["Resource Management\n(requests/limits, quotas, HPA/VPA)"]
+  Prod --> Sec["Security\n(RBAC, NetworkPolicy, Pod Security, Workload Identity)"]
+  Prod --> Obs["Observability\n(metrics, logs, traces, symptom-based alerts)"]
+  Prod --> HA["High Availability\n(multi-AZ, PDBs, tested backup/DR)"]
+  Prod --> Cost["Cost Control\n(right-sizing, Spot, autoscaling, attribution)"]
+
+  RM -.feeds.-> Obs
+  Sec -.limits blast radius of.-> Obs
+  HA -.absorbs failures that would page.-> Obs
+  Cost -.funds continued investment in.-> RM
+  Cost -.funds continued investment in.-> Sec
+  Cost -.funds continued investment in.-> HA
+
+  Obs --> OnCall["On-call engineer:\nroot cause in minutes, not hours"]
+</pre>
+
+<h2 id="code-example">Code Example</h2>
+<pre><code>#############################################
+# Capstone checklist as a single annotated Namespace manifest
+# (illustrating several pillars applied together on one workload)
+#############################################
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: checkout
+  labels:
+    pod-security.kubernetes.io/enforce: restricted    # Security: enforce Pod Security Standard
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: checkout-quota
+  namespace: checkout
+spec:
+  hard:
+    requests.cpu: "20"          # Resource mgmt: cap total requested CPU for this team's namespace
+    requests.memory: 40Gi
+    limits.cpu: "40"
+    limits.memory: 80Gi
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+  namespace: checkout
+spec:
+  podSelector: {}
+  policyTypes: ["Ingress", "Egress"]   # Security: default-deny, explicit allow-lists added per service
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: checkout-pdb
+  namespace: checkout
+spec:
+  minAvailable: 80%              # HA: survive voluntary disruption (drains/upgrades) without an outage
+  selector:
+    matchLabels: { app: checkout }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: checkout-api
+  namespace: checkout
+spec:
+  replicas: 6
+  selector: { matchLabels: { app: checkout } }
+  template:
+    metadata:
+      labels: { app: checkout }
+      annotations:
+        prometheus.io/scrape: "true"     # Observability: scraped for golden-signal metrics
+    spec:
+      topologySpreadConstraints:          # HA: spread across zones
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector: { matchLabels: { app: checkout } }
+      containers:
+        - name: checkout
+          image: registry.example.com/checkout:v9.2.0
+          resources:                       # Resource mgmt: explicit, load-tested requests/limits
+            requests: { cpu: "250m", memory: "256Mi" }
+            limits: { cpu: "500m", memory: "512Mi" }
+          securityContext:                 # Security: least privilege at container level
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+</code></pre>
+
+<h2 id="kubectl-cli-commands">kubectl / CLI Commands</h2>
+<pre><code># Audit a namespace's resource requests/limits vs actual usage
+kubectl top pods -n checkout
+kubectl describe resourcequota checkout-quota -n checkout
+
+# Confirm Pod Security Standard enforcement is active
+kubectl get ns checkout -o jsonpath='{.metadata.labels}'
+
+# Check NetworkPolicies actually applied to a namespace
+kubectl get networkpolicy -n checkout
+
+# Verify PodDisruptionBudget status before any planned disruption
+kubectl get pdb -n checkout
+
+# Confirm topology spread is actually achieved across zones
+kubectl get pods -n checkout -o wide -L topology.kubernetes.io/zone
+
+# Spot-check cost/capacity: idle vs requested vs limit across the cluster
+kubectl describe nodes | grep -A5 "Allocated resources"
+
+# Run a full readiness self-audit combining several signals at once
+kubectl get all,pdb,networkpolicy,resourcequota -n checkout
+</code></pre>
+
+<h2 id="best-practices">Best Practices &amp; Common Pitfalls</h2>
+<div class="grid-2">
+  <div class="lab-card">
+    <h4>Best Practices</h4>
+    <ul>
+      <li>Treat resource requests as load-tested numbers, not copy-pasted defaults.</li>
+      <li>Layer RBAC, NetworkPolicy, Pod Security, and Workload Identity together — never rely on one alone.</li>
+      <li>Alert on user-facing symptoms first; use traces/logs for drill-down, not primary paging.</li>
+      <li>Rehearse HA and DR failure scenarios on a schedule, not just after an incident.</li>
+      <li>Give every team visibility into their own namespace's cost and resource footprint.</li>
+    </ul>
+  </div>
+  <div class="lab-card">
+    <h4>Common Pitfalls</h4>
+    <ul>
+      <li>Treating any single pillar (e.g. "we have HA") as sufficient for production readiness alone.</li>
+      <li>Alerting only on infrastructure metrics nobody ties back to real user impact.</li>
+      <li>Skipping chaos/game-day testing until a real incident forces the first real-world test.</li>
+      <li>No cost attribution, letting budget pressure quietly erode security/observability investment.</li>
+      <li>Treating this course's topics as one-time setup rather than an ongoing operational discipline.</li>
+    </ul>
+  </div>
+</div>
+
+<h2 id="interview-questions">50 Interview Questions</h2>
+
+<details class="qa"><summary>1. Why does this topic insist that no single feature makes a cluster "production ready"?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Production readiness is the compounding effect of getting five categories right simultaneously — resource management, security, observability, high availability, and cost control — neglecting any one eventually produces an incident.
+<br><strong>Detail:</strong> The categories are independent failure modes: a beautifully secured cluster with no resource limits still gets taken down by a noisy-neighbor Pod, and a highly available cluster with no observability still pages someone at 3 AM to debug blind.
+<br><strong>Production example:</strong> A team with excellent RBAC and NetworkPolicy but no ResourceQuotas suffers an outage when one team's misconfigured Job consumes all available node capacity.
+<br><strong>Common mistake:</strong> Treating any single pillar (e.g. "we have HA") as sufficient for production readiness alone.</div></details>
+
+<details class="qa"><summary>2. Why does the scheduler's correctness fundamentally depend on accurate resource requests?</summary>
+<div class="qa-body"><strong>Short answer:</strong> The scheduler makes placement decisions purely off declared requests, so wrong requests mean wrong bin-packing — either wasted capacity or real resource contention discovered only under production load.
+<br><strong>Detail:</strong> This is a first-principles dependency, not a best-practice suggestion: HPA/VPA and the Cluster Autoscaler all key off the same declared requests, so a single bad number cascades into every downstream automation misbehaving.
+<br><strong>Production example:</strong> A Deployment copy-pasted with generic `requests: { cpu: "250m" }` regardless of actual load causes either wasted node capacity (over-requested) or noisy-neighbor CPU contention (under-requested).
+<br><strong>Common mistake:</strong> Copy-pasting default resource requests/limits across services rather than setting load-tested, workload-specific numbers.</div></details>
+
+<details class="qa"><summary>3. Why do RBAC, NetworkPolicy, and Pod Security Standards "compose rather than substitute" for each other?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Each layer independently limits what a compromised Pod or credential can reach — RBAC scopes API access, NetworkPolicy scopes network reachability, Pod Security Standards scope container-level capabilities — so a single mistake in one layer doesn't cascade into a full compromise.
+<br><strong>Detail:</strong> None of these individually stops every attack; their value comes specifically from stacking, so that a gap in one layer (e.g. an overly broad RBAC role) is still contained by another (e.g. default-deny NetworkPolicy).
+<br><strong>Production example:</strong> A namespace with `pod-security.kubernetes.io/enforce: restricted`, a default-deny NetworkPolicy, and scoped RBAC means a compromised Pod still can't escalate privileges, reach unrelated services, or access the API beyond its bound role.
+<br><strong>Common mistake:</strong> Relying on RBAC alone (or any single layer alone) as "our security," treating the other layers as optional rather than complementary.</div></details>
+
+<details class="qa"><summary>4. Why should alerting be tied to symptoms users actually feel rather than raw infrastructure metrics?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Golden-signal alerting (error rate, latency) directly reflects real user impact, whereas raw infrastructure metrics nobody acts on at 3 AM generate noise without corresponding action.
+<br><strong>Detail:</strong> The test of good observability is whether an on-call engineer with no prior incident context can find the root cause from dashboards alone within minutes — that requires alerts anchored to what's actually broken for users, with infra metrics/traces/logs as the drill-down path, not the primary trigger.
+<br><strong>Production example:</strong> Paging on `error rate > 5%` (a symptom) rather than on `node disk IO latency` alone (an infra metric that may or may not be user-impacting).
+<br><strong>Common mistake:</strong> Alerting only on infrastructure metrics nobody ties back to real user impact, generating alert fatigue with low actionability.</div></details>
+
+<details class="qa"><summary>5. What's the relationship between high availability and backup/DR, and why are they not interchangeable?</summary>
+<div class="qa-body"><strong>Short answer:</strong> HA absorbs single-component failures automatically (a node dies, a zone fails); backup/DR is the fallback when HA itself is insufficient — data corruption, full-region loss, or logical errors that HA cannot protect against.
+<br><strong>Detail:</strong> HA mechanisms (odd-numbered etcd quorums, multi-AZ control planes, PDBs, topology spread) assume the underlying data is intact and simply need to survive infrastructure failure; they do nothing against a bad deploy that corrupts data or deletes resources.
+<br><strong>Production example:</strong> A multi-AZ HA cluster survives a zone outage automatically, but only a tested backup/restore process recovers from an accidental `kubectl delete` of critical resources or corrupted etcd state.
+<br><strong>Common mistake:</strong> Assuming HA alone covers disaster recovery, skipping tested backup/restore because "we're already highly available."</div></details>
+
+<details class="qa"><summary>6. Why is cost control framed as what "funds continued investment" in the other four pillars?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Without per-team/per-namespace cost visibility and attribution, budget pressure quietly erodes security/observability/HA investment over time as "we can't afford it" becomes the path of least resistance.
+<br><strong>Detail:</strong> This reframes cost control from a purely financial concern into a sustainability mechanism for the other pillars — teams facing unattributed, opaque cluster costs tend to cut corners on the categories that don't have an obvious immediate cost (until an incident makes the cost visible the hard way).
+<br><strong>Production example:</strong> A team with clear per-namespace cost attribution can justify continued investment in dedicated observability tooling; a team with no cost visibility gets that tooling budget cut first during a cost-cutting round.
+<br><strong>Common mistake:</strong> Treating cost control as disconnected from security/observability/HA, rather than as the mechanism that keeps leadership funding them.</div></details>
+
+<details class="qa"><summary>7. Why does the capstone Namespace example enforce Pod Security Standards at the namespace label level rather than per-Pod?</summary>
+<div class="qa-body"><strong>Short answer:</strong> A namespace-level `pod-security.kubernetes.io/enforce: restricted` label applies admission enforcement to every Pod created in that namespace automatically, rather than relying on each team to correctly configure per-Pod securityContext fields individually.
+<br><strong>Detail:</strong> This is a defense-in-depth technique: even if an individual Deployment's securityContext is missing or misconfigured, the namespace-level enforcement still blocks non-compliant Pods from being admitted at all.
+<br><strong>Production example:</strong> A Deployment that forgets `runAsNonRoot: true` in its own manifest still gets rejected by admission control if the namespace enforces the `restricted` Pod Security Standard.
+<br><strong>Common mistake:</strong> Relying solely on per-container securityContext settings without namespace-level Pod Security Standard enforcement as a backstop.</div></details>
+
+<details class="qa"><summary>8. Why does the capstone example use topologySpreadConstraints alongside a PodDisruptionBudget rather than either alone?</summary>
+<div class="qa-body"><strong>Short answer:</strong> topologySpreadConstraints proactively spreads replicas across zones to reduce correlated-failure risk; the PodDisruptionBudget protects against voluntary disruption (drains/upgrades) once replicas are already spread — they address different failure timings.
+<br><strong>Detail:</strong> Spread alone doesn't prevent an upgrade from draining too many replicas simultaneously; a PDB alone doesn't prevent all replicas from initially landing in the same zone — together they cover both the initial placement and any later disruption event.
+<br><strong>Production example:</strong> `maxSkew: 1` with `topologyKey: topology.kubernetes.io/zone` combined with `minAvailable: 80%` on the PDB ensures replicas start zone-spread and stay above a safe availability floor during planned node drains.
+<br><strong>Common mistake:</strong> Setting a PodDisruptionBudget without topology spread, so all replicas end up concentrated in one zone despite the PDB "protecting" them.</div></details>
+
+<details class="qa"><summary>9. Why does the topic recommend chaos-testing assumptions (killing a node, failing a zone, corrupting a backup on purpose) rather than trusting configuration alone?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Production readiness is an ongoing discipline, not a one-time gate — untested HA/backup/DR configuration is an assumption until it's actually exercised, and production will test it on its own schedule if you don't do it deliberately first.
+<br><strong>Detail:</strong> A PodDisruptionBudget, a backup job, or a multi-AZ topology can all be misconfigured in ways that only surface during an actual failure — deliberately rehearsing failure scenarios (game days) surfaces those gaps under controlled, non-incident conditions.
+<br><strong>Production example:</strong> A team that has never tested restoring from its etcd backup discovers, only during a real incident, that the backup has been silently failing for months.
+<br><strong>Common mistake:</strong> Skipping chaos/game-day testing until a real incident forces the first real-world test of HA/backup/DR assumptions.</div></details>
+
+<details class="qa"><summary>10. How does this capstone topic's five-pillar framework synthesize the rest of the course?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Resource management, security, observability, HA, and cost control each map directly to specific earlier topics (scheduling/HPA/VPA, RBAC/NetworkPolicy/Pod Security/Workload Identity, Prometheus/logging/tracing, etcd/multi-AZ/PDBs/backup, autoscaling/Spot) — this topic is explicitly the integration point, not new material.
+<br><strong>Detail:</strong> The value of the capstone is showing these previously-separate topics interacting on a single manifest/namespace simultaneously, since real production readiness requires applying them together, not as isolated checklist items studied independently.
+<br><strong>Production example:</strong> The capstone's single annotated Namespace example combines a Pod Security Standard label, a ResourceQuota, a default-deny NetworkPolicy, a PodDisruptionBudget, and topology spread — five different course topics on one page.
+<br><strong>Common mistake:</strong> Treating this course's topics as one-time setup rather than an ongoing operational discipline that must be revisited as workloads and scale change.</div></details>
+
+<details class="qa"><summary>11–50. Additional rapid-fire questions</summary>
+<div class="qa-body">
+<strong>11.</strong> What are the five categories this capstone topic organizes production readiness around? — Resource management, security, observability, high availability, and cost control.<br>
+<strong>12.</strong> What decides scheduler placement/bin-packing? — Declared Pod resource requests.<br>
+<strong>13.</strong> What Kubernetes objects prevent one team from starving another's namespace of resources? — ResourceQuotas and LimitRanges.<br>
+<strong>14.</strong> What three autoscaling mechanisms should be tuned against real traffic rather than left at defaults? — Cluster Autoscaler, HPA, and VPA.<br>
+<strong>15.</strong> What RBAC principle should scope every team/service-account's permissions? — Least privilege.<br>
+<strong>16.</strong> What NetworkPolicy pattern is recommended as a security baseline between namespaces? — Default-deny.<br>
+<strong>17.</strong> What Kubernetes-native mechanism enforces non-root and no-privilege-escalation Pod settings? — Pod Security Standards/admission.<br>
+<strong>18.</strong> How should Secrets be handled at rest and in images? — Encrypted at rest, never embedded in images.<br>
+<strong>19.</strong> What replaces static cloud credentials in the cluster across all three major clouds? — Workload Identity (IRSA / GKE Workload Identity / Azure AD Workload Identity).<br>
+<strong>20.</strong> What four "golden signals" does metrics-based observability typically track per service? — Latency, traffic, errors, and saturation.<br>
+<strong>21.</strong> What should alerting be tied to primarily? — Symptoms users actually feel (error rate, latency), not just raw infrastructure metrics.<br>
+<strong>22.</strong> What's the test of good observability described in this topic? — Whether an on-call engineer with no prior context can find root cause from dashboards alone within minutes.<br>
+<strong>23.</strong> What etcd cluster property is called out as an HA requirement? — Odd-numbered quorum.<br>
+<strong>24.</strong> What Kubernetes object protects replica availability during voluntary disruptions like drains/upgrades? — PodDisruptionBudget.<br>
+<strong>25.</strong> What scheduling feature spreads Pods across zones for HA? — topologySpreadConstraints.<br>
+<strong>26.</strong> What HA practice is emphasized beyond just having backups? — Tested backup/restore, not just backup existence.<br>
+<strong>27.</strong> What two numbers should a disaster recovery runbook define concretely? — RTO and RPO (Recovery Time Objective / Recovery Point Objective).<br>
+<strong>28.</strong> What capacity type is recommended for fault-tolerant workloads to control cost? — Spot/preemptible capacity.<br>
+<strong>29.</strong> What direction should cluster autoscaling be tuned as aggressively as it scales up? — Scaling down.<br>
+<strong>30.</strong> What visibility is needed to prevent cost from silently eroding other pillars? — Per-team/per-namespace cost attribution.<br>
+<strong>31.</strong> What kubectl command audits a namespace's resource requests/limits vs actual usage? — `kubectl top pods -n <ns>` and `kubectl describe resourcequota <name> -n <ns>`.<br>
+<strong>32.</strong> What kubectl command confirms Pod Security Standard enforcement is active on a namespace? — `kubectl get ns <ns> -o jsonpath='{.metadata.labels}'`.<br>
+<strong>33.</strong> What kubectl command checks NetworkPolicies actually applied to a namespace? — `kubectl get networkpolicy -n <ns>`.<br>
+<strong>34.</strong> What kubectl command verifies PodDisruptionBudget status before a planned disruption? — `kubectl get pdb -n <ns>`.<br>
+<strong>35.</strong> What kubectl command confirms topology spread is actually achieved across zones? — `kubectl get pods -n <ns> -o wide -L topology.kubernetes.io/zone`.<br>
+<strong>36.</strong> What kubectl command spot-checks cluster-wide cost/capacity via allocated resources? — `kubectl describe nodes | grep -A5 "Allocated resources"`.<br>
+<strong>37.</strong> What single command runs a combined readiness self-audit across several signals at once? — `kubectl get all,pdb,networkpolicy,resourcequota -n <ns>`.<br>
+<strong>38.</strong> Why does wrong resource requests/limits cause "wasted capacity or real contention" specifically? — Over-requesting wastes unused reserved capacity; under-requesting risks actual resource contention only discovered under real production load.<br>
+<strong>39.</strong> Why is image scanning and image signing part of the security pillar? — It secures the software supply chain itself, preventing compromised or unverified images from ever running, complementing runtime controls like RBAC/NetworkPolicy.<br>
+<strong>40.</strong> Why does centralized logging need to "survive Pod restarts" specifically? — Because Kubernetes' own self-healing churn destroys in-Pod evidence the moment a Pod is replaced, unlike a static server.<br>
+<strong>41.</strong> Why is distributed tracing called out for "latency root-causing across service boundaries" specifically (not error-rate)? — Tracing's unique value is pinpointing which specific downstream hop in a multi-service call chain caused slowness, which aggregate metrics alone can't show.<br>
+<strong>42.</strong> What's the risk of a highly available cluster with no observability, per this topic? — It still pages someone at 3 AM to debug blind, since HA alone doesn't explain what's actually wrong.<br>
+<strong>43.</strong> What's the risk of a well-secured cluster with no resource limits, per this topic? — It can still be taken down by a noisy-neighbor Pod consuming unbounded resources.<br>
+<strong>44.</strong> Why is `securityContext.readOnlyRootFilesystem: true` included in the capstone example? — It's a least-privilege container hardening setting, preventing runtime writes to the container's root filesystem as an additional blast-radius limiter.<br>
+<strong>45.</strong> Why does the capstone recommend rehearsing HA/DR failure scenarios "on a schedule, not just after an incident"? — Untested assumptions (backups, failover, quorum behavior) often only reveal gaps when actually exercised, and waiting for a real incident to find out is far costlier.<br>
+<strong>46.</strong> What's the relationship between requests/limits and the Vertical/Horizontal Pod Autoscalers? — Both autoscalers key off declared requests, so incorrect requests directly cause every downstream autoscaling decision to misbehave.<br>
+<strong>47.</strong> Why is per-team cost attribution described as protecting the other four pillars specifically? — Because unattributed costs make security/observability/HA investment an easy, invisible target for budget cuts under pressure.<br>
+<strong>48.</strong> What's the danger of treating production-readiness as "a single gate you pass once"? — It ignores that workloads, scale, and failure modes change over time, requiring ongoing chaos-testing and re-validation rather than one-time certification.<br>
+<strong>49.</strong> Why does the capstone Namespace example combine ResourceQuota, NetworkPolicy, PodDisruptionBudget, and topologySpreadConstraints on one workload rather than showing each in isolation? — To demonstrate that real production readiness requires these controls composing together on the same workload, not being adopted as separate, disconnected checklist items.<br>
+<strong>50.</strong> What's the single biggest takeaway this capstone topic emphasizes across the whole course? — Production readiness is the ongoing, compounding discipline of getting resource management, security, observability, HA, and cost right together — no individual feature or topic substitutes for that synthesis.
+</div></details>
+
+<div class="callout good">
+  <strong>Course complete.</strong> You've now covered all 70 topics of the Kubernetes Expert Course — from core
+  architecture through networking, storage, security, scaling, multi-cluster operations, managed cloud platforms, and
+  the operational disciplines (HA, backup/DR, upgrades) that keep production clusters running. The material here is
+  a foundation, not a finish line: the fastest way to deepen it further is to apply it against a real cluster,
+  rehearse the failure scenarios deliberately, and keep the CKA exam skills sharp with regular hands-on practice.
+  Congratulations on finishing the course.
+</div>
+
+<footer class="course-footer">You've completed all 70 topics of the Kubernetes Expert Course. Congratulations!</footer>
+
+<script>
+  mermaid.initialize({ startOnLoad: true, theme: 'dark' });
+</script>
+
+</body>
+</html>

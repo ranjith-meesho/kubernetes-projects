@@ -1,0 +1,261 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Topic 5: etcd — Kubernetes Expert Course</title>
+<link rel="stylesheet" href="styles.css">
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+</head>
+<body>
+
+<header class="course-header">
+  <div class="kicker">Topic 5 of 70</div>
+  <h1>etcd</h1>
+  <div class="subtitle">The single source of truth: Raft consensus, key layout, snapshots, and quorum guarantees underlying the whole cluster.</div>
+</header>
+
+<nav class="topic-nav">
+  <a href="04-api-server.html">&larr; API Server</a>
+  <a href="index.html">Course Index</a>
+  <a href="06-scheduler.html">Scheduler &rarr;</a>
+</nav>
+
+<h2 id="explanation">Explanation</h2>
+<p><strong>etcd</strong> is a distributed, strongly-consistent key-value store, and it is the only place Kubernetes
+durably stores cluster state. Every object you create — Pods, Secrets, Deployments, Nodes — ends up as a serialized
+protobuf value under a structured key in etcd. Nothing in Kubernetes is "real" until it's committed to etcd; the API
+Server itself holds no durable state of its own.</p>
+
+<p>Kubernetes needs etcd's specific guarantees — not just any database — because a distributed control system requires
+<strong>linearizable reads/writes</strong> (every client sees a single consistent order of changes) and a
+<strong>watch API</strong> (clients get notified of changes instead of polling). etcd provides both natively via the
+<strong>Raft consensus algorithm</strong>: one node is elected leader, all writes go through the leader, and a write is
+only acknowledged once a majority of members have durably persisted it. This is what prevents split-brain — two
+different parts of the cluster can never both believe conflicting things are true.</p>
+
+<p>Because Raft requires a <strong>majority (quorum)</strong> to commit any write, etcd clusters are run with an odd
+number of members — 3 or 5. A 3-member cluster tolerates 1 failure; a 5-member cluster tolerates 2. Adding a 4th
+member to a 3-member cluster does not add resilience — it only raises the quorum threshold. This is a frequently
+misunderstood point: more members is not free — each additional member adds replication overhead and doesn't scale
+throughput (all writes still funnel through the leader).</p>
+
+<p>etcd stores Kubernetes objects under keys shaped like <code>/registry/{resource}/{namespace}/{name}</code>, e.g.
+<code>/registry/pods/default/nginx-abc123</code>. This flat, path-like key layout is why etcd's watch API can
+efficiently support "watch everything under /registry/pods" style queries that the API Server relies on. Because
+Secrets are stored the same way as everything else, they are <strong>plaintext by default</strong> unless
+encryption-at-rest is explicitly configured — a fact every security review should catch.</p>
+
+<p>etcd is extremely latency-sensitive: every write requires an <code>fsync</code> to disk before it's acknowledged, so
+slow disks directly translate into slow API Server responses cluster-wide. This is the single most common root cause
+of "the whole cluster feels sluggish" incidents, and it's why production etcd clusters mandate low-latency SSDs and
+tight network proximity between members.</p>
+
+<h2 id="internal-working">Internal Working / Interactions</h2>
+<ul>
+  <li><strong>etcd &harr; API Server only:</strong> no other component ever talks to etcd directly — this is enforced by convention and network policy, not a technical restriction.</li>
+  <li><strong>Raft leader election:</strong> one etcd member is leader; all writes are proposed to it, replicated to followers, and committed once a quorum acknowledges.</li>
+  <li><strong>Watch stream:</strong> the API Server maintains a long-lived watch on etcd's key space and fans changes out to its own watchers (controllers, kubelets).</li>
+  <li><strong>Compaction/defrag:</strong> etcd keeps historical revisions until compacted; periodic compaction + defragmentation reclaims disk space and keeps performance stable.</li>
+  <li><strong>Snapshotting:</strong> <code>etcdctl snapshot save</code> captures a point-in-time backup of the entire keyspace for disaster recovery.</li>
+</ul>
+
+<h2 id="architecture-diagram">Architecture Diagram</h2>
+<pre class="mermaid">
+flowchart TB
+    API["API Server"]
+    subgraph ETCD["etcd cluster (3 members, Raft)"]
+        L["Leader"]
+        F1["Follower 1"]
+        F2["Follower 2"]
+    end
+    API -->|write request| L
+    L -->|replicate entry| F1
+    L -->|replicate entry| F2
+    F1 -->|ack| L
+    F2 -->|ack| L
+    L -->|commit once quorum acks (2 of 3)| API
+</pre>
+
+<pre class="mermaid">
+stateDiagram-v2
+    [*] --> Follower
+    Follower --> Candidate: Election timeout, no heartbeat from leader
+    Candidate --> Leader: Wins majority vote
+    Candidate --> Follower: Loses election, sees higher term
+    Leader --> Follower: Discovers higher term (network partition healed)
+    Leader --> [*]: Node removed/crashed
+</pre>
+
+<h2 id="code-example">Code Example</h2>
+<pre><code># etcd is not configured via Kubernetes YAML — it's configured via its own
+# static pod manifest (kubeadm) or systemd unit flags. Key production flags:
+
+# /etc/kubernetes/manifests/etcd.yaml (relevant command args)
+- --data-dir=/var/lib/etcd
+- --initial-cluster=cp1=https://10.0.1.10:2380,cp2=https://10.0.1.11:2380,cp3=https://10.0.1.12:2380
+- --initial-cluster-state=new
+- --listen-peer-urls=https://10.0.1.10:2380       # member-to-member Raft traffic
+- --listen-client-urls=https://10.0.1.10:2379     # API Server connects here
+- --quota-backend-bytes=8589934592                # raise beyond default 2GB for large clusters
+- --auto-compaction-mode=periodic
+- --auto-compaction-retention=1h                    # compact old revisions hourly to bound DB growth
+
+# Backup command (run on any etcd member, requires TLS certs)
+etcdctl --endpoints=https://127.0.0.1:2379 \
+  --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+  --cert=/etc/kubernetes/pki/etcd/server.crt \
+  --key=/etc/kubernetes/pki/etcd/server.key \
+  snapshot save /backup/etcd-snapshot-$(date +%F).db
+
+# Restore from snapshot into a fresh data directory (used during DR)
+etcdctl snapshot restore /backup/etcd-snapshot-2026-07-19.db \
+  --data-dir=/var/lib/etcd-restored \
+  --initial-cluster=cp1=https://10.0.1.10:2380 \
+  --initial-advertise-peer-urls=https://10.0.1.10:2380
+</code></pre>
+
+<h2 id="kubectl-commands">kubectl Commands</h2>
+<pre><code># etcd health is not exposed via kubectl directly — use etcdctl on a control-plane node:
+etcdctl endpoint health --cluster -w table       # per-member health
+etcdctl endpoint status --cluster -w table       # shows leader, DB size, raft term
+etcdctl member list -w table                     # list all etcd members and their URLs
+
+# Indirect visibility via kubectl:
+kubectl get pods -n kube-system -l component=etcd    # etcd static pods (kubeadm)
+kubectl get --raw='/healthz/etcd'                    # API Server's view of etcd reachability
+kubectl top node                                     # slow etcd often manifests as slow describe/get here first
+kubectl logs etcd-controlplane-1 -n kube-system      # etcd's own logs (fsync latency warnings appear here)
+</code></pre>
+
+<h2 id="best-practices">Best Practices &amp; Common Pitfalls</h2>
+<div class="grid-2">
+<div>
+<h4>Best Practices</h4>
+<ul>
+  <li>Run 3 or 5 members on dedicated low-latency SSD storage.</li>
+  <li>Automate regular snapshot backups to off-cluster object storage.</li>
+  <li>Enable encryption-at-rest for Secrets stored in etcd.</li>
+  <li>Monitor <code>fsync</code> and network round-trip latency continuously — they predict issues before quorum is lost.</li>
+</ul>
+</div>
+<div>
+<h4>Pitfalls</h4>
+<ul>
+  <li>Running an even number of members — no resilience benefit, higher split-vote risk.</li>
+  <li>Using network-attached storage with high/variable latency for the data directory.</li>
+  <li>Letting the DB grow unbounded without compaction/defrag — leads to <code>mvcc: database space exceeded</code>.</li>
+  <li>Exposing etcd's client port beyond the control-plane network — anyone with access effectively has cluster-admin.</li>
+</ul>
+</div>
+</div>
+
+<h2 id="interview-questions">50 Interview Questions</h2>
+
+<details class="qa"><summary>1. Why does Kubernetes use etcd specifically instead of any other key-value store?</summary>
+<div class="qa-body"><strong>Short answer:</strong> etcd natively provides linearizable reads/writes via Raft consensus and a built-in watch API, both required by Kubernetes' architecture.
+<br><strong>Detailed explanation:</strong> Kubernetes needs every client to see a single consistent order of changes (linearizability) and needs to notify watchers of changes instead of polling. Raft gives strict write ordering through a single elected leader, and etcd's watch API is a first-class primitive, not bolted on.
+<br><strong>Production example:</strong> The API Server's own watch mechanism for controllers/kubelets is built directly on top of etcd's native watch stream.
+<br><strong>Common mistake:</strong> Assuming any consistent database would work — the watch API and Raft-based consistency guarantees are both load-bearing, not incidental.</div></details>
+
+<details class="qa"><summary>2. Explain how Raft consensus makes an etcd write durable and consistent.</summary>
+<div class="qa-body"><strong>Short answer:</strong> A write is proposed to the elected leader, replicated to followers, and only acknowledged once a majority (quorum) durably persists it.
+<br><strong>Detailed explanation:</strong> One etcd member is leader at any time; all writes flow through it. The leader replicates the entry to followers and waits for acknowledgment from a majority before considering the write committed — this prevents split-brain because no two conflicting values can both achieve quorum simultaneously.
+<br><strong>Production example:</strong> In a 3-member cluster, a write is durable once 2 of 3 members (leader + 1 follower) have persisted it to disk.
+<br><strong>Common mistake:</strong> Believing a write is safe as soon as the leader accepts it — it isn't durable until quorum acknowledges.</div></details>
+
+<details class="qa"><summary>3. Why must etcd clusters run an odd number of members, and why doesn't adding more always help?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Raft needs a strict majority; odd numbers give the best fault-tolerance-to-member ratio, and each additional member increases replication overhead without adding throughput.
+<br><strong>Detailed explanation:</strong> A 3-member cluster tolerates 1 failure (needs 2/3); a 5-member cluster tolerates 2 (needs 3/5). A 4-member cluster still only tolerates 1 failure (needs 3/4) while requiring more replication work — strictly worse than 3. All writes still funnel through one leader regardless of member count, so more members never increases write throughput.
+<br><strong>Production example:</strong> Production etcd topologies standardize on 3 (small/medium clusters) or 5 (very large clusters needing to tolerate 2 failures).
+<br><strong>Common mistake:</strong> Adding a 4th member "for extra safety" — it raises the quorum threshold without adding real resilience.</div></details>
+
+<details class="qa"><summary>4. How are Kubernetes objects actually stored as keys in etcd?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Under a flat, path-like key structure: <code>/registry/{resource}/{namespace}/{name}</code>.
+<br><strong>Detailed explanation:</strong> This layout, e.g. <code>/registry/pods/default/nginx-abc123</code>, is why etcd's range-watch capabilities can efficiently support "watch everything under /registry/pods" style queries that the API Server relies on for its own watch fan-out to clients.
+<br><strong>Production example:</strong> Direct <code>etcdctl get</code> against this key prefix on a lab cluster reveals the raw serialized object the API Server would otherwise abstract away.
+<br><strong>Common mistake:</strong> Thinking Kubernetes objects are stored in some Kubernetes-specific format rather than plain etcd keys with serialized (protobuf) values.</div></details>
+
+<details class="qa"><summary>5. Why are Secrets in etcd plaintext by default, and how do you fix that?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Secrets are stored the same way as every other object (just base64-encoded, not encrypted) unless encryption-at-rest is explicitly configured.
+<br><strong>Detailed explanation:</strong> Kubernetes' generic object storage doesn't special-case Secrets for encryption — you must configure an <code>EncryptionConfiguration</code> on the API Server to encrypt Secret values before they're written to etcd.
+<br><strong>Production example:</strong> A security review flags an EKS cluster without KMS-backed etcd encryption as a compliance gap for PCI-DSS/SOC2.
+<br><strong>Common mistake:</strong> Assuming Secrets are inherently "secure" just because they're a distinct resource type — anyone with direct etcd access can read them in plaintext without encryption-at-rest.</div></details>
+
+<details class="qa"><summary>6. Why is etcd so sensitive to disk and network latency?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Every write requires an fsync to disk before acknowledgment, and Raft replication between members is latency-sensitive to network round-trips.
+<br><strong>Detailed explanation:</strong> A slow disk directly delays every write's commit time, which cascades into slow API Server responses cluster-wide since the API Server can't acknowledge a write until etcd does. Network jitter between members can also trigger unnecessary leader re-elections.
+<br><strong>Production example:</strong> Switching etcd's data directory from network-attached storage to local NVMe SSD resolves cluster-wide "kubectl feels sluggish" complaints.
+<br><strong>Common mistake:</strong> Running etcd on network storage or spinning disks to save cost, not realizing it degrades the entire cluster's responsiveness.</div></details>
+
+<details class="qa"><summary>7. What is etcd compaction and defragmentation, and why are both needed?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Compaction discards old historical revisions (MVCC); defragmentation reclaims the freed disk space at the storage-engine level.
+<br><strong>Detailed explanation:</strong> etcd's MVCC model keeps every historical revision of every key until compacted, so disk usage grows unbounded without periodic compaction; even after compaction, the underlying bbolt database file doesn't shrink until defragmented.
+<br><strong>Production example:</strong> <code>--auto-compaction-mode=periodic --auto-compaction-retention=1h</code> compacts hourly; a separate scheduled defrag job then reclaims disk space.
+<br><strong>Common mistake:</strong> Enabling compaction but never defragmenting, then still hitting <code>mvcc: database space exceeded</code> because the file itself never shrank.</div></details>
+
+<details class="qa"><summary>8. How do you back up and restore etcd, and when would you need to?</summary>
+<div class="qa-body"><strong>Short answer:</strong> <code>etcdctl snapshot save</code> captures a point-in-time backup; <code>etcdctl snapshot restore</code> rebuilds a data directory from it during disaster recovery.
+<br><strong>Detailed explanation:</strong> Restore is typically needed after total quorum loss, accidental mass deletion, or corruption — it rebuilds a fresh data directory that a new etcd cluster is then bootstrapped from, not a live in-place operation.
+<br><strong>Production example:</strong> A platform team automates hourly snapshots to S3, with a documented runbook to restore from the latest snapshot during a DR drill.
+<br><strong>Common mistake:</strong> Taking backups but never testing the restore procedure until an actual outage, discovering gaps in the runbook under pressure.</div></details>
+
+<details class="qa"><summary>9. What happens operationally when etcd loses quorum?</summary>
+<div class="qa-body"><strong>Short answer:</strong> All writes fail cluster-wide; reads may still succeed from a stale follower, but nothing can change.
+<br><strong>Detailed explanation:</strong> Quorum loss (more than (N-1)/2 members down) means no majority can commit new entries via Raft, so the API Server can't persist any change — Pods can't be created, scaled, or deleted, though already-running workloads keep functioning.
+<br><strong>Production example:</strong> Losing 2 of 3 etcd members simultaneously (e.g. a bad AZ-wide network event) halts all cluster mutations until members are restored.
+<br><strong>Common mistake:</strong> Forcing a single surviving member into a fake "quorum" as a workaround without understanding the data-loss and split-brain risk this introduces.</div></details>
+
+<details class="qa"><summary>10–50. Additional rapid-fire questions</summary>
+<div class="qa-body">
+<strong>10.</strong> What consensus algorithm does etcd use? — Raft.<br>
+<strong>11.</strong> How many members can a 5-node etcd cluster lose and still function? — 2 (needs 3 of 5 for quorum).<br>
+<strong>12.</strong> What's the default etcd quota-backend-bytes limit? — 2GB, raised via <code>--quota-backend-bytes</code> for large clusters.<br>
+<strong>13.</strong> What error indicates the etcd DB size limit was hit? — <code>etcdserver: mvcc: database space exceeded</code>.<br>
+<strong>14.</strong> What command shows per-member health across an etcd cluster? — <code>etcdctl endpoint health --cluster -w table</code>.<br>
+<strong>15.</strong> What command shows which member is currently the Raft leader? — <code>etcdctl endpoint status --cluster -w table</code>.<br>
+<strong>16.</strong> Why should etcd's client port never be exposed outside the control-plane network? — Anyone with access effectively has cluster-admin, since it holds all cluster state including Secrets.<br>
+<strong>17.</strong> What's the difference between etcd's peer URL and client URL? — Peer URLs (<code>--listen-peer-urls</code>) handle member-to-member Raft traffic; client URLs (<code>--listen-client-urls</code>) are where the API Server connects.<br>
+<strong>18.</strong> Why is MVCC relevant to etcd's watch API? — MVCC keeps historical revisions, letting watchers resume from a specific revision instead of losing events during reconnects.<br>
+<strong>19.</strong> What's a typical symptom of etcd fsync latency problems? — Slow <code>kubectl</code> commands cluster-wide, especially writes (create/update/delete), even though reads may feel fine.<br>
+<strong>20.</strong> Why does etcd prefer local SSD over network-attached storage? — fsync latency and consistency guarantees are far more predictable on local, low-latency storage.<br>
+<strong>21.</strong> What's the risk of etcd members being geographically far apart? — Raft replication round-trip latency increases, slowing every write and increasing the chance of unnecessary leader re-elections.<br>
+<strong>22.</strong> Why does Kubernetes never let controllers write to etcd directly? — Only the API Server should enforce authn/authz/admission before any persistence — direct writes would bypass all of that.<br>
+<strong>23.</strong> What does <code>--initial-cluster-state=new</code> signify during bootstrap? — Tells etcd this is a brand-new cluster being formed, not joining an existing one.<br>
+<strong>24.</strong> How would you add a new member to an existing etcd cluster safely? — Use <code>etcdctl member add</code> first to register it, then start the new member pointing at the updated cluster list — order matters to avoid quorum issues.<br>
+<strong>25.</strong> What's the effect of an etcd leader crashing? — Remaining members hold a new election; a brief write unavailability window occurs until a new leader is elected.<br>
+<strong>26.</strong> Why is etcd described as "the single source of truth"? — Nothing in Kubernetes is considered real until it's committed to etcd — the API Server itself holds no durable state.<br>
+<strong>27.</strong> What's a good way to test a DR runbook without touching production? — Take a snapshot from a lab/staging etcd cluster, deliberately corrupt/delete data, then practice the full restore procedure end to end.<br>
+<strong>28.</strong> Why does etcd compaction need to run periodically rather than never? — Without it, historical revisions accumulate indefinitely and eventually exceed the DB size quota.<br>
+<strong>29.</strong> What's the relationship between etcd revision numbers and resourceVersion in Kubernetes? — Kubernetes' <code>resourceVersion</code> is derived from etcd's internal revision, used for optimistic concurrency and watch resumption.<br>
+<strong>30.</strong> Why might you see "etcdserver: request timed out" errors? — etcd is overloaded or its disk I/O is too slow to commit writes within the client's timeout.<br>
+<strong>31.</strong> What's the purpose of TLS certificates in etcd's configuration? — Encrypts and authenticates both peer (member-to-member) and client (API Server-to-etcd) traffic.<br>
+<strong>32.</strong> Why is running etcd co-located with the API Server on the same control-plane node common? — Minimizes network latency between the two, since API Server performance is bottlenecked heavily by etcd round-trip time.<br>
+<strong>33.</strong> What's a leading indicator metric to alert on for etcd health? — fsync/commit duration and Raft proposal failure rate.<br>
+<strong>34.</strong> Why is it risky to restore an etcd snapshot into a running cluster without care? — It replaces the entire keyspace state, potentially reverting recent legitimate changes or causing conflicts with already-running Pods/controllers.<br>
+<strong>35.</strong> What's the difference between etcd's "leader" and Kubernetes controller "leader election"? — etcd's Raft leader handles consensus for etcd's own writes; Kubernetes leader election (via Lease objects) is a separate, higher-level mechanism used by Scheduler/Controller Manager, implemented using etcd/API Server underneath.<br>
+<strong>36.</strong> Why shouldn't you scale etcd cluster size the way you'd scale stateless services? — More members add Raft replication overhead without adding write throughput, since all writes still go through one leader.<br>
+<strong>37.</strong> What's the impact of a slow etcd disk on Pod scheduling latency? — Scheduler bindings must be persisted through the API Server to etcd, so slow etcd commits directly delay how fast Pods transition out of Pending.<br>
+<strong>38.</strong> How can you verify an etcd snapshot is valid before relying on it for DR? — <code>etcdctl snapshot status</code> reports hash, revision, and size, letting you sanity-check it before an actual restore.<br>
+<strong>39.</strong> Why does etcd use a term/revision-based model rather than plain timestamps? — Logical revisions avoid the coordination problems of relying on potentially-skewed wall-clock time across distributed members.<br>
+<strong>40.</strong> What's a real consequence of exposing etcd without TLS? — Any network-adjacent attacker could read or write raw cluster state, including all Secrets, completely bypassing Kubernetes RBAC.<br>
+<strong>41.</strong> Why is etcd backup automation (not just manual snapshotting) considered a best practice? — Manual processes are forgotten or done inconsistently; automated, tested, off-cluster backups are the only reliable DR guarantee.<br>
+<strong>42.</strong> What's the practical difference between etcd being "down" vs "quorum lost"? — A single member being down with quorum intact is transparent to clients; quorum loss halts all writes cluster-wide.<br>
+<strong>43.</strong> Why does etcd's watch mechanism matter beyond just the API Server? — It's the foundational primitive the API Server's own client watch/informer system is built on top of.<br>
+<strong>44.</strong> What's a symptom in etcd logs that predicts an upcoming performance issue? — Repeated warnings about slow fsync duration or applied entries taking too long.<br>
+<strong>45.</strong> Why is restoring from a very old snapshot risky? — It can revert the cluster to a stale desired state, causing controllers to "correct" already-changed real-world resources back to outdated configurations.<br>
+<strong>46.</strong> What's the operational reason production etcd clusters avoid public cloud "burstable" storage tiers? — Inconsistent/variable IOPS and latency directly translate into unpredictable etcd (and thus cluster-wide) performance.<br>
+<strong>47.</strong> How does etcd's design relate to the CAP theorem? — etcd favors consistency and partition tolerance (CP) over availability — it will refuse writes rather than risk inconsistent state during a partition.<br>
+<strong>48.</strong> Why might restoring etcd not fully recover a cluster by itself? — Some controller-managed external resources (cloud LoadBalancers, PVs) may be orphaned or duplicated if their corresponding etcd records were rolled back to a stale state.<br>
+<strong>49.</strong> What's the first command to run when investigating "the cluster feels slow" that points at etcd specifically? — <code>etcdctl endpoint status --cluster -w table</code> to check DB size, leader, and latency across members.<br>
+<strong>50.</strong> Why is etcd considered the highest-value single component to protect operationally? — It's the sole durable source of truth for the entire cluster — its loss (without backups) means total, unrecoverable loss of cluster state.
+</div></details>
+
+<footer class="course-footer">Next: Topic 6 — Scheduler, the component that reads Pod objects out of etcd and decides where they run.</footer>
+
+<script>
+  mermaid.initialize({ startOnLoad: true, theme: 'dark' });
+</script>
+
+</body>
+</html>

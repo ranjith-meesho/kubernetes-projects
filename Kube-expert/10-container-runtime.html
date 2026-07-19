@@ -1,0 +1,279 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Topic 10: Container Runtime — Kubernetes Expert Course</title>
+<link rel="stylesheet" href="styles.css">
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+</head>
+<body>
+
+<header class="course-header">
+  <div class="kicker">Topic 10 of 70</div>
+  <h1>Container Runtime</h1>
+  <div class="subtitle">The CRI shim, containerd/CRI-O internals, the image pull flow, and the OCI runtime spec underneath it all.</div>
+</header>
+
+<nav class="topic-nav">
+  <a href="09-kube-proxy.html">&larr; kube-proxy</a>
+  <a href="index.html">Course Index</a>
+  <a href="11-pods.html">Pods &rarr;</a>
+</nav>
+
+<h2 id="explanation">Explanation</h2>
+<p>The <strong>container runtime</strong> is the layer that does the actual, literal work of running a container:
+pulling an image, unpacking its filesystem layers, creating Linux namespaces and cgroups, and executing the
+containerized process. Kubernetes itself has no idea how to do any of this — kubelet delegates every bit of it to the
+runtime through a standardized gRPC API called the <strong>CRI (Container Runtime Interface)</strong>.</p>
+
+<p>Kubernetes needs this separation because container runtimes are a genuinely separate, fast-moving ecosystem
+concern, and early Kubernetes paid a real cost for being tightly coupled to Docker specifically. The CRI was
+introduced precisely so kubelet's code never needs to change when the runtime changes — today, <strong>containerd</strong>
+and <strong>CRI-O</strong> are the dominant CRI-compliant runtimes (Docker Engine itself is no longer used directly;
+even Docker Desktop-based clusters run containerd underneath).</p>
+
+<p>Underneath the CRI-compliant runtime sits an even lower-level layer: the <strong>OCI (Open Container Initiative)
+runtime spec</strong>, implemented by tools like <strong>runc</strong> (or <code>crun</code>, or gVisor/Kata for
+sandboxed isolation). containerd/CRI-O handle image management, storage, and the CRI gRPC surface, then shell out to
+an OCI runtime to actually create the low-level namespaces/cgroups and <code>exec()</code> the container's entrypoint
+process. This is a genuine layered architecture: CRI (Kubernetes-facing) &rarr; containerd/CRI-O (image + lifecycle
+management) &rarr; OCI runtime (actual process creation).</p>
+
+<p>The <strong>image pull flow</strong> matters operationally because it's a common source of slow Pod startup and
+production incidents: kubelet asks the runtime to pull an image, the runtime checks its local content-addressable
+store first, and if missing, pulls each layer from the registry (with configurable pull policy — <code>Always</code>,
+<code>IfNotPresent</code>, <code>Never</code>) and unpacks it before the container can start. Registry rate limits,
+network latency to the registry, and large image sizes all directly translate into slower Pod scheduling-to-Running
+time — one reason production clusters run local registry mirrors/pull-through caches.</p>
+
+<p>The runtime also enforces the resource <code>limits</code> you set in a Pod spec by configuring cgroups — CPU
+limits become CFS quota/period settings, memory limits become cgroup memory limits that trigger OOM-kill when
+exceeded. Understanding that this enforcement happens here, not in kubelet or the API Server, is key to correctly
+diagnosing OOMKilled and CPU-throttling incidents.</p>
+
+<h2 id="internal-working">Internal Working / Interactions</h2>
+<ul>
+  <li><strong>kubelet &harr; Container Runtime (CRI):</strong> gRPC calls over a Unix socket — RunPodSandbox, PullImage, CreateContainer, StartContainer, ContainerStatus, StopContainer, RemoveContainer.</li>
+  <li><strong>Container Runtime &harr; image registry:</strong> pulls image manifests + layers (OCI image spec) over HTTPS, verifies digests, caches layers in local content store.</li>
+  <li><strong>Container Runtime &harr; OCI runtime (runc/crun):</strong> generates an OCI runtime spec (<code>config.json</code>) describing namespaces/cgroups/mounts, then invokes the OCI runtime to create and start the actual process.</li>
+  <li><strong>Container Runtime &harr; cgroups:</strong> translates Pod <code>resources.limits</code>/<code>requests</code> into cgroup v1/v2 controller settings enforced by the kernel.</li>
+  <li><strong>Container Runtime &harr; CNI (via kubelet):</strong> the runtime creates the network namespace during sandbox creation; kubelet then invokes CNI plugins to wire it up.</li>
+</ul>
+
+<h2 id="architecture-diagram">Architecture Diagram</h2>
+<pre class="mermaid">
+flowchart TB
+    KL["kubelet"] -->|CRI gRPC| CT["containerd (or CRI-O)"]
+    CT -->|pull manifest+layers| REG["Image Registry"]
+    CT -->|generate OCI spec| RUNC["OCI runtime (runc)"]
+    RUNC -->|create namespaces+cgroups+exec| PROC["Container process"]
+    CT -->|configure limits| CGROUP["cgroups (CPU/memory enforcement)"]
+    CGROUP --> PROC
+</pre>
+
+<pre class="mermaid">
+sequenceDiagram
+    participant K as kubelet
+    participant C as containerd
+    participant R as Registry
+    participant O as runc
+    K->>C: RunPodSandbox (CRI)
+    C->>O: create pause container + namespaces
+    O-->>C: Sandbox ready
+    K->>C: PullImage (CRI)
+    C->>C: Check local content store
+    alt Image not cached
+        C->>R: Pull manifest + layers
+        R-->>C: Layers downloaded, digest verified
+    end
+    K->>C: CreateContainer + StartContainer (CRI)
+    C->>O: Generate OCI spec, exec entrypoint
+    O-->>C: Process running
+    C-->>K: Container running (status)
+</pre>
+
+<h2 id="code-example">Code Example</h2>
+<pre><code># containerd config — the runtime's own config file, not a Kubernetes YAML.
+# /etc/containerd/config.toml
+version = 2
+
+[plugins."io.containerd.grpc.v1.cri"]
+  sandbox_image = "registry.k8s.io/pause:3.9"   # the "pause" container that holds the Pod's namespaces
+
+[plugins."io.containerd.grpc.v1.cri".containerd]
+  default_runtime_name = "runc"
+
+[plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc]
+  runtime_type = "io.containerd.runc.v2"
+
+[plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc.options]
+  SystemdCgroup = true                # MUST match kubelet's cgroupDriver=systemd setting
+
+[plugins."io.containerd.grpc.v1.cri".registry.mirrors."docker.io"]
+  endpoint = ["https://mirror.internal.example.com"]   # pull-through cache, avoids Docker Hub rate limits
+
+# crictl — the CRI-level CLI, used to debug the runtime directly (bypassing kubectl)
+# crictl pull nginx:1.25
+# crictl images
+# crictl ps -a
+# crictl inspect <container-id>
+</code></pre>
+
+<h2 id="kubectl-commands">kubectl Commands</h2>
+<pre><code># See which runtime + version a node reports
+kubectl get nodes -o custom-columns=NAME:.metadata.name,RUNTIME:.status.nodeInfo.containerRuntimeVersion
+
+# Check image pull policy and status for a Pod
+kubectl describe pod my-pod | grep -A3 Image
+
+# See image pull failures/backoff
+kubectl get events --field-selector reason=Failed,reason=BackOff
+
+# Confirm resource limits are actually enforced (cgroup-level effect visible via kubectl top)
+kubectl top pod my-pod --containers
+
+# On the node (debug pod or SSH), talk to the runtime directly:
+# crictl ps -a
+# crictl logs <container-id>
+# crictl inspect <container-id> | grep -i cgroup
+
+kubectl describe node worker-3 | grep -i "Container Runtime"
+</code></pre>
+
+<h2 id="best-practices">Best Practices &amp; Common Pitfalls</h2>
+<div class="grid-2">
+<div>
+<h4>Best Practices</h4>
+<ul>
+  <li>Run a registry pull-through cache/mirror to avoid rate limits and reduce Pod startup latency.</li>
+  <li>Keep the runtime's cgroup driver setting in sync with kubelet's.</li>
+  <li>Use <code>imagePullPolicy: IfNotPresent</code> for immutable, digest-pinned production images.</li>
+  <li>Set both CPU/memory requests and limits so cgroup enforcement behaves predictably.</li>
+</ul>
+</div>
+<div>
+<h4>Pitfalls</h4>
+<ul>
+  <li>Mismatched cgroup drivers between kubelet and runtime — causes subtle, hard-to-diagnose instability.</li>
+  <li>Using <code>imagePullPolicy: Always</code> universally, adding registry round-trip latency to every Pod start.</li>
+  <li>Diagnosing "container won't start" purely via <code>kubectl</code> instead of dropping to <code>crictl</code> on the node when the issue is below kubelet.</li>
+  <li>Ignoring image layer bloat — huge images slow scheduling-to-Running time cluster-wide during traffic spikes/autoscale events.</li>
+</ul>
+</div>
+</div>
+
+<h2 id="interview-questions">50 Interview Questions</h2>
+
+<details class="qa"><summary>1. What is the container runtime's job, and why doesn't kubelet do this work directly?</summary>
+<div class="qa-body"><strong>Short answer:</strong> The runtime pulls images, unpacks filesystem layers, creates namespaces/cgroups, and executes the containerized process; kubelet delegates all of this via the CRI so it never needs runtime-specific code.
+<br><strong>Detail:</strong> Kubernetes itself has no built-in knowledge of how to actually run a container process — that's a genuinely separate, fast-moving ecosystem concern handled entirely by the runtime layer.
+<br><strong>Production example:</strong> kubelet issues a CRI <code>CreateContainer</code> call and never touches image layers or cgroup files itself — containerd does all of that work.
+<br><strong>Common mistake:</strong> Assuming kubelet directly manipulates containers/images — it only ever talks CRI gRPC to a runtime that does the real work.</div></details>
+
+<details class="qa"><summary>2. Why was the CRI introduced, and what problem did tight Docker coupling cause before it existed?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Early Kubernetes paid a real cost being tightly coupled to Docker specifically; CRI standardized the interface so kubelet's code never needs to change when the runtime changes.
+<br><strong>Detail:</strong> CRI is a gRPC API contract — any CRI-compliant runtime (containerd, CRI-O) can be swapped in without touching kubelet internals, decoupling the fast-moving runtime ecosystem from core Kubernetes development.
+<br><strong>Production example:</strong> Migrating a fleet from dockershim to containerd required runtime-level configuration changes only, with zero kubelet code changes.
+<br><strong>Common mistake:</strong> Believing Docker Engine is still used directly today — even Docker Desktop-based clusters run containerd underneath now.</div></details>
+
+<details class="qa"><summary>3. What are the three layers in the runtime architecture, from Kubernetes-facing down to the actual process?</summary>
+<div class="qa-body"><strong>Short answer:</strong> CRI (Kubernetes-facing gRPC contract) &rarr; containerd/CRI-O (image + lifecycle management) &rarr; OCI runtime (actual process creation).
+<br><strong>Detail:</strong> containerd/CRI-O handle image management, storage, and the CRI gRPC surface, then generate an OCI runtime spec and shell out to an OCI runtime like runc to create namespaces/cgroups and exec the entrypoint.
+<br><strong>Production example:</strong> containerd generates a <code>config.json</code> OCI spec describing the container's namespaces/mounts, then invokes runc to actually create the process.
+<br><strong>Common mistake:</strong> Conflating "container runtime" (containerd/CRI-O) with "OCI runtime" (runc) as if they're the same layer — they have distinct responsibilities.</div></details>
+
+<details class="qa"><summary>4. What is runc, and what alternatives exist for sandboxed isolation?</summary>
+<div class="qa-body"><strong>Short answer:</strong> runc is the reference OCI runtime that creates namespaces/cgroups and execs the container process; gVisor and Kata provide stronger sandboxed isolation as alternatives.
+<br><strong>Detail:</strong> runc runs the container as a regular (namespaced/cgrouped) Linux process sharing the host kernel; gVisor intercepts syscalls in userspace and Kata runs each container in a lightweight VM, trading some performance for stronger isolation boundaries.
+<br><strong>Production example:</strong> A multi-tenant platform running untrusted workloads might configure a RuntimeClass that routes specific Pods to Kata containers instead of runc for kernel-level isolation.
+<br><strong>Common mistake:</strong> Assuming all containers on a node share identical isolation guarantees — the underlying OCI runtime (runc vs gVisor vs Kata) materially changes that.</div></details>
+
+<details class="qa"><summary>5. Walk through the image pull flow when kubelet asks the runtime to pull an image.</summary>
+<div class="qa-body"><strong>Short answer:</strong> The runtime checks its local content-addressable store first; if the image is missing, it pulls each layer from the registry, verifies digests, and unpacks before the container can start.
+<br><strong>Detail:</strong> This flow is gated by <code>imagePullPolicy</code> (<code>Always</code>, <code>IfNotPresent</code>, <code>Never</code>), and registry rate limits, network latency, and large image sizes directly translate into slower Pod scheduling-to-Running time.
+<br><strong>Production example:</strong> A cluster running a local registry pull-through cache/mirror to avoid Docker Hub rate limits and cut Pod startup latency during autoscale events.
+<br><strong>Common mistake:</strong> Using <code>imagePullPolicy: Always</code> universally, adding an unnecessary registry round-trip to every single Pod start even when the image hasn't changed.</div></details>
+
+<details class="qa"><summary>6. Where does cgroup-based resource enforcement actually happen, and why does that matter for diagnosing incidents?</summary>
+<div class="qa-body"><strong>Short answer:</strong> The container runtime configures cgroups based on Pod spec <code>resources.limits</code> — CPU limits become CFS quota/period settings, memory limits become cgroup memory limits enforced by the kernel.
+<br><strong>Detail:</strong> Neither kubelet nor the API Server enforces resource limits directly — they only pass values down; the runtime translates them into kernel cgroup controller settings, and the kernel itself performs OOM-kill or CPU-throttling.
+<br><strong>Production example:</strong> An OOMKilled Pod is the kernel's OOM killer acting on a cgroup memory limit the runtime configured — not a kubelet-level decision.
+<br><strong>Common mistake:</strong> Trying to explain CPU throttling or OOMKilled purely by looking at kubelet logs instead of understanding it's a kernel/cgroup-level enforcement mechanism.</div></details>
+
+<details class="qa"><summary>7. Why must the cgroup driver setting match between kubelet and the container runtime?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Both write cgroup settings for the same containers; a mismatch means two different managers compete over the same cgroup hierarchy, causing subtle instability.
+<br><strong>Detail:</strong> containerd's <code>SystemdCgroup</code> option must align with kubelet's <code>cgroupDriver</code> flag — if one uses systemd and the other cgroupfs, resource enforcement becomes inconsistent in ways that are hard to trace back to the root cause.
+<br><strong>Production example:</strong> Setting <code>SystemdCgroup = true</code> in containerd's config specifically because kubelet is configured with <code>cgroupDriver=systemd</code>.
+<br><strong>Common mistake:</strong> Changing one side's cgroup driver during a runtime upgrade without verifying the other side still matches.</div></details>
+
+<details class="qa"><summary>8. What is the "pause" container/sandbox_image, and what is it for?</summary>
+<div class="qa-body"><strong>Short answer:</strong> A minimal container the runtime creates first to hold the Pod's shared namespaces (network, IPC) before any application containers start.
+<br><strong>Detail:</strong> Configured via <code>sandbox_image</code> in containerd's config, the pause container's sole job is to exist and hold the namespaces open so all containers in the Pod can share them, even if application containers restart.
+<br><strong>Production example:</strong> <code>RunPodSandbox</code> in the CRI creates this pause container first, before <code>CreateContainer</code>/<code>StartContainer</code> ever run for the actual application container.
+<br><strong>Common mistake:</strong> Being confused by an extra "pause" process/container showing up per Pod in <code>crictl ps -a</code> output and thinking it's an application bug.</div></details>
+
+<details class="qa"><summary>9. What is crictl, and why would you use it instead of kubectl for a debugging session?</summary>
+<div class="qa-body"><strong>Short answer:</strong> crictl is a CRI-level CLI that talks directly to the container runtime, bypassing kubelet and the API Server entirely.
+<br><strong>Detail:</strong> When an issue is below kubelet — e.g. a stuck image pull, a runtime-level crash, or a cgroup misconfiguration — kubectl can't see far enough; crictl commands like <code>crictl ps -a</code>, <code>crictl inspect</code>, and <code>crictl logs</code> query the runtime directly on the node.
+<br><strong>Production example:</strong> Diagnosing a container stuck in <code>ContainerCreating</code> by SSHing to the node and running <code>crictl inspect &lt;container-id&gt;</code> to see the actual CRI-level state and error.
+<br><strong>Common mistake:</strong> Trying to diagnose "container won't start" purely via <code>kubectl</code> instead of dropping to <code>crictl</code> on the node when the failure is at the runtime layer.</div></details>
+
+<details class="qa"><summary>10. Who creates the Pod's network namespace, and how does that interact with the CNI plugin?</summary>
+<div class="qa-body"><strong>Short answer:</strong> The container runtime creates the network namespace during sandbox creation; kubelet then invokes the CNI plugin to wire it up with actual networking.
+<br><strong>Detail:</strong> This is a coordinated two-step process — the runtime provides the empty namespace as part of <code>RunPodSandbox</code>, and kubelet's separate call to the CNI plugin populates it with an IP address and routes.
+<br><strong>Production example:</strong> A Pod stuck in <code>ContainerCreating</code> due to a CNI plugin failure still has a runtime-created sandbox/namespace — the failure is specifically in the kubelet-to-CNI step, not the runtime's sandbox creation.
+<br><strong>Common mistake:</strong> Assuming the container runtime itself configures Pod networking end-to-end — it only creates the namespace; the CNI plugin (invoked by kubelet) does the actual wiring.</div></details>
+
+<details class="qa"><summary>11–50. Additional rapid-fire questions</summary>
+<div class="qa-body">
+<strong>11.</strong> What protocol does kubelet use to talk to the container runtime? — gRPC over a Unix domain socket, per the CRI spec.<br>
+<strong>12.</strong> Name two dominant CRI-compliant runtimes in use today. — containerd and CRI-O.<br>
+<strong>13.</strong> What organization defines the low-level container spec that runc implements? — The OCI (Open Container Initiative).<br>
+<strong>14.</strong> What file describes a container's namespaces/cgroups/mounts to an OCI runtime? — The OCI runtime spec's <code>config.json</code>.<br>
+<strong>15.</strong> What CRI call creates the Pod sandbox before any application container starts? — <code>RunPodSandbox</code>.<br>
+<strong>16.</strong> What CRI calls follow sandbox creation to start an application container? — <code>PullImage</code>, then <code>CreateContainer</code>, then <code>StartContainer</code>.<br>
+<strong>17.</strong> What does the runtime check before pulling an image over the network? — Its local content-addressable store, to see if the image is already cached.<br>
+<strong>18.</strong> What are the three imagePullPolicy values? — <code>Always</code>, <code>IfNotPresent</code>, <code>Never</code>.<br>
+<strong>19.</strong> Why is imagePullPolicy: Always risky for every Pod universally? — It adds a registry round-trip to every Pod start even when the image is unchanged, slowing scheduling-to-Running time.<br>
+<strong>20.</strong> What verifies image integrity during a pull? — Digest verification against the registry-provided manifest.<br>
+<strong>21.</strong> What operational pattern reduces registry rate-limit and latency issues? — Running a local registry mirror/pull-through cache.<br>
+<strong>22.</strong> What kernel mechanism enforces CPU limits set in a Pod spec? — CFS (Completely Fair Scheduler) quota/period settings via cgroups.<br>
+<strong>23.</strong> What kernel mechanism enforces memory limits? — cgroup memory limits, which trigger OOM-kill when exceeded.<br>
+<strong>24.</strong> Does the API Server enforce resource limits directly? — No, it only stores the spec; the runtime configures cgroups and the kernel enforces them.<br>
+<strong>25.</strong> What config field in containerd must match kubelet's cgroupDriver=systemd? — <code>SystemdCgroup = true</code> under the runc runtime options.<br>
+<strong>26.</strong> What CLI tool inspects a running container directly via the CRI, bypassing kubectl? — crictl.<br>
+<strong>27.</strong> What crictl command lists all containers on a node, including stopped ones? — <code>crictl ps -a</code>.<br>
+<strong>28.</strong> What crictl command pulls an image directly, bypassing kubelet? — <code>crictl pull &lt;image&gt;</code>.<br>
+<strong>29.</strong> What does the "pause" container/sandbox_image hold open for the Pod? — The shared network and IPC namespaces used by all containers in the Pod.<br>
+<strong>30.</strong> Is dockershim still part of kubelet today? — No, it was removed; kubelet only speaks CRI to compliant runtimes now.<br>
+<strong>31.</strong> What layer generates the OCI config.json before invoking runc? — containerd (or CRI-O), the CRI-compliant runtime layer.<br>
+<strong>32.</strong> What's a common cause of slow Pod startup unrelated to scheduling? — Large image size combined with no local cache/mirror, causing a slow image pull.<br>
+<strong>33.</strong> How would you check which runtime + version a node is using? — <code>kubectl get nodes -o custom-columns=...containerRuntimeVersion</code>.<br>
+<strong>34.</strong> What kubectl-visible signal suggests an image pull failure? — Events with <code>reason=Failed</code> or <code>reason=BackOff</code> on the Pod.<br>
+<strong>35.</strong> Does kubectl top reflect cgroup-level resource enforcement? — Yes, it surfaces actual usage against limits enforced at the cgroup level.<br>
+<strong>36.</strong> What creates the network namespace: the runtime or the CNI plugin? — The container runtime creates the namespace; the CNI plugin then configures it.<br>
+<strong>37.</strong> What's the risk of ignoring image layer bloat cluster-wide? — Slower scheduling-to-Running time cluster-wide, especially damaging during traffic spikes/autoscale events.<br>
+<strong>38.</strong> What is gVisor's isolation approach compared to runc? — It intercepts syscalls in userspace rather than letting the container share the host kernel directly like runc does.<br>
+<strong>39.</strong> What is Kata containers' isolation approach? — Running each container inside a lightweight VM instead of as a namespaced host process.<br>
+<strong>40.</strong> What Kubernetes object lets you select a non-default OCI runtime per Pod? — RuntimeClass.<br>
+<strong>41.</strong> Why is CRI described as a "contract" rather than an implementation? — Because it's just a gRPC API definition — any compliant runtime can implement it independently of kubelet's code.<br>
+<strong>42.</strong> What happens if the runtime and kubelet disagree on cgroup driver? — Two managers writing conflicting cgroup settings, causing subtle, hard-to-diagnose stability issues.<br>
+<strong>43.</strong> What's the relationship between StopContainer/RemoveContainer CRI calls and Pod deletion? — kubelet issues these CRI calls to tear down containers when a Pod is deleted or terminated.<br>
+<strong>44.</strong> Why would you inspect cgroup settings via crictl inspect during an OOMKilled investigation? — To confirm the actual memory limit the runtime configured for that container, not just what the Pod spec requested.<br>
+<strong>45.</strong> What's a production reason to pin images by digest rather than tag? — Guarantees the exact same image content is pulled regardless of tag mutation, avoiding pull inconsistency across nodes.<br>
+<strong>46.</strong> Does the container runtime persist any cluster-level state itself? — No, it's node-local; cluster state lives in etcd via the API Server.<br>
+<strong>47.</strong> What's the effect of a registry outage on running Pods vs new Pods? — Running Pods are unaffected; new Pods needing an uncached image will fail to pull/start.<br>
+<strong>48.</strong> Why is "Container Runtime &harr; CNI (via kubelet)" described as an indirect interaction? — Because the runtime and CNI plugin don't talk to each other directly — kubelet coordinates the sandbox creation and CNI invocation as separate steps.<br>
+<strong>49.</strong> What's the value of separating image/lifecycle management (containerd) from process creation (runc)? — It lets alternate OCI runtimes (gVisor, Kata) be swapped in for isolation needs without changing containerd/CRI-O's image and lifecycle logic.<br>
+<strong>50.</strong> Why is understanding the CRI/OCI layering important for diagnosing "it works in Docker but not in Kubernetes" reports? — Because the actual execution path (CRI &rarr; containerd/CRI-O &rarr; OCI runtime) differs from a standalone Docker Engine setup, so runtime-specific assumptions from plain Docker don't always carry over.
+</div></details>
+
+<footer class="course-footer">Next: Topic 11 — Pods, the smallest deployable unit that everything covered so far exists to run.</footer>
+
+<script>
+  mermaid.initialize({ startOnLoad: true, theme: 'dark' });
+</script>
+
+</body>
+</html>

@@ -1,0 +1,238 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Topic 28: ConfigMaps — Kubernetes Expert Course</title>
+<link rel="stylesheet" href="styles.css">
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+</head>
+<body>
+
+<header class="course-header">
+  <div class="kicker">Topic 28 of 70</div>
+  <h1>ConfigMaps</h1>
+  <div class="subtitle">Externalizing non-secret configuration — literals, files, env vars, volume mounts, and how updates propagate.</div>
+</header>
+
+<nav class="topic-nav">
+  <a href="27-csi.html">&larr; CSI</a>
+  <a href="index.html">Course Index</a>
+  <a href="29-secrets.html">Secrets &rarr;</a>
+</nav>
+
+<h2 id="explanation">Explanation</h2>
+<p>A <strong>ConfigMap</strong> is a key-value store for non-sensitive configuration, decoupled from the container image. The core problem it solves: without it, changing a config value (a feature flag, a log level, a database hostname) means rebuilding and re-pushing a container image, which is slow and couples "config" to "code" in a way that doesn't match how operations teams actually work — the same image should be deployable to dev/staging/prod with different config, not rebuilt per environment.</p>
+<p>ConfigMaps can be created from literal key-value pairs (<code>--from-literal</code>), from whole files (<code>--from-file</code>, useful for a full <code>nginx.conf</code> or <code>application.yaml</code>), or declaratively via YAML with a <code>data</code> map. They're namespaced, so the same ConfigMap name can exist independently in <code>dev</code> and <code>prod</code> namespaces with different values — this is the standard pattern for per-environment configuration with identical manifests otherwise.</p>
+<p>There are two fundamentally different ways to consume a ConfigMap, and the choice has real operational consequences. As <strong>environment variables</strong> (<code>envFrom</code> or individual <code>valueFrom.configMapKeyRef</code>), values are injected once at container start — simple, and what most 12-factor apps expect, but a change to the ConfigMap has zero effect on already-running Pods; you must trigger a rollout to pick up new values. As a <strong>volume mount</strong>, the ConfigMap's keys appear as files in a directory inside the container, and kubelet actively watches for ConfigMap changes and updates the mounted files in place (usually within about a minute, via the kubelet sync loop) — without restarting the Pod. This makes volume-mounted ConfigMaps the right choice for apps that can hot-reload config from disk (e.g. watching a file for changes), while env vars remain the right choice for values read once at startup.</p>
+<p>ConfigMaps are also the natural place to store whole configuration files consumed by sidecars or the main container's binary — Envoy config, Prometheus scrape configs, Fluent Bit pipelines — letting the same generic container image be reused across many different deployments purely by swapping the mounted ConfigMap.</p>
+
+<h2 id="internal-working">Internal Working / Interactions</h2>
+<ul>
+<li><strong>API Server / etcd</strong> — ConfigMaps are stored as plain (unencrypted, unlike Secrets which get optional encryption-at-rest treatment) objects.</li>
+<li><strong>kubelet</strong> — for env-var consumption, reads the ConfigMap once at Pod creation to populate the container's environment; for volume mounts, keeps a watch and syncs updated keys to the mounted files periodically.</li>
+<li><strong>Deployment/rollout controllers</strong> — do NOT automatically restart Pods on ConfigMap change; teams commonly use a checksum annotation on the Pod template (hashed from the ConfigMap contents) to force a rollout when config changes.</li>
+</ul>
+
+<h2 id="architecture-diagram">Architecture Diagram</h2>
+<pre class="mermaid">
+flowchart TD
+  CM[ConfigMap app-config] -->|envFrom / configMapKeyRef| EnvPod[Pod: env vars set once at start]
+  CM -->|volumeMount| VolPod[Pod: files in /etc/config]
+  API[API Server] -->|watch| Kubelet[kubelet]
+  Kubelet -->|periodic sync ~60s| VolPod
+  CM -.->|edit via kubectl apply| API
+  EnvPod -.->|no auto-update: requires rollout| Restart[Manual/triggered Pod restart]
+</pre>
+
+<h2 id="code-example">Code Example</h2>
+<pre><code># ConfigMap holding both simple key-values and a whole config file
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app-config
+  namespace: shop
+data:
+  LOG_LEVEL: "info"                 # simple key, consumable as an env var
+  FEATURE_NEW_CHECKOUT: "true"
+  app.properties: |                 # a whole file, consumable via volume mount
+    server.port=8080
+    cache.ttl=300
+    retry.max=3
+
+---
+# Pod consuming the ConfigMap both ways
+apiVersion: v1
+kind: Pod
+metadata:
+  name: app-pod
+  namespace: shop
+spec:
+  containers:
+  - name: app
+    image: myco/app:1.4.0
+    envFrom:
+    - configMapRef:
+        name: app-config            # LOG_LEVEL and FEATURE_NEW_CHECKOUT become env vars automatically
+    env:
+    - name: SPECIFIC_KEY
+      valueFrom:
+        configMapKeyRef:
+          name: app-config
+          key: LOG_LEVEL             # pull just one key under a custom env var name
+    volumeMounts:
+    - name: config-volume
+      mountPath: /etc/config          # app.properties appears here as a real file, live-updated
+  volumes:
+  - name: config-volume
+    configMap:
+      name: app-config
+</code></pre>
+
+<h2 id="kubectl-commands">kubectl Commands</h2>
+<pre><code>kubectl create configmap app-config --from-literal=LOG_LEVEL=info   # imperative creation
+kubectl create configmap nginx-conf --from-file=nginx.conf          # from a whole file
+kubectl get configmap app-config -n shop -o yaml                    # inspect full contents
+kubectl describe configmap app-config -n shop                       # summary view
+kubectl edit configmap app-config -n shop                           # live edit (triggers volume sync, not env)
+kubectl rollout restart deployment/app -n shop                      # force Pods to pick up new env values
+kubectl exec app-pod -n shop -- cat /etc/config/app.properties      # verify mounted file contents
+</code></pre>
+
+<h2 id="best-practices">Best Practices &amp; Common Pitfalls</h2>
+<div class="grid-2">
+<div class="callout good">
+<strong>Do</strong>
+<ul>
+<li>Use a content-hash annotation on the Pod template so ConfigMap changes trigger an automatic rollout.</li>
+<li>Prefer volume mounts for config an app can hot-reload; env vars for values read once at startup.</li>
+<li>Keep ConfigMaps small and focused per component rather than one giant cluster-wide config object.</li>
+<li>Version-control ConfigMap manifests the same as any other Kubernetes object (GitOps).</li>
+</ul>
+</div>
+<div class="callout warn">
+<strong>Pitfalls</strong>
+<ul>
+<li>Editing a ConfigMap and assuming env-var-consuming Pods immediately see the change — they won't until restarted.</li>
+<li>Storing secrets in a ConfigMap "temporarily" — it has no encryption and is visible to anyone with read access.</li>
+<li>Exceeding the ~1MiB etcd object size limit by stuffing huge files into a single ConfigMap.</li>
+<li>Relying on the exact kubelet sync interval for volume-mounted updates — it's eventually consistent, not instant.</li>
+</ul>
+</div>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="interview-questions">50 Interview Questions</h2>
+
+<details class="qa"><summary>1. What problem does a ConfigMap actually solve that hardcoding values in the image doesn't?</summary>
+<div class="qa-body"><strong>Short answer:</strong> It decouples configuration from the container image so the same built artifact can run in dev, staging, and prod with different values.
+<br><strong>Detailed explanation:</strong> Without ConfigMaps, changing a log level or a feature flag means rebuilding and re-pushing the image — slow, and it wrongly couples "config" with "code." A ConfigMap lets the image stay identical while an external key-value object supplies environment-specific values.
+<br><strong>Production example:</strong> The same <code>myco/app:1.4.0</code> image is deployed to <code>dev</code> and <code>prod</code> namespaces, each with its own <code>app-config</code> ConfigMap setting different <code>LOG_LEVEL</code> or feature-flag values.
+<br><strong>Common mistake:</strong> Baking environment-specific values into the image and maintaining separate image tags per environment instead of externalizing config.</div></details>
+
+<details class="qa"><summary>2. What are the three ways to create a ConfigMap, and when would you pick each?</summary>
+<div class="qa-body"><strong>Short answer:</strong> <code>--from-literal</code> for individual key-value pairs, <code>--from-file</code> for whole files, and a declarative YAML <code>data</code> map for anything version-controlled.
+<br><strong>Detailed explanation:</strong> <code>--from-literal</code> is quick for one-off imperative key=value pairs. <code>--from-file</code> is used when you need to hand a whole config file (like <code>nginx.conf</code>) to a container as-is. Declarative YAML with a <code>data</code> map is the production-grade approach since it's diffable and lives in Git.
+<br><strong>Production example:</strong> A ConfigMap holding both <code>LOG_LEVEL: "info"</code> as a literal-style key and a full <code>app.properties</code> file under one key, defined declaratively in a checked-in manifest.
+<br><strong>Common mistake:</strong> Relying on imperative <code>kubectl create configmap --from-literal</code> commands for production config with no YAML source of truth in Git.</div></details>
+
+<details class="qa"><summary>3. Why can the same ConfigMap name exist in both dev and prod namespaces with different values?</summary>
+<div class="qa-body"><strong>Short answer:</strong> ConfigMaps are namespaced objects, so identical names in different namespaces are entirely independent resources.
+<br><strong>Detailed explanation:</strong> This is the standard pattern for per-environment configuration: the Deployment manifest referencing <code>app-config</code> stays identical across environments, while the actual ConfigMap object with that name differs per namespace.
+<br><strong>Production example:</strong> <code>app-config</code> in the <code>dev</code> namespace sets <code>FEATURE_NEW_CHECKOUT: "false"</code> while the same-named ConfigMap in <code>prod</code> sets it to <code>"true"</code>, with no changes needed to the Pod spec.
+<br><strong>Common mistake:</strong> Assuming a ConfigMap is cluster-scoped and can be referenced across namespaces without duplicating it into each one.</div></details>
+
+<details class="qa"><summary>4. What's the fundamental difference between consuming a ConfigMap as env vars versus a volume mount?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Env vars are injected once at container start and never update; volume-mounted files are actively kept in sync by kubelet as the ConfigMap changes.
+<br><strong>Detailed explanation:</strong> With <code>envFrom</code> or <code>configMapKeyRef</code>, kubelet reads the ConfigMap once when the container starts. With a volume mount, kubelet maintains a watch and periodically syncs updated keys to the mounted files in place, without touching the running process.
+<br><strong>Production example:</strong> A Pod using <code>envFrom</code> for <code>LOG_LEVEL</code> keeps logging at the old level even after <code>kubectl edit configmap</code>, until the Pod restarts; a Pod mounting <code>app.properties</code> as a volume sees the file update within roughly a minute.
+<br><strong>Common mistake:</strong> Editing a ConfigMap and expecting env-var-based Pods to reflect the change immediately.</div></details>
+
+<details class="qa"><summary>5. Why don't Deployment controllers automatically restart Pods when a referenced ConfigMap changes?</summary>
+<div class="qa-body"><strong>Short answer:</strong> The Deployment controller only watches its own Pod template's spec; a ConfigMap reference by name doesn't change when the ConfigMap's contents change, so no diff is detected.
+<br><strong>Detailed explanation:</strong> Kubernetes has no built-in "config changed, roll the Deployment" mechanism. The Pod template still says <code>configMapRef: app-config</code> before and after the edit — identical spec, so the controller sees nothing to reconcile.
+<br><strong>Production example:</strong> An engineer edits <code>app-config</code> expecting a rollout, but <code>kubectl get pods</code> shows the same Pod ages as before — nothing happened until a manual <code>kubectl rollout restart</code>.
+<br><strong>Common mistake:</strong> Assuming Kubernetes "just knows" to redeploy when config changes, without any explicit rollout trigger in place.</div></details>
+
+<details class="qa"><summary>6. How does the content-hash annotation pattern force a rollout on ConfigMap change?</summary>
+<div class="qa-body"><strong>Short answer:</strong> An annotation on the Pod template is set to a hash of the ConfigMap's contents, so any content change alters the Pod template spec and triggers a real rollout.
+<br><strong>Detailed explanation:</strong> Tools like Helm or Kustomize (or a custom CI step) compute a checksum of the ConfigMap data and inject it as e.g. <code>metadata.annotations.configHash</code> on the Deployment's <code>spec.template</code>. Since the Pod template itself now differs, the Deployment controller detects a genuine spec change and performs a normal rolling update.
+<br><strong>Production example:</strong> A Helm chart templates <code>checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}</code> as a Pod annotation, so every <code>helm upgrade</code> that changes config also rolls the Pods.
+<br><strong>Common mistake:</strong> Forgetting to wire up a hash annotation and relying purely on volume-mount syncing for changes that actually require a full app restart (e.g. changed startup-only settings).</div></details>
+
+<details class="qa"><summary>7. Why would you deliberately choose env vars over a volume mount even though volume mounts auto-update?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Many 12-factor apps only read configuration once at startup, so auto-updating files would have no effect anyway, and env vars are simpler to wire up and inspect.
+<br><strong>Detailed explanation:</strong> If the application code never re-reads a file after boot, a live-updating volume mount just sits there stale in application memory — the update propagation is wasted. Env vars are also easier to `exec` in and check, and match how most language runtimes expect config to arrive.
+<br><strong>Production example:</strong> A Java service that reads <code>System.getenv()</code> once during Spring context initialization gains nothing from a volume mount, so it uses <code>envFrom</code> for simplicity.
+<br><strong>Common mistake:</strong> Wiring config as a volume mount for an app that never watches the filesystem for changes, then being confused why "hot reload" doesn't work.</div></details>
+
+<details class="qa"><summary>8. Why are ConfigMaps a good fit for whole configuration files like Envoy or Prometheus configs?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Storing a whole file as one ConfigMap key and mounting it as a volume lets a single generic container image be reused across many deployments purely by swapping the mounted config.
+<br><strong>Detailed explanation:</strong> Instead of baking a Prometheus scrape config or Fluent Bit pipeline into a custom image, the ConfigMap supplies the file and the volume mount makes it appear at the expected path — the sidecar image itself never changes between environments or teams.
+<br><strong>Production example:</strong> Every team's Fluent Bit sidecar uses the exact same <code>fluent/fluent-bit</code> image, differing only in which <code>fluent-bit.conf</code> ConfigMap is mounted into <code>/fluent-bit/etc/</code>.
+<br><strong>Common mistake:</strong> Building custom container images per team just to embed a different config file, instead of reusing one image with a mounted ConfigMap.</div></details>
+
+<details class="qa"><summary>9. What is the etcd object size limit for a ConfigMap, and why does it matter?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Roughly 1MiB per object, because that's etcd's practical limit for a single stored value.
+<br><strong>Detailed explanation:</strong> Since a ConfigMap is stored as one object in etcd, stuffing large files (bundled binaries, huge JSON blobs, large certs bundles) into it risks hitting this ceiling, causing creation or update failures.
+<br><strong>Production example:</strong> An attempt to store a multi-megabyte GeoIP database as a ConfigMap key fails outright — it needs to be handled via a volume/init-container download instead.
+<br><strong>Common mistake:</strong> Treating a ConfigMap as a general file store for arbitrarily large assets rather than small-to-medium text configuration.</div></details>
+
+<details class="qa"><summary>10. Why should secrets never be stored in a ConfigMap, even "temporarily"?</summary>
+<div class="qa-body"><strong>Short answer:</strong> ConfigMaps are stored as plain, unencrypted objects in etcd and are visible in cleartext to anyone with read access, unlike Secrets which support optional encryption-at-rest.
+<br><strong>Detailed explanation:</strong> A ConfigMap has no base64-obscuring convention and no encryption-at-rest treatment path the way Secrets do; `kubectl get configmap -o yaml` shows every value in plain text immediately.
+<br><strong>Production example:</strong> A database password accidentally placed in a ConfigMap instead of a Secret is visible to any user or service account with `get configmaps` RBAC permission in that namespace — far broader exposure than intended.
+<br><strong>Common mistake:</strong> Using a ConfigMap for a database URL that embeds credentials, rather than splitting the credential into a Secret and only the non-sensitive host/port into the ConfigMap.</div></details>
+
+<details class="qa"><summary>11–50. Additional rapid-fire questions</summary>
+<div class="qa-body">
+<strong>11.</strong> What flag creates a ConfigMap from an entire directory of files at once? — <code>kubectl create configmap &lt;name&gt; --from-file=&lt;dir&gt;</code>, adding one key per file in the directory.<br>
+<strong>12.</strong> Can a ConfigMap key contain a full multi-line file's contents? — Yes, using the YAML block scalar (<code>|</code>) syntax under <code>data</code>, as with <code>app.properties</code>.<br>
+<strong>13.</strong> What command shows the full contents of a ConfigMap? — <code>kubectl get configmap app-config -n shop -o yaml</code>.<br>
+<strong>14.</strong> What's the difference between <code>envFrom</code> and <code>valueFrom.configMapKeyRef</code>? — <code>envFrom</code> imports every key in the ConfigMap as an env var automatically; <code>configMapKeyRef</code> pulls just one specific key, optionally under a different env var name.<br>
+<strong>15.</strong> How often does kubelet sync updated ConfigMap volume-mount contents to the container filesystem? — Roughly every ~60 seconds via its periodic sync loop, not instantly.<br>
+<strong>16.</strong> Does editing a ConfigMap trigger an immediate update for env-var consumers? — No — env vars are set once at container start and never refresh without a restart.<br>
+<strong>17.</strong> What command forces Pods to pick up new env-var values from a changed ConfigMap? — <code>kubectl rollout restart deployment/app -n shop</code>.<br>
+<strong>18.</strong> Are ConfigMaps namespaced or cluster-scoped? — Namespaced — a Pod can only reference a ConfigMap in its own namespace.<br>
+<strong>19.</strong> What happens if a Pod references a ConfigMap key that doesn't exist? — The Pod fails to start (env var case) or the volume mount omits that file, depending on how it's referenced and whether it's marked optional.<br>
+<strong>20.</strong> Can you mark a ConfigMap reference as optional so the Pod still starts if it's missing? — Yes, via <code>optional: true</code> on the <code>configMapRef</code>/<code>configMapKeyRef</code>.<br>
+<strong>21.</strong> What tool commonly auto-generates the content-hash annotation for a Pod template? — Helm (via a checksum template function) or Kustomize's ConfigMap generator with hash suffixes.<br>
+<strong>22.</strong> How does Kustomize's ConfigMap generator force a rollout differently from a manual hash annotation? — It appends a content hash to the generated ConfigMap's name itself, so the Pod template's reference literally changes, triggering a natural rollout.<br>
+<strong>23.</strong> Why might mounting an entire ConfigMap as a volume hide previously existing files in that directory? — By default, a ConfigMap volume mount replaces the entire target directory's contents with only the ConfigMap's keys, unless <code>subPath</code> is used.<br>
+<strong>24.</strong> What does using <code>subPath</code> in a ConfigMap volume mount let you avoid? — It mounts a single file from the ConfigMap without wiping out the rest of the target directory's existing contents.<br>
+<strong>25.</strong> Why does <code>subPath</code> disable the live-update behavior of ConfigMap volume mounts? — kubelet's sync mechanism relies on updating a symlinked directory, which subPath mounts bypass, so subPath files don't auto-update.<br>
+<strong>26.</strong> How would you verify a mounted ConfigMap file actually updated in a running container? — <code>kubectl exec &lt;pod&gt; -- cat /etc/config/app.properties</code> and compare against the current ConfigMap contents.<br>
+<strong>27.</strong> What's a fast way to see a summary of a ConfigMap's keys without dumping full YAML? — <code>kubectl describe configmap app-config -n shop</code>.<br>
+<strong>28.</strong> Why should you version-control ConfigMap manifests the same as application code? — So config changes are reviewed, diffable, and auditable via GitOps rather than made ad hoc with <code>kubectl edit</code>.<br>
+<strong>29.</strong> What risk does <code>kubectl edit configmap</code> in production carry compared to applying from Git? — It bypasses code review and leaves the cluster's live state diverged from the source-controlled manifest.<br>
+<strong>30.</strong> Why is it good practice to keep ConfigMaps small and focused per component? — Smaller, scoped ConfigMaps reduce blast radius and merge conflicts compared to one giant cluster-wide config object.<br>
+<strong>31.</strong> Can multiple Pods/Deployments reference the same ConfigMap simultaneously? — Yes, any number of Pods in the same namespace can mount or reference the same ConfigMap.<br>
+<strong>32.</strong> What happens to Pods already running if you delete a ConfigMap they reference via volume mount? — The mounted files typically remain as last-synced (stale) until kubelet's next failed sync attempt or Pod restart, though behavior can vary by kubelet version.<br>
+<strong>33.</strong> Why is a ConfigMap unsuitable for storing a TLS private key? — It has no encryption and is stored as plain text — a Secret with restricted RBAC is the appropriate object for sensitive material.<br>
+<strong>34.</strong> What's the benefit of using <code>--from-env-file</code> when creating a ConfigMap? — It bulk-imports an entire `.env`-style file of KEY=value lines into ConfigMap data in one command.<br>
+<strong>35.</strong> Why might an application misbehave right after a ConfigMap update even with a volume mount in place? — If the app caches config in memory at startup and never re-reads the file, the on-disk update has no runtime effect without a restart.<br>
+<strong>36.</strong> What's a common pitfall when referencing a ConfigMap key with a name containing dots, like <code>app.properties</code>? — Environment variable names generally can't contain dots, so such keys are only usable via volume mount, not as env vars.<br>
+<strong>37.</strong> How can a mounted ConfigMap volume be made read-only, and why would you want that? — Volume mounts from ConfigMaps are read-only by default, preventing the container from modifying what it perceives as its own config files.<br>
+<strong>38.</strong> Why is it easy to accidentally shadow one ConfigMap key with another when merging multiple ConfigMaps via envFrom? — If two ConfigMaps referenced in the same Pod share a key name, the later one in the list silently overrides the earlier value with no error.<br>
+<strong>39.</strong> How would you diagnose a Pod stuck in <code>CreateContainerConfigError</code> related to a ConfigMap? — Check `kubectl describe pod` events — it usually indicates a referenced ConfigMap or key doesn't exist in that namespace.<br>
+<strong>40.</strong> What's the advantage of declarative YAML ConfigMaps over imperative `kubectl create configmap` commands in CI/CD? — They're reproducible, diffable, and reapplyable via `kubectl apply`, matching GitOps workflows instead of one-off shell commands.<br>
+<strong>41.</strong> Why does a typo in a ConfigMap's key name often fail silently rather than erroring loudly? — For optional references or volume mounts, a missing key can simply be absent from the environment or directory rather than throwing a visible error.<br>
+<strong>42.</strong> What's the relationship between a ConfigMap and an `initContainer` in some config patterns? — An initContainer can read a mounted ConfigMap and transform/render it into a final config file before the main container starts, for cases needing pre-processing.<br>
+<strong>43.</strong> Why would you avoid embedding cluster-specific hostnames directly inside a versioned ConfigMap manifest? — It breaks the "same manifest across environments" pattern; better to template it (Helm/Kustomize) so only values change per environment.<br>
+<strong>44.</strong> What's a good way to validate a ConfigMap's YAML `data` map before applying it in CI? — Run `kubectl apply --dry-run=client -f configmap.yaml` or a schema/lint check as part of the pipeline.<br>
+<strong>45.</strong> Why might two teams sharing a namespace clash over ConfigMap names? — ConfigMaps are namespace-scoped, so identical names in a shared namespace collide and one team can unintentionally overwrite another's config.<br>
+<strong>46.</strong> What's the operational benefit of separating ConfigMaps per microservice rather than one shared "global-config"? — Limits blast radius — an unrelated service's config change can't accidentally roll or break a different service's Pods.<br>
+<strong>47.</strong> How does immutable ConfigMap support (the <code>immutable: true</code> field) help at scale? — It signals to the API server the ConfigMap's data won't change, letting kubelet skip watching it for updates and reducing API server load in large clusters.<br>
+<strong>48.</strong> Why would an immutable ConfigMap be combined with the Kustomize hash-suffix pattern? — Since immutable ConfigMaps can't be edited in place, a new hash-suffixed ConfigMap is created per change and the Deployment is updated to reference the new name, still triggering a proper rollout.<br>
+<strong>49.</strong> What's a quick way to confirm which Pods are actually using a given ConfigMap before deleting it? — Search Deployment/Pod specs (e.g. via `kubectl get pods -o yaml` or a tool like `kubectl-who-uses`) for references to that ConfigMap's name.<br>
+<strong>50.</strong> Why is it best practice to keep environment-specific values in the ConfigMap but keep the Deployment/Pod spec identical across environments? — It maximizes manifest reuse and reduces drift — the only thing that should differ between dev and prod is the data inside the environment's own ConfigMap, not the workload spec itself.
+</div></details>
+
+<footer class="course-footer">Next: Topic 29 — Secrets (types, base64 vs encryption, RBAC implications).</footer>
+
+<script>
+  mermaid.initialize({ startOnLoad: true, theme: 'dark' });
+</script>
+
+</body>
+</html>

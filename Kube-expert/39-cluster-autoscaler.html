@@ -1,0 +1,308 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Topic 39: Cluster Autoscaler — Kubernetes Expert Course</title>
+<link rel="stylesheet" href="styles.css">
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+</head>
+<body>
+
+<header class="course-header">
+  <div class="kicker">Topic 39 of 70</div>
+  <h1>Cluster Autoscaler</h1>
+  <div class="subtitle">Adding and removing whole nodes automatically based on pending pods and node utilization.</div>
+</header>
+
+<nav class="topic-nav">
+  <a href="38-vpa.html">&larr; VPA</a>
+  <a href="index.html">Course Index</a>
+  <a href="40-health-probes.html">Health Probes &rarr;</a>
+</nav>
+
+<h2 id="explanation">Explanation</h2>
+<p>The <strong>Cluster Autoscaler (CA)</strong> is a component that automatically adjusts the <em>number of nodes</em>
+in a cluster based on scheduling pressure: it adds nodes when Pods can't be scheduled due to insufficient capacity,
+and removes nodes when they're significantly underutilized and their Pods could be safely moved elsewhere. Where HPA
+(topic 37) scales Pod count and VPA (topic 38) resizes Pod resource requests, Cluster Autoscaler operates one layer
+below both — it scales the actual infrastructure the Scheduler has to work with.</p>
+
+<p>Kubernetes needs this because the Scheduler can only place Pods on nodes that already exist — if every node is full,
+new Pods simply sit <code>Pending</code> forever, no matter how correctly HPA or VPA sized them. Conversely, a cluster
+sized for peak load but running well below it wastes money on idle nodes around the clock. Cluster Autoscaler closes
+this last gap in the autoscaling stack, turning "add capacity" and "shed capacity" into fully automatic responses to
+real demand rather than a human watching dashboards and resizing node groups by hand.</p>
+
+<p>Cluster Autoscaler is cloud-provider-aware by design — it doesn't manage raw VMs itself, it talks to a
+cloud-specific abstraction (AWS Auto Scaling Groups / EKS Managed Node Groups, GCP Managed Instance Groups, Azure VMSS)
+through a pluggable <strong>cloud provider interface</strong>. This is why it understands the concept of a "node group"
+(a set of nodes with identical capacity/labels/taints) — its core decisions are always phrased in terms of node groups,
+not individual nodes.</p>
+
+<p><strong>Scale-up logic:</strong> CA watches for Pods in <code>Pending</code> state that failed scheduling due to
+insufficient resources. For each node group, it simulates whether adding one more node of that group's instance type
+would allow the Pending Pod to schedule (respecting the Pod's actual constraints — affinity, taints/tolerations,
+topology spread, resource requests). If multiple node groups would work, an "expander" strategy (e.g. least-waste,
+most-pods, priority) picks which one to scale. <strong>Scale-down logic:</strong> CA periodically checks each node's
+utilization; if a node's Pods could all be rescheduled elsewhere within the same constraints, and the node has been
+underutilized for longer than <code>scale-down-unneeded-time</code> (default 10 min), CA cordons and drains it, then
+removes the underlying instance from the node group.</p>
+
+<p>In production, Cluster Autoscaler and HPA are almost always deployed together: HPA reacts to load by creating more
+Pods; if the cluster lacks room, those Pods go Pending; CA reacts to Pending Pods by adding nodes; the Scheduler then
+places the Pods on the new capacity. The chain has real latency at every step (cloud instance boot time is often the
+dominant factor, sometimes 1-3 minutes), which is why over-provisioning a small buffer of headroom (or using low-priority
+placeholder Pods) is a common production pattern to smooth over this scale-up lag.</p>
+
+<div class="callout">
+  <strong>Cluster Autoscaler vs Karpenter:</strong> Karpenter (increasingly popular on AWS) is a newer alternative that
+  provisions individual nodes directly rather than through fixed node groups, offering faster and more flexible
+  bin-packing decisions. Cluster Autoscaler remains the CNCF-standard, cloud-agnostic option and is what most managed
+  Kubernetes documentation and certification exams (CKA) reference.
+</div>
+
+<h2 id="internal-working">Internal Working / Interactions</h2>
+<ul>
+  <li><strong>Scheduler:</strong> CA reads the Scheduler's simulated placement outcome (via its own internal scheduling simulation library, which mirrors the real Scheduler's filtering logic) to decide if a new node would actually unblock a Pending Pod.</li>
+  <li><strong>API Server:</strong> CA watches Pods (for Pending ones) and Nodes (for utilization) via the standard watch/informer pattern, and issues cordon/drain-equivalent operations through the API Server before removing a node.</li>
+  <li><strong>Cloud provider API (ASG/MIG/VMSS):</strong> the actual mechanism for adding/removing capacity — CA calls the cloud provider's scaling API, then waits for the new node to register with the API Server and become Ready.</li>
+  <li><strong>PodDisruptionBudget:</strong> respected during scale-down — CA will not drain a node if doing so would violate a PDB for the Pods running on it.</li>
+  <li><strong>HPA:</strong> upstream trigger in the common chain — HPA creates Pending Pods that CA then reacts to; the two systems don't talk to each other directly, they're chained via the shared Pod/Node state in the API Server.</li>
+</ul>
+
+<h2 id="architecture-diagram">Architecture Diagram</h2>
+<pre class="mermaid">
+flowchart TB
+    HPA["HPA scales Deployment to 10 replicas"] --> PEND["3 pods Pending\n(insufficient node capacity)"]
+    PEND --> CA["Cluster Autoscaler"]
+    CA -->|"Simulate scheduling against\neach node group"| SIM{"Would a new node\nunblock these pods?"}
+    SIM -->|"Yes - node-group-b fits"| CLOUD["Cloud Provider API\n(ASG/MIG/VMSS) scale-up"]
+    CLOUD --> NEWNODE["New node joins cluster,\nregisters with API Server"]
+    NEWNODE --> SCHED["Scheduler places pending pods"]
+
+    UNDER["Node with <50% utilization\nfor > 10 minutes"] --> CA2["Cluster Autoscaler scale-down check"]
+    CA2 -->|"All pods reschedulable\nelsewhere + PDB allows"| DRAIN["Cordon + drain node"]
+    DRAIN --> REMOVE["Cloud Provider API removes instance"]
+</pre>
+
+<pre class="mermaid">
+sequenceDiagram
+    participant S as Scheduler
+    participant A as API Server
+    participant CA as Cluster Autoscaler
+    participant Cloud as Cloud Provider API
+
+    S->>A: Pod fails to schedule (insufficient CPU on all nodes)
+    A-->>CA: Watch fires - Pod Pending with FailedScheduling event
+    CA->>CA: Simulate: would node-group-b's instance type fit this pod?
+    CA->>Cloud: Scale ASG/MIG node-group-b +1
+    Cloud-->>CA: New instance launching
+    Cloud->>A: New node registers, becomes Ready
+    A-->>S: Watch fires - new schedulable node
+    S->>A: Bind pending pod to new node
+</pre>
+
+<h2 id="code-example">Code Example</h2>
+<pre><code># Cluster Autoscaler is typically deployed as a Deployment in kube-system,
+# configured via command-line flags/args rather than a CRD (on most cloud providers).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cluster-autoscaler
+  namespace: kube-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: cluster-autoscaler }
+  template:
+    metadata:
+      labels: { app: cluster-autoscaler }
+    spec:
+      serviceAccountName: cluster-autoscaler
+      containers:
+        - name: cluster-autoscaler
+          image: registry.k8s.io/autoscaling/cluster-autoscaler:v1.29.0
+          command:
+            - ./cluster-autoscaler
+            - --cloud-provider=aws
+            - --namespace=kube-system
+            - --scale-down-enabled=true
+            - --scale-down-unneeded-time=10m       # how long a node must be underused before removal
+            - --scale-down-utilization-threshold=0.5   # below 50% utilization counts as "underused"
+            - --skip-nodes-with-local-storage=false
+            - --expander=least-waste                # scale-up strategy when multiple node groups qualify
+            - --nodes=2:10:eks-node-group-general    # min:max:name - CA-managed node group bounds
+            - --nodes=0:5:eks-node-group-gpu
+</code></pre>
+
+<pre><code># PodDisruptionBudget that Cluster Autoscaler respects during scale-down drains
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: checkout-pdb
+  namespace: payments
+spec:
+  minAvailable: 2          # CA will not drain a node if it would drop below 2 available replicas
+  selector:
+    matchLabels:
+      app: checkout
+</code></pre>
+
+<h2 id="kubectl-commands">kubectl Commands</h2>
+<pre><code># Check Cluster Autoscaler pod health and logs
+kubectl get pods -n kube-system -l app=cluster-autoscaler
+kubectl logs -n kube-system deployment/cluster-autoscaler --tail=100
+
+# See CA's own status/decisions (writes a status configmap)
+kubectl describe configmap cluster-autoscaler-status -n kube-system
+
+# Find pods currently Pending due to insufficient capacity
+kubectl get pods -A --field-selector=status.phase=Pending
+
+# See why a pod couldn't be scheduled (the trigger for CA scale-up)
+kubectl describe pod <pending-pod> | grep -A5 Events
+
+# List nodes and their current utilization
+kubectl top nodes
+
+# Manually cordon a node to test scale-down draining behavior
+kubectl cordon <node-name>
+</code></pre>
+
+<h2 id="best-practices">Best Practices &amp; Common Pitfalls</h2>
+<div class="grid-2">
+<div>
+<h4>Do's</h4>
+<ul>
+  <li>Set realistic min/max bounds per node group to avoid runaway costs or under-provisioning.</li>
+  <li>Set PodDisruptionBudgets on every critical workload so scale-down never drops availability below your threshold.</li>
+  <li>Combine with HPA and correctly-set resource requests — CA's simulation is only as accurate as the requests it reads.</li>
+  <li>Use node group priority/expander strategy deliberately (e.g. prefer spot/cheaper groups first) for cost optimization.</li>
+</ul>
+</div>
+<div>
+<h4>Don'ts</h4>
+<ul>
+  <li>Don't run workloads with local storage or no PDB on nodes you expect CA to freely scale down — they'll block or bypass drains unexpectedly.</li>
+  <li>Don't set <code>scale-down-unneeded-time</code> too low for spiky workloads — you'll get node churn (scale down, immediately scale back up).</li>
+  <li>Don't forget CA cannot help a Pod that's Pending due to affinity/taint mismatches with every node group — it only adds capacity of types that already exist as node groups.</li>
+  <li>Don't rely on CA for sub-minute scaling response — cloud instance boot time is a hard physical floor on scale-up latency.</li>
+</ul>
+</div>
+</div>
+
+<h2 id="interview-questions">50 Interview Questions</h2>
+
+<details class="qa"><summary>1. What does Cluster Autoscaler change, and how does that differ from HPA and VPA?</summary>
+<div class="qa-body"><strong>Short answer:</strong> It adjusts the number of nodes in the cluster, one layer below HPA (Pod count) and VPA (Pod resource sizing) — it scales the actual infrastructure the Scheduler works with.
+<br><strong>Detail:</strong> HPA and VPA can only resize what already fits on existing nodes; if every node is full, no amount of correct Pod sizing helps — CA is what closes that gap.
+<br><strong>Production example:</strong> A load spike triggers HPA to request 10 more replicas; 4 go Pending until CA adds 2 nodes roughly 90 seconds later.
+<br><strong>Common mistake:</strong> Confusing CA with HPA/VPA's scope — CA never touches replica counts or resource requests, only node count.</div></details>
+
+<details class="qa"><summary>2. Why does CA need a "node group" abstraction instead of managing individual VMs?</summary>
+<div class="qa-body"><strong>Short answer:</strong> CA is cloud-provider-aware by design and talks through a pluggable cloud provider interface (ASG, MIG, VMSS) — its decisions are always phrased in terms of a group of nodes with identical capacity/labels/taints, not individual instances.
+<br><strong>Detail:</strong> This is why CA's core scale-up decision is "would adding one more node of this node group's instance type unblock the Pending Pod," rather than reasoning about arbitrary individual machines.
+<br><strong>Production example:</strong> A configuration defines <code>--nodes=2:10:eks-node-group-general</code> and <code>--nodes=0:5:eks-node-group-gpu</code> as two separately-bounded node groups.
+<br><strong>Common mistake:</strong> Assuming CA can provision an arbitrary new instance type on demand — it can only scale within node groups that already exist.</div></details>
+
+<details class="qa"><summary>3. Walk through CA's scale-up logic step by step.</summary>
+<div class="qa-body"><strong>Short answer:</strong> CA watches for Pods stuck Pending due to insufficient resources, then simulates whether adding one more node of each node group's instance type would let that Pod schedule, respecting its actual constraints.
+<br><strong>Detail:</strong> The simulation considers affinity, taints/tolerations, topology spread, and resource requests — the same constraints the real Scheduler enforces. If multiple node groups would work, an expander strategy picks which one.
+<br><strong>Production example:</strong> A Pending Pod requiring a GPU triggers CA to simulate against eks-node-group-gpu specifically, since eks-node-group-general's instance type can't satisfy the constraint.
+<br><strong>Common mistake:</strong> Assuming CA reacts to raw cluster utilization for scale-up — it only reacts to actual scheduling failures (Pending Pods), not general busyness.</div></details>
+
+<details class="qa"><summary>4. Walk through CA's scale-down logic step by step.</summary>
+<div class="qa-body"><strong>Short answer:</strong> CA periodically checks each node's utilization; if a node has been underutilized longer than <code>scale-down-unneeded-time</code> (default 10 min) and all its Pods could be rescheduled elsewhere, CA cordons and drains it, then removes the instance from the node group.
+<br><strong>Detail:</strong> "Could be rescheduled elsewhere" is itself a constraint-aware simulation — the same kind used for scale-up, just checking whether removing capacity is safe rather than whether adding it helps.
+<br><strong>Production example:</strong> <code>--scale-down-utilization-threshold=0.5</code> means a node below 50% utilization for over 10 minutes becomes a scale-down candidate.
+<br><strong>Common mistake:</strong> Assuming CA scales down purely on a timer — it requires both sustained low utilization AND confirmation the node's Pods can be safely relocated.</div></details>
+
+<details class="qa"><summary>5. What is an "expander" strategy and why does it matter?</summary>
+<div class="qa-body"><strong>Short answer:</strong> When multiple node groups could satisfy a Pending Pod's scheduling requirements, the expander strategy (e.g. least-waste, most-pods, priority) decides which node group CA actually scales up.
+<br><strong>Detail:</strong> least-waste picks the option that leaves the least unused capacity after placement; priority lets teams deliberately prefer cheaper/spot node groups first for cost optimization.
+<br><strong>Production example:</strong> The Deployment config sets <code>--expander=least-waste</code> as CA's scale-up strategy when multiple node groups qualify.
+<br><strong>Common mistake:</strong> Assuming CA always picks the cheapest option by default — the expander strategy must be deliberately configured for cost-driven behavior.</div></details>
+
+<details class="qa"><summary>6. Why do HPA and Cluster Autoscaler get deployed together in production, and how are they chained?</summary>
+<div class="qa-body"><strong>Short answer:</strong> HPA reacts to load by creating more Pods; if the cluster lacks room those Pods go Pending, which is the signal CA reacts to by adding nodes — they don't talk to each other directly, they're chained via shared Pod/Node state in the API Server.
+<br><strong>Detail:</strong> This chain has real latency at every step, with cloud instance boot time often the dominant factor (1-3 minutes) — motivating headroom buffers or low-priority placeholder Pods in production.
+<br><strong>Production example:</strong> HPA scaling checkout-service to 10 replicas leaves several Pending until CA provisions and boots new nodes roughly 90 seconds later.
+<br><strong>Common mistake:</strong> Assuming HPA-triggered scaling is instantaneous end-to-end when the cluster lacks headroom — the chained CA response adds real, sometimes multi-minute, latency.</div></details>
+
+<details class="qa"><summary>7. What role does the Scheduler's simulation logic play inside Cluster Autoscaler?</summary>
+<div class="qa-body"><strong>Short answer:</strong> CA maintains its own internal scheduling simulation library that mirrors the real Scheduler's filtering logic, used to decide whether a new node would actually unblock a specific Pending Pod.
+<br><strong>Detail:</strong> This is a simulation, not a live call to the real Scheduler — CA needs to answer "would this pod fit" for hypothetical future nodes that don't exist yet.
+<br><strong>Production example:</strong> Before scaling up eks-node-group-b, CA simulates whether that group's instance type and labels satisfy the Pending Pod's affinity and resource constraints.
+<br><strong>Common mistake:</strong> Assuming CA asks the live Scheduler to test-place a Pod — it uses its own internal simulation, separate from the real scheduling pipeline.</div></details>
+
+<details class="qa"><summary>8. Why does CA respect PodDisruptionBudgets during scale-down?</summary>
+<div class="qa-body"><strong>Short answer:</strong> CA will not drain a node if doing so would violate a PDB for the Pods running on it, preventing scale-down from silently breaching availability guarantees.
+<br><strong>Detail:</strong> This mirrors VPA's Updater behavior (topic 38) — both autoscalers treat PDBs as a hard constraint before evicting/draining, not just a suggestion.
+<br><strong>Production example:</strong> checkout-pdb sets <code>minAvailable: 2</code>, so CA will not drain a node if doing so would drop available checkout replicas below 2.
+<br><strong>Common mistake:</strong> Running workloads with no PDB and assuming CA will "just be careful" — without a PDB, CA has no explicit availability floor to respect.</div></details>
+
+<details class="qa"><summary>9. Why can't CA help a Pod that's Pending due to affinity or taint mismatches?</summary>
+<div class="qa-body"><strong>Short answer:</strong> CA only adds capacity of instance types that already exist as configured node groups — if no node group's labels/taints could ever satisfy the Pod's constraints, adding more nodes of any existing type won't help.
+<br><strong>Detail:</strong> This is a direct consequence of CA's scale-up simulation — it explicitly checks whether a new node of a given node group would unblock the Pod; if none can, CA correctly does nothing.
+<br><strong>Production example:</strong> A Pod requiring a node label that no configured node group has stays Pending indefinitely, regardless of how much CA scales other groups.
+<br><strong>Common mistake:</strong> Assuming CA will eventually resolve any Pending Pod given enough time — it cannot fix scheduling constraints that no existing node group can satisfy.</div></details>
+
+<details class="qa"><summary>10. How would you troubleshoot a Pod stuck Pending when Cluster Autoscaler should have added capacity?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Check the Pod's scheduling failure event for the real constraint, check CA's own logs/status configmap for its decision, and check node group min/max bounds aren't already exhausted.
+<br><strong>Detail:</strong> <code>kubectl describe pod</code> reveals why the Scheduler rejected placement (the same signal CA reacts to); <code>cluster-autoscaler-status</code> configmap and CA's logs reveal whether it even attempted a scale-up and why it may have declined.
+<br><strong>Production example:</strong> A Pod stayed Pending because its node group was already at its configured max (<code>--nodes=2:10:...</code>), a bound CA respects even when scale-up would otherwise help.
+<br><strong>Common mistake:</strong> Assuming a Pending Pod always means CA is broken, rather than checking whether node group bounds or unsatisfiable constraints are the actual cause.</div></details>
+
+<details class="qa"><summary>11–50. Additional rapid-fire questions</summary>
+<div class="qa-body">
+<strong>11.</strong> Where is Cluster Autoscaler typically deployed? — As a Deployment in <code>kube-system</code>.<br>
+<strong>12.</strong> Is CA configured via a CRD or via flags? — Via command-line flags/args on most cloud providers, not a CRD.<br>
+<strong>13.</strong> What flag sets the cloud provider CA talks to? — <code>--cloud-provider</code> (e.g. <code>aws</code>).<br>
+<strong>14.</strong> What flag controls whether scale-down is enabled at all? — <code>--scale-down-enabled</code>.<br>
+<strong>15.</strong> What flag sets how long a node must be underused before removal? — <code>--scale-down-unneeded-time</code> (default 10m).<br>
+<strong>16.</strong> What flag sets the utilization threshold that counts as "underused"? — <code>--scale-down-utilization-threshold</code>.<br>
+<strong>17.</strong> What does the <code>--nodes=min:max:name</code> flag format mean? — Min and max node bounds for a specific CA-managed node group by name.<br>
+<strong>18.</strong> How do you check CA's pod health and recent decisions? — <code>kubectl get pods -n kube-system -l app=cluster-autoscaler</code> and <code>kubectl logs -n kube-system deployment/cluster-autoscaler</code>.<br>
+<strong>19.</strong> What object shows CA's own status/decisions? — The <code>cluster-autoscaler-status</code> configmap.<br>
+<strong>20.</strong> How do you find Pods currently Pending across the cluster? — <code>kubectl get pods -A --field-selector=status.phase=Pending</code>.<br>
+<strong>21.</strong> How do you see why a specific pod couldn't be scheduled? — <code>kubectl describe pod &lt;pending-pod&gt;</code> and check its Events.<br>
+<strong>22.</strong> How do you check current node utilization? — <code>kubectl top nodes</code>.<br>
+<strong>23.</strong> What's a manual way to test scale-down draining behavior? — <code>kubectl cordon &lt;node-name&gt;</code>.<br>
+<strong>24.</strong> What's the CNCF-standard, cloud-agnostic option for node autoscaling? — Cluster Autoscaler itself, referenced by most managed Kubernetes docs and CKA exams.<br>
+<strong>25.</strong> What's a newer AWS-specific alternative to CA? — Karpenter, which provisions individual nodes directly rather than through fixed node groups.<br>
+<strong>26.</strong> What's the main advantage Karpenter offers over CA? — Faster and more flexible bin-packing decisions since it isn't constrained to fixed node group shapes.<br>
+<strong>27.</strong> What component does CA watch to detect scheduling pressure? — Pods (for Pending status) and Nodes (for utilization), via the standard watch/informer pattern against the API Server.<br>
+<strong>28.</strong> What's the biggest fixed latency factor in CA's scale-up chain? — Cloud instance boot time, often the dominant factor (sometimes 1-3 minutes).<br>
+<strong>29.</strong> What's a common production pattern to smooth over CA's scale-up lag? — Over-provisioning a small headroom buffer, or using low-priority placeholder Pods.<br>
+<strong>30.</strong> Why shouldn't you rely on CA for sub-minute scaling response? — Cloud instance boot time is a hard physical floor on scale-up latency that CA cannot shortcut.<br>
+<strong>31.</strong> What happens if you set <code>scale-down-unneeded-time</code> too low for spiky workloads? — Node churn — nodes scale down and then immediately need to scale back up.<br>
+<strong>32.</strong> Why must resource requests be set accurately for CA to work well? — CA's scheduling simulation reads requests to decide whether a new node would fit a Pending Pod — inaccurate requests skew the simulation just like they skew HPA.<br>
+<strong>33.</strong> What flag controls whether nodes with local storage can be scaled down? — <code>--skip-nodes-with-local-storage</code>.<br>
+<strong>34.</strong> Why is running workloads with local storage risky for CA scale-down? — Such nodes may block or bypass drains unexpectedly since local data can't simply migrate elsewhere.<br>
+<strong>35.</strong> What's the relationship between node groups and Kubernetes taints/labels? — A node group is defined as a set of nodes with identical capacity/labels/taints — CA's simulation checks these when deciding if a group can satisfy a Pod.<br>
+<strong>36.</strong> Does CA manage raw VMs directly? — No — it calls the cloud provider's scaling API (ASG/MIG/VMSS) and waits for the new node to register with the API Server and become Ready.<br>
+<strong>37.</strong> What's the one-line difference between CA's scale-up trigger and scale-down trigger? — Scale-up reacts to Pending Pods (a hard failure signal); scale-down reacts to sustained low utilization (a soft, time-gated signal).<br>
+<strong>38.</strong> Why does CA wait for a new node to become "Ready" before considering scale-up complete? — Because only a Ready node is schedulable — the Scheduler can't place Pods on a node still joining the cluster.<br>
+<strong>39.</strong> What's a realistic incident from setting node group max too low? — Traffic growth hits the max bound and CA can't add more nodes even though Pods are Pending, capping real capacity below demand.<br>
+<strong>40.</strong> What's a realistic incident from setting node group min too high? — Paying for idle nodes continuously, since CA won't scale below the configured floor even under low load.<br>
+<strong>41.</strong> Why is combining CA with correctly-set resource requests emphasized as a best practice? — CA's simulation is only as accurate as the requests it reads — wrong requests produce wrong scale-up decisions.<br>
+<strong>42.</strong> What's the relationship between CA and the Deployment/ReplicaSet controller? — None directly — CA only manages node count; the Deployment/ReplicaSet controller still owns Pod creation and placement requests as usual.<br>
+<strong>43.</strong> Why is "priority" a valid expander strategy choice for cost optimization? — It lets teams deliberately prefer cheaper/spot node groups first when multiple groups could satisfy a Pending Pod.<br>
+<strong>44.</strong> What's the danger of a node group with no PDB-respecting workloads on it during scale-down? — None specific — the danger is the opposite: workloads without PDBs anywhere in the cluster leave CA no explicit constraint to protect availability during drains.<br>
+<strong>45.</strong> How does CA interact with cordon/drain semantics? — It performs cordon+drain-equivalent operations through the API Server before removing the underlying instance from the node group.<br>
+<strong>46.</strong> What's the fastest way to determine if HPA or CA is the bottleneck during a slow scale-up? — Check if new Pods are Pending (CA hasn't added capacity yet) vs not yet created at all (HPA hasn't reacted).<br>
+<strong>47.</strong> Why is CA described as operating "one layer below" HPA and VPA? — It scales the physical/virtual infrastructure the Scheduler works with, rather than Pod count or Pod resource sizing.<br>
+<strong>48.</strong> What's a realistic reason a node group might never be scaled down despite low utilization? — Its Pods can't all be safely rescheduled elsewhere (e.g. due to affinity or PDB constraints), so CA declines to drain it.<br>
+<strong>49.</strong> Why is chaining HPA -> CA -> Scheduler described as having "real latency at every step"? — Each stage (HPA's sync period, CA's simulation and cloud API call, node boot time, Scheduler binding) adds sequential delay before a Pending Pod actually runs.<br>
+<strong>50.</strong> What's the one-line interview summary of Cluster Autoscaler? — A cloud-provider-aware controller that adds nodes by simulating whether a new node of some node group would unblock Pending Pods, and removes nodes by confirming sustained low utilization and safe Pod rescheduling, both gated by PodDisruptionBudgets.
+</div></details>
+
+<footer class="course-footer">Next up: Topic 40 — Health Probes: liveness, readiness, and startup checks that keep traffic away from broken pods.</footer>
+
+<script>
+  mermaid.initialize({ startOnLoad: true, theme: 'dark' });
+</script>
+
+</body>
+</html>

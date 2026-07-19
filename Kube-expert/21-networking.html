@@ -1,0 +1,297 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Topic 21: Networking — Kubernetes Expert Course</title>
+<link rel="stylesheet" href="styles.css">
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+</head>
+<body>
+
+<header class="course-header">
+  <div class="kicker">Topic 21 of 70</div>
+  <h1>Networking</h1>
+  <div class="subtitle">The CNI model and the flat-network requirement that makes every Pod reachable from every other Pod, cluster-wide.</div>
+</header>
+
+<nav class="topic-nav">
+  <a href="20-coredns.html">&larr; CoreDNS</a>
+  <a href="index.html">Course Index</a>
+  <a href="22-ingress.html">Ingress &rarr;</a>
+</nav>
+
+<h2 id="explanation">Explanation</h2>
+<p>Kubernetes networking rests on one foundational rule, often called the <strong>Kubernetes networking model</strong>:
+every Pod gets its own IP address, and <strong>every Pod can reach every other Pod's IP directly, cluster-wide,
+without NAT</strong> — regardless of which node either Pod is on. This is a deliberately strong and unusual guarantee
+compared to plain Docker networking (where containers on different hosts can't reach each other by IP without extra
+port-mapping/NAT gymnastics), and it's what allows every other abstraction covered so far — Services, DNS, Endpoints
+— to work uniformly no matter where Pods happen to land.</p>
+
+<p>Kubernetes itself does not implement this networking — it delegates entirely to the <strong>Container Network
+Interface (CNI)</strong>, a plugin standard. The kubelet, when starting a Pod, invokes whatever CNI plugin binary is
+configured on that node to actually set up the Pod's network namespace, assign it an IP, and wire it into the
+cluster-wide network fabric. This plugin boundary is why you choose a CNI implementation (Calico, Cilium, Flannel,
+AWS VPC CNI, etc.) separately from choosing Kubernetes itself — the core API and scheduler have no opinion on
+network implementation, only on the contract every CNI plugin must satisfy.</p>
+
+<p>CNI plugins fall broadly into two architectural families. <strong>Overlay networks</strong> (e.g. Flannel's VXLAN
+mode, Calico in IPIP mode) create a virtual network on top of the existing node network by encapsulating Pod-to-Pod
+packets inside node-to-node packets — this works on any underlying infrastructure (even ones you don't control,
+like arbitrary cloud VPCs) at the cost of some encapsulation overhead and slightly higher latency.
+<strong>Underlay/native-routed networks</strong> (e.g. Calico in BGP mode, AWS VPC CNI) instead assign Pods IPs
+directly from the real, routable network and use standard routing (BGP peers, or in AWS's case, actual ENI secondary
+IPs) so packets flow without encapsulation — better performance and simpler packet inspection, at the cost of
+needing more control over or integration with the underlying network fabric (route table capacity, IP address
+exhaustion in a VPC, etc.).</p>
+
+<p>On top of basic connectivity, most CNI plugins (Calico and Cilium especially) also implement
+<strong>NetworkPolicy</strong> enforcement — the mechanism for restricting which Pods may talk to which other Pods,
+turning the default "everything can reach everything" model into an explicitly allow-listed one. Not every CNI plugin
+supports NetworkPolicy (e.g. plain Flannel does not), which is a key evaluation criterion when choosing one for a
+security-conscious production cluster.</p>
+
+<p>Networking also has to solve node-to-Pod and Pod-to-external-internet paths, but the flat, NAT-less Pod-to-Pod
+guarantee is the one property every higher-level abstraction (Services, DNS, NetworkPolicy) implicitly assumes and
+builds on.</p>
+
+<h2 id="internal-working">Internal Working / Interactions</h2>
+<ul>
+  <li><strong>kubelet</strong> — on Pod creation, calls the configured CNI plugin binary (per the
+  <code>/etc/cni/net.d</code> config) to create the Pod's network namespace, assign an IP, and attach it to the
+  cluster network.</li>
+  <li><strong>CNI plugin (Calico/Cilium/Flannel/VPC CNI)</strong> — runs as its own DaemonSet-managed agent on every
+  node; programs routes, encapsulation rules, or ENI attachments so the new Pod IP is reachable cluster-wide.</li>
+  <li><strong>IPAM (IP Address Management)</strong> — a sub-component (often a separate CNI plugin chained after the
+  main one) that allocates a Pod IP from a per-node CIDR block carved out of the cluster's overall Pod CIDR.</li>
+  <li><strong>kube-proxy</strong> — layers Service virtual-IP routing on top of whatever the CNI plugin provides for
+  raw Pod-to-Pod reachability; it does not replace the CNI, it depends on it.</li>
+  <li><strong>NetworkPolicy controller</strong> (part of the CNI plugin, if supported) — watches NetworkPolicy
+  objects and programs node-local firewall rules (iptables/eBPF) to enforce allow/deny between Pods.</li>
+</ul>
+
+<h2 id="architecture-diagram">Architecture Diagram</h2>
+<pre class="mermaid">
+flowchart TB
+    subgraph N1["Node 1 (Pod CIDR: 10.244.1.0/24)"]
+      CNI1["CNI agent (e.g. Calico)"]
+      PA["Pod A: 10.244.1.5"]
+    end
+    subgraph N2["Node 2 (Pod CIDR: 10.244.2.0/24)"]
+      CNI2["CNI agent (e.g. Calico)"]
+      PB["Pod B: 10.244.2.9"]
+    end
+    PA -->|"Direct IP packet to 10.244.2.9\n(no NAT, cluster-wide flat network)"| CNI1
+    CNI1 -->|"Routed/encapsulated node-to-node"| CNI2
+    CNI2 --> PB
+    Kubelet1["kubelet (Node 1)"] -->|"invokes CNI ADD on Pod create"| CNI1
+    Kubelet2["kubelet (Node 2)"] -->|"invokes CNI ADD on Pod create"| CNI2
+</pre>
+
+<pre class="mermaid">
+sequenceDiagram
+    participant K as kubelet (Node 1)
+    participant CNI as CNI Plugin
+    participant IPAM as IPAM
+    participant Fabric as Network Fabric (overlay/underlay)
+
+    K->>CNI: CNI ADD (new Pod, namespace, container ID)
+    CNI->>IPAM: Request IP from node's Pod CIDR block
+    IPAM-->>CNI: Assigned IP 10.244.1.5
+    CNI->>CNI: Create veth pair, attach to Pod netns
+    CNI->>Fabric: Program route/encapsulation for 10.244.1.5
+    CNI-->>K: IP + network config returned
+    Note over Fabric: Pod is now reachable cluster-wide, no NAT
+</pre>
+
+<h2 id="code-example">Code Example</h2>
+<pre><code># Example: default-deny NetworkPolicy, enforced by the CNI plugin (Calico/Cilium), not core Kubernetes
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  namespace: payments
+spec:
+  podSelector: {}                 # Empty selector = applies to ALL Pods in this namespace.
+  policyTypes:
+    - Ingress                      # Only restricts inbound traffic; egress remains unaffected.
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-checkout-from-gateway
+  namespace: payments
+spec:
+  podSelector:
+    matchLabels:
+      app: checkout                 # Applies to Pods labeled app=checkout.
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: api-gateway       # Only allow traffic from Pods labeled app=api-gateway...
+      ports:
+        - protocol: TCP
+          port: 8080                 # ...and only on port 8080.
+</code></pre>
+
+<h2 id="kubectl-commands">kubectl Commands</h2>
+<pre><code># Identify which CNI is installed and its DaemonSet Pods
+kubectl get pods -n kube-system -l k8s-app=calico-node
+kubectl get daemonset -n kube-system
+
+# Check the cluster's overall Pod CIDR and each node's allocated sub-range
+kubectl cluster-info dump | grep -i cluster-cidr
+kubectl get nodes -o jsonpath='{.items[*].spec.podCIDR}'
+
+# Confirm Pod-to-Pod connectivity across nodes (no NAT expected)
+kubectl run -it --rm netcheck-a --image=busybox --overrides='{"spec":{"nodeName":"node-1"}}' -- sh
+# then from the shell: wget -qO- <pod-B-IP>:8080
+
+# List NetworkPolicies and confirm which Pods they select
+kubectl get networkpolicy -n payments
+kubectl describe networkpolicy default-deny-ingress -n payments
+
+# Check kube-proxy mode in use (iptables vs ipvs vs none, if CNI handles it e.g. Cilium)
+kubectl get configmap kube-proxy -n kube-system -o yaml | grep mode
+</code></pre>
+
+<h2 id="best-practices">Best Practices &amp; Common Pitfalls</h2>
+<div class="grid-2">
+<div>
+<h4>Best Practices</h4>
+<ul>
+  <li>Choose a CNI that supports NetworkPolicy if any workload requires network segmentation (most production clusters do).</li>
+  <li>Size the cluster's Pod CIDR generously up front — resizing it later usually requires cluster recreation.</li>
+  <li>Prefer native-routed/underlay CNI modes (e.g. Calico BGP, VPC CNI) when raw throughput/latency matters and the underlying network supports it.</li>
+  <li>Start with a default-deny NetworkPolicy per namespace, then explicitly allow required paths.</li>
+</ul>
+</div>
+<div>
+<h4>Pitfalls</h4>
+<ul>
+  <li>Running out of IPs on cloud-native CNIs (e.g. AWS VPC CNI) that consume real VPC/subnet IPs per Pod.</li>
+  <li>Assuming NetworkPolicy is enforced when the installed CNI (e.g. plain Flannel) doesn't actually support it.</li>
+  <li>Overlapping the cluster's Pod CIDR with an existing on-prem/VPC range, breaking routing silently.</li>
+  <li>Not accounting for encapsulation overhead (overlay mode) when benchmarking latency-sensitive services.</li>
+</ul>
+</div>
+</div>
+
+<h2 id="interview-questions">50 Interview Questions</h2>
+
+<details class="qa"><summary>1. What is the core guarantee of the Kubernetes networking model?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Every Pod gets its own IP, and every Pod can reach every other Pod's IP directly, cluster-wide, without NAT — regardless of which node either Pod is on.
+<br><strong>Detail:</strong> This is a deliberately strong guarantee compared to plain Docker networking, where cross-host containers can't reach each other by IP without extra port-mapping/NAT gymnastics; it's the assumption every higher-level abstraction (Services, DNS, NetworkPolicy) builds on.
+<br><strong>Production example:</strong> A Pod on Node 1 (10.244.1.5) can directly dial a Pod on Node 2 (10.244.2.9) with no NAT translation in between, letting Services and DNS work uniformly regardless of Pod placement.
+<br><strong>Common mistake:</strong> Assuming Kubernetes networking behaves like Docker's default bridge networking, where cross-host container IPs aren't routable.</div></details>
+
+<details class="qa"><summary>2. What is the CNI, and why does Kubernetes delegate networking to it instead of implementing it natively?</summary>
+<div class="qa-body"><strong>Short answer:</strong> CNI (Container Network Interface) is a plugin standard; Kubernetes has no built-in networking implementation, only a contract every CNI plugin must satisfy.
+<br><strong>Detail:</strong> The kubelet invokes whatever CNI plugin binary is configured on a node whenever it starts a Pod, delegating network namespace setup, IP assignment, and cluster-wide wiring entirely to that plugin — this is what lets Calico, Cilium, Flannel, and AWS VPC CNI all be valid, interchangeable choices.
+<br><strong>Production example:</strong> Two clusters can run identical Kubernetes versions but completely different CNI plugins (one Calico, one Cilium) with zero changes to the API Server or scheduler.
+<br><strong>Common mistake:</strong> Assuming Kubernetes itself provides Pod networking, rather than realizing it's entirely delegated to a swappable external plugin.</div></details>
+
+<details class="qa"><summary>3. What triggers a CNI plugin to run, and what does it actually do?</summary>
+<div class="qa-body"><strong>Short answer:</strong> The kubelet calls the configured CNI plugin binary on Pod creation, per the config in <code>/etc/cni/net.d</code>, to create the Pod's network namespace, assign it an IP, and attach it to the cluster network.
+<br><strong>Detail:</strong> This is the "CNI ADD" operation — the plugin creates a veth pair, requests an IP from IPAM, attaches the veth to the Pod's network namespace, and programs whatever routing/encapsulation is needed for cluster-wide reachability.
+<br><strong>Production example:</strong> The sequence diagram for a new Pod shows kubelet calling CNI ADD, IPAM assigning 10.244.1.5, and the CNI plugin programming the route before returning the IP config to kubelet.
+<br><strong>Common mistake:</strong> Debugging a Pod stuck in ContainerCreating without checking CNI plugin logs/health, when a CNI failure is a common root cause of that state.</div></details>
+
+<details class="qa"><summary>4. What is the difference between overlay and underlay (native-routed) CNI architectures?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Overlay networks (e.g. Flannel VXLAN, Calico IPIP) encapsulate Pod-to-Pod packets inside node-to-node packets; underlay networks (e.g. Calico BGP, AWS VPC CNI) assign Pods real routable IPs and route natively without encapsulation.
+<br><strong>Detail:</strong> Overlay works on any underlying infrastructure you don't control, at the cost of encapsulation overhead and slightly higher latency; underlay gives better performance and simpler packet inspection but needs tighter integration with (or control over) the underlying network fabric.
+<br><strong>Production example:</strong> A cluster spanning multiple cloud VPCs with no BGP peering might use Flannel VXLAN overlay mode, while a single-VPC AWS cluster might use VPC CNI to assign Pods real ENI secondary IPs.
+<br><strong>Common mistake:</strong> Choosing overlay mode by default without considering that native routing (when available) removes encapsulation overhead entirely.</div></details>
+
+<details class="qa"><summary>5. What is IPAM's role in the CNI model?</summary>
+<div class="qa-body"><strong>Short answer:</strong> IPAM (IP Address Management) allocates a Pod's IP from a per-node CIDR block carved out of the cluster's overall Pod CIDR.
+<br><strong>Detail:</strong> IPAM is often a separate plugin chained after the main CNI plugin in the CNI config, meaning the main plugin handles namespace/veth setup while IPAM specifically owns IP allocation bookkeeping per node.
+<br><strong>Production example:</strong> <code>kubectl get nodes -o jsonpath='{.items[*].spec.podCIDR}'</code> shows each node's carved-out sub-range (e.g. 10.244.1.0/24) that IPAM allocates Pod IPs from.
+<br><strong>Common mistake:</strong> Sizing the cluster's overall Pod CIDR too small up front — resizing it later usually requires cluster recreation, since per-node sub-ranges are carved out at cluster bring-up.</div></details>
+
+<details class="qa"><summary>6. How does kube-proxy's role relate to the CNI plugin's role?</summary>
+<div class="qa-body"><strong>Short answer:</strong> kube-proxy layers Service virtual-IP routing on top of whatever raw Pod-to-Pod reachability the CNI plugin provides — it doesn't replace the CNI, it depends on it.
+<br><strong>Detail:</strong> The CNI plugin solves "can Pod A reach Pod B's real IP at all"; kube-proxy solves a separate problem — "how does traffic to a Service's virtual IP get DNAT'd to one of several real Pod IPs" — and that DNAT only works because the underlying Pod-to-Pod path already exists thanks to the CNI.
+<br><strong>Production example:</strong> Some CNIs like Cilium can run in "kube-proxy replacement" mode, implementing Service routing via eBPF instead of relying on a separate kube-proxy process — showing the two concerns are related but distinct.
+<br><strong>Common mistake:</strong> Conflating kube-proxy and the CNI plugin as the same layer, rather than recognizing kube-proxy builds on top of CNI-provided connectivity.</div></details>
+
+<details class="qa"><summary>7. What is NetworkPolicy, and why doesn't every CNI plugin support it?</summary>
+<div class="qa-body"><strong>Short answer:</strong> NetworkPolicy restricts which Pods may talk to which other Pods, turning the default "everything can reach everything" model into an explicitly allow-listed one — but enforcement is implemented by the CNI plugin, not core Kubernetes, so support varies.
+<br><strong>Detail:</strong> Plain Flannel, for example, does not implement NetworkPolicy enforcement at all — a NetworkPolicy object would be accepted by the API Server but silently have no effect — making CNI choice a key evaluation criterion for security-conscious clusters.
+<br><strong>Production example:</strong> A team running plain Flannel writes a default-deny NetworkPolicy expecting it to block traffic, but nothing is actually blocked because Flannel has no NetworkPolicy controller watching and enforcing those objects.
+<br><strong>Common mistake:</strong> Assuming NetworkPolicy is enforced simply because the object was created and accepted by the API Server, without confirming the installed CNI actually supports enforcement.</div></details>
+
+<details class="qa"><summary>8. What does an empty podSelector (<code>{}</code>) mean in a NetworkPolicy, and why is it used for default-deny?</summary>
+<div class="qa-body"><strong>Short answer:</strong> An empty <code>podSelector: {}</code> matches all Pods in the NetworkPolicy's namespace, so combined with <code>policyTypes: [Ingress]</code> and no ingress rules, it denies all inbound traffic to every Pod in that namespace by default.
+<br><strong>Detail:</strong> This is the standard "default-deny-ingress" pattern — start by blocking everything, then layer specific allow rules (like allowing only the api-gateway to reach checkout) on top, following least-privilege network segmentation.
+<br><strong>Production example:</strong> A payments namespace applies <code>default-deny-ingress</code> with an empty selector, then adds <code>allow-checkout-from-gateway</code> permitting only Pods labeled <code>app: api-gateway</code> to reach <code>app: checkout</code> on port 8080.
+<br><strong>Common mistake:</strong> Writing a default-deny NetworkPolicy but forgetting to also add explicit allow rules afterward, silently breaking all legitimate traffic to that namespace.</div></details>
+
+<details class="qa"><summary>9. Why can running out of IPs be a real production risk on cloud-native CNIs like AWS VPC CNI?</summary>
+<div class="qa-body"><strong>Short answer:</strong> AWS VPC CNI assigns Pods real IPs directly from VPC subnet ranges (via ENI secondary IPs) rather than from a separate overlay range, so Pod IP consumption directly competes with the VPC's finite subnet address space.
+<br><strong>Detail:</strong> Unlike overlay CNIs where the Pod CIDR is independent of the real network, underlay/native CNIs tie Pod scaling directly to real, finite address space — a cluster that scales up heavily can exhaust available subnet IPs, blocking new Pod scheduling.
+<br><strong>Production example:</strong> A cluster on AWS VPC CNI hits its subnet's IP capacity during a traffic spike autoscaling event, and new Pods fail to get IPs assigned even though compute capacity (nodes) is still available.
+<br><strong>Common mistake:</strong> Sizing VPC subnets only for node count, not accounting for the much larger number of Pod IPs that a native-routed CNI will consume from the same address space.</div></details>
+
+<details class="qa"><summary>10. Why does overlapping the cluster's Pod CIDR with an existing on-prem or VPC range cause silent routing failures?</summary>
+<div class="qa-body"><strong>Short answer:</strong> If the Pod CIDR overlaps a real, already-routed network range, packets meant for a Pod IP can be ambiguously routed toward the real overlapping network instead, breaking connectivity without any obvious error.
+<br><strong>Detail:</strong> Because the CNI programs routes assuming the Pod CIDR is exclusively its own, any overlap with existing infrastructure creates routing table conflicts that are hard to diagnose since nothing rejects the configuration outright — it just doesn't work correctly for the overlapping ranges.
+<br><strong>Production example:</strong> A cluster's default Pod CIDR (10.244.0.0/16) overlaps a company's existing on-prem VPN range, causing Pods in that overlapping subset to intermittently fail to reach on-prem systems and vice versa.
+<br><strong>Common mistake:</strong> Accepting a CNI's default Pod CIDR without checking it against the organization's existing IP allocation plan before cluster creation.</div></details>
+
+<details class="qa"><summary>11–50. Additional rapid-fire questions</summary>
+<div class="qa-body">
+<strong>11.</strong> Does core Kubernetes (API Server, scheduler) have any opinion on which CNI plugin is used? — No, it only defines the contract every CNI plugin must satisfy.<br>
+<strong>12.</strong> Where is the CNI plugin configuration typically stored on a node? — <code>/etc/cni/net.d</code>.<br>
+<strong>13.</strong> Name three example CNI plugin implementations mentioned for Kubernetes. — Calico, Cilium, Flannel (also AWS VPC CNI).<br>
+<strong>14.</strong> What does "CNI ADD" refer to? — The CNI operation invoked by kubelet to set up networking for a newly created Pod.<br>
+<strong>15.</strong> What kind of pair does a CNI plugin typically create to attach a Pod to the network? — A veth (virtual ethernet) pair.<br>
+<strong>16.</strong> Is Flannel's VXLAN mode an overlay or underlay implementation? — Overlay.<br>
+<strong>17.</strong> Is Calico's BGP mode an overlay or underlay implementation? — Underlay/native-routed.<br>
+<strong>18.</strong> What's the main cost of overlay networking? — Encapsulation overhead and slightly higher latency.<br>
+<strong>19.</strong> What's the main requirement for underlay/native-routed networking to work? — More control over or integration with the underlying network fabric (route table capacity, BGP peering, etc.).<br>
+<strong>20.</strong> Does plain Flannel support NetworkPolicy enforcement? — No.<br>
+<strong>21.</strong> Do Calico and Cilium support NetworkPolicy enforcement? — Yes, both implement it.<br>
+<strong>22.</strong> What object type restricts Pod-to-Pod traffic in Kubernetes? — NetworkPolicy.<br>
+<strong>23.</strong> What is the default Pod-to-Pod traffic model before any NetworkPolicy is applied? — Everything can reach everything (fully open).<br>
+<strong>24.</strong> What does <code>policyTypes: [Ingress]</code> restrict versus egress? — Only inbound traffic to selected Pods; outbound (egress) traffic remains unaffected unless egress is also specified.<br>
+<strong>25.</strong> How do you select which Pods a NetworkPolicy applies to? — Via its <code>podSelector</code> matching labels within the same namespace.<br>
+<strong>26.</strong> Can a NetworkPolicy restrict traffic across namespaces by selector alone? — Ingress rules can reference namespaceSelector alongside podSelector to allow traffic from specific namespaces.<br>
+<strong>27.</strong> What component actually enforces NetworkPolicy at runtime? — The CNI plugin's NetworkPolicy controller, programming node-local iptables/eBPF firewall rules.<br>
+<strong>28.</strong> How do you check the cluster's overall Pod CIDR? — <code>kubectl cluster-info dump | grep -i cluster-cidr</code>.<br>
+<strong>29.</strong> How do you check a specific node's allocated Pod sub-range? — <code>kubectl get nodes -o jsonpath='{.items[*].spec.podCIDR}'</code>.<br>
+<strong>30.</strong> What's a quick way to identify which CNI is installed on a cluster? — Check its DaemonSet Pods in kube-system, e.g. <code>kubectl get pods -n kube-system -l k8s-app=calico-node</code>.<br>
+<strong>31.</strong> Why is Pod-to-Pod connectivity said to require "no NAT"? — Because NAT would break the assumption that a Pod's own IP is directly reachable and identifiable cluster-wide, which Services, DNS, and NetworkPolicy all depend on.<br>
+<strong>32.</strong> What's a practical way to verify the no-NAT guarantee across nodes? — Run a test Pod on one node and directly curl/wget another Pod's real IP on a different node.<br>
+<strong>33.</strong> What does the IPAM sub-component specifically own versus the main CNI plugin? — IP allocation bookkeeping (which IP goes to which Pod), while the main plugin handles namespace/veth setup and route/encapsulation programming.<br>
+<strong>34.</strong> Why is resizing a cluster's Pod CIDR after creation usually disruptive? — Per-node sub-ranges are carved out from the overall CIDR at cluster bring-up, so shrinking/growing it typically requires cluster recreation.<br>
+<strong>35.</strong> What's a benefit of native-routed/underlay CNI modes for latency-sensitive workloads? — No encapsulation overhead, since packets flow via standard routing rather than being wrapped in extra headers.<br>
+<strong>36.</strong> What kind of Kubernetes controller runs the CNI plugin agent on every node? — A DaemonSet.<br>
+<strong>37.</strong> Does kube-proxy replace the need for a CNI plugin? — No, kube-proxy depends on the CNI plugin's underlying Pod-to-Pod reachability; it doesn't provide it.<br>
+<strong>38.</strong> What does it mean that some CNIs (e.g. Cilium) run in "kube-proxy replacement" mode? — They implement Service virtual-IP routing themselves via eBPF, instead of relying on a separate kube-proxy process.<br>
+<strong>39.</strong> How can you check which kube-proxy mode (iptables/ipvs/none) a cluster is using? — <code>kubectl get configmap kube-proxy -n kube-system -o yaml | grep mode</code>.<br>
+<strong>40.</strong> Why is choosing a CNI with NetworkPolicy support a key evaluation criterion? — Because most production clusters need network segmentation for security, and not all CNIs (e.g. plain Flannel) provide enforcement.<br>
+<strong>41.</strong> What's a recommended NetworkPolicy starting posture for a namespace? — Start with a default-deny policy, then explicitly allow only the required Pod-to-Pod paths.<br>
+<strong>42.</strong> What real-world constraint can cloud-native CNIs (e.g. AWS VPC CNI) hit that overlay CNIs typically don't? — Running out of real VPC/subnet IPs, since Pods consume actual routable addresses.<br>
+<strong>43.</strong> What happens if the cluster Pod CIDR overlaps an existing on-prem/VPC range? — Routing breaks silently for the overlapping addresses, since routes conflict with pre-existing network ranges.<br>
+<strong>44.</strong> Does the choice of CNI plugin affect NetworkPolicy behavior for cross-node traffic? — Yes — the CNI's NetworkPolicy controller must enforce rules consistently regardless of which node either Pod is on.<br>
+<strong>45.</strong> Why is benchmarking latency-sensitive services without accounting for overlay encapsulation a pitfall? — Overlay mode adds real per-packet encapsulation overhead that can meaningfully affect latency-sensitive workload measurements.<br>
+<strong>46.</strong> What Kubernetes component invokes the CNI plugin, and when? — The kubelet, at Pod creation (and teardown, via CNI DEL).<br>
+<strong>47.</strong> Is the CNI plugin itself part of core Kubernetes source code? — No, it's an external plugin conforming to the CNI standard, installed and run separately.<br>
+<strong>48.</strong> What's the relationship between the Pod CIDR and each node's podCIDR field? — The cluster's overall Pod CIDR is subdivided into smaller per-node CIDR blocks, recorded in each Node object's <code>spec.podCIDR</code>.<br>
+<strong>49.</strong> Why does NetworkPolicy support vary so much between CNI implementations? — Because NetworkPolicy enforcement isn't part of core Kubernetes — it's an optional feature each CNI plugin chooses whether and how to implement.<br>
+<strong>50.</strong> What's the first thing to check if two Pods on different nodes can't reach each other? — Whether the CNI plugin's DaemonSet Pods are healthy on both nodes, since cross-node routing/encapsulation depends entirely on the CNI agent running correctly there.
+</div></details>
+
+<footer class="course-footer">Next: Topic 22 — Ingress, for routing external HTTP(S) traffic into cluster Services.</footer>
+
+<script>
+  mermaid.initialize({ startOnLoad: true, theme: 'dark' });
+</script>
+
+</body>
+</html>

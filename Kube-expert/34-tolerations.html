@@ -1,0 +1,309 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Topic 34: Tolerations — Kubernetes Expert Course</title>
+<link rel="stylesheet" href="styles.css">
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+</head>
+<body>
+
+<header class="course-header">
+  <div class="kicker">Topic 34 of 70</div>
+  <h1>Tolerations</h1>
+  <div class="subtitle">The Pod-side permission slip that cancels out a node's taint.</div>
+</header>
+
+<nav class="topic-nav">
+  <a href="33-taints.html">&larr; Taints</a>
+  <a href="index.html">Course Index</a>
+  <a href="35-topology-spread.html">Topology Spread &rarr;</a>
+</nav>
+
+<h2 id="explanation">Explanation</h2>
+<p>A <strong>toleration</strong> is a Pod-spec field that declares "I am willing to be scheduled on a node with this
+specific taint." Tolerations don't attract a Pod to a tainted node the way affinity does — they merely remove the
+repulsion that the taint would otherwise cause. This distinction trips up almost everyone learning Kubernetes for the
+first time: adding a toleration for <code>dedicated=ml:NoSchedule</code> to a Pod does <em>not</em> mean that Pod will
+land on a GPU node — it only means the Scheduler is now <em>allowed</em> to consider that node, alongside every other
+untainted node in the cluster. To actually steer the Pod onto the tainted node, you must pair the toleration with a
+node affinity or nodeSelector targeting that pool.</p>
+
+<p>Kubernetes needs tolerations as the mechanism that makes taints usable at all — without them, a taint would be an
+absolute wall with no door. The toleration is that door, and its fields make the match precise: <code>key</code>,
+<code>operator</code>, <code>value</code>, and <code>effect</code> must line up with the taint for the toleration to
+"cancel" it. The <code>operator</code> field has two modes:</p>
+<ul>
+  <li><strong>Equal</strong> (default) — requires <code>key</code>, <code>value</code>, and <code>effect</code> to all match the taint exactly.</li>
+  <li><strong>Exists</strong> — matches any taint with the given key (and effect, if specified), regardless of value; leaving <code>key</code> empty as well matches <em>all</em> taints, which is how DaemonSets like kube-proxy tolerate everything to guarantee they run on every node including tainted ones.</li>
+</ul>
+
+<p>The <code>tolerationSeconds</code> field only applies to <code>NoExecute</code> taints, and it is one of the more
+subtle production-relevant knobs in the scheduling system: it defines how long a Pod is allowed to keep running on a
+node <em>after</em> a NoExecute taint appears (e.g. the node goes NotReady), before it gets forcibly evicted. This is
+the exact mechanism that determines how quickly a StatefulSet or Deployment reacts to a node failure — set it too
+high and failover is slow; set it too low (or omit it, letting the default 300s from Kubernetes' built-in
+tolerations kick in) and you risk premature eviction during brief network blips.</p>
+
+<p>In production, tolerations show up constantly in three patterns: (1) node dedication — a workload tolerates a
+dedication taint plus carries matching affinity, (2) infrastructure DaemonSets — kube-proxy, CNI plugins, and log
+shippers tolerate everything (<code>operator: Exists</code> with no key) so they run on every node regardless of
+taints, and (3) fast failover tuning — critical Deployments explicitly set a short <code>tolerationSeconds</code> on
+the <code>not-ready</code>/<code>unreachable</code> taints to force faster rescheduling than the cluster default.</p>
+
+<div class="callout good">
+  <strong>Mental model:</strong> Taint = "keep out unless." Toleration = "the unless." Affinity/nodeSelector = "please
+  put me here." You almost always need toleration + affinity together for true node dedication — toleration alone
+  just opens the door, it doesn't walk the Pod through it.
+</div>
+
+<h2 id="internal-working">Internal Working / Interactions</h2>
+<ul>
+  <li><strong>Scheduler (TaintToleration plugin):</strong> during Filter, compares each node's taint list against the Pod's toleration list; any taint without a matching toleration eliminates that node as a candidate (for NoSchedule/NoExecute effects).</li>
+  <li><strong>API Server:</strong> stores tolerations as part of <code>Pod.spec.tolerations</code>; validated for shape (key/operator/value/effect/tolerationSeconds) but not semantically checked against real node taints at admission time.</li>
+  <li><strong>Node Controller:</strong> when it applies an automatic NoExecute taint (node NotReady/unreachable), the eviction logic checks each running Pod's tolerations and <code>tolerationSeconds</code> to schedule (or skip) eviction.</li>
+  <li><strong>kubelet:</strong> executes the actual eviction once the eviction controller's timer expires for a given Pod — it does not decide timing itself.</li>
+  <li><strong>DaemonSet controller:</strong> automatically injects tolerations for several built-in node conditions (memory pressure, disk pressure, not-ready, unreachable) onto DaemonSet pods, unless the DaemonSet spec overrides them, so DaemonSets keep running everywhere by default.</li>
+</ul>
+
+<h2 id="architecture-diagram">Architecture Diagram</h2>
+<pre class="mermaid">
+flowchart LR
+    subgraph Taint["Node taint: dedicated=ml:NoSchedule"]
+    end
+    P1["Pod A: no toleration"] -->|"Blocked"| X1["Filtered out"]
+    P2["Pod B: toleration key=dedicated\noperator=Equal value=ml effect=NoSchedule"] -->|"Match - allowed to be considered"| SCORE["Scorer evaluates node normally"]
+    P3["Pod C: toleration operator=Exists\n(no key, no effect)"] -->|"Matches any taint"| SCORE
+    SCORE --> RESULT["Node eligible if it also passes\nresource/affinity filters"]
+</pre>
+
+<pre class="mermaid">
+sequenceDiagram
+    participant NC as Node Controller
+    participant A as API Server
+    participant K as kubelet (on affected node)
+    participant Ev as Eviction Timer
+
+    NC->>A: Node missed heartbeats - apply taint node.kubernetes.io/not-ready:NoExecute
+    A-->>Ev: Watch fires for pods on this node
+    Ev->>Ev: For each pod, check tolerationSeconds
+    Ev->>A: Pod A (tolerationSeconds=0) - evict immediately
+    Ev->>Ev: Pod B (tolerationSeconds=300) - start 300s timer
+    Note over Ev: Node recovers at 120s
+    NC->>A: Remove not-ready taint
+    Ev->>Ev: Cancel Pod B's eviction timer
+</pre>
+
+<h2 id="code-example">Code Example</h2>
+<pre><code>apiVersion: v1
+kind: Pod
+metadata:
+  name: ml-training-job
+  labels:
+    workload: ml
+spec:
+  tolerations:
+    - key: "dedicated"          # must match the node's taint key exactly
+      operator: "Equal"         # requires value to match too
+      value: "ml"
+      effect: "NoSchedule"      # only cancels NoSchedule taints with this key/value
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+          - matchExpressions:
+              - key: node-pool
+                operator: In
+                values: ["gpu-pool"]   # toleration opens the door, affinity walks through it
+  containers:
+    - name: trainer
+      image: registry.internal/ml-trainer:3.1
+      resources:
+        limits:
+          nvidia.com/gpu: 1
+</code></pre>
+
+<pre><code>apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: log-shipper
+  namespace: kube-system
+spec:
+  selector:
+    matchLabels: { app: log-shipper }
+  template:
+    metadata:
+      labels: { app: log-shipper }
+    spec:
+      tolerations:
+        # Tolerate EVERYTHING (no key specified with Exists) so this DaemonSet
+        # runs on every node in the cluster, including control-plane and dedicated pools.
+        - operator: "Exists"
+        # Explicit short grace period for the not-ready taint, so log shipping stops
+        # quickly on a genuinely failed node instead of lingering for the 300s default.
+        - key: "node.kubernetes.io/not-ready"
+          operator: "Exists"
+          effect: "NoExecute"
+          tolerationSeconds: 30
+      containers:
+        - name: shipper
+          image: registry.internal/log-shipper:1.2
+</code></pre>
+
+<h2 id="kubectl-commands">kubectl Commands</h2>
+<pre><code># View a pod's tolerations
+kubectl get pod ml-training-job -o jsonpath='{.spec.tolerations}'
+
+# Cross-check against the target node's taints
+kubectl get node gpu-node-1 -o jsonpath='{.spec.taints}'
+
+# See why a pod is Pending — mismatched toleration shows up in events
+kubectl describe pod ml-training-job | grep -A5 Events
+
+# List every pod's tolerations across a namespace for an audit
+kubectl get pods -n kube-system -o custom-columns=NAME:.metadata.name,TOLERATIONS:.spec.tolerations
+
+# Check DaemonSet default tolerations (auto-injected ones included)
+kubectl get ds log-shipper -n kube-system -o yaml | grep -A10 tolerations
+
+# Explain the toleration schema live from the API server
+kubectl explain pod.spec.tolerations
+</code></pre>
+
+<h2 id="best-practices">Best Practices &amp; Common Pitfalls</h2>
+<div class="grid-2">
+<div>
+<h4>Do's</h4>
+<ul>
+  <li>Always pair a toleration with node affinity/nodeSelector when the goal is true node dedication.</li>
+  <li>Set explicit <code>tolerationSeconds</code> for latency-sensitive workloads instead of relying on cluster defaults.</li>
+  <li>Use <code>operator: Exists</code> with no key sparingly and only for genuinely cluster-wide infrastructure (CNI, kube-proxy, log/metrics agents).</li>
+  <li>Keep toleration keys/values consistent with a documented taint naming convention across the org.</li>
+</ul>
+</div>
+<div>
+<h4>Don'ts</h4>
+<ul>
+  <li>Don't assume a toleration alone will place a Pod on the tainted node — it only removes the block.</li>
+  <li>Don't tolerate the built-in <code>not-ready</code>/<code>unreachable</code> taints indefinitely on stateless services — you'll keep routing traffic to a pod on a dead node longer than necessary.</li>
+  <li>Don't copy-paste broad "tolerate everything" configs onto regular application workloads — it defeats the purpose of node dedication taints.</li>
+  <li>Don't forget effect matters — a toleration for <code>NoSchedule</code> does not cancel a <code>NoExecute</code> taint with the same key/value.</li>
+</ul>
+</div>
+</div>
+
+<h2 id="interview-questions">50 Interview Questions</h2>
+
+<details class="qa"><summary>1. What is a toleration and what does it actually do?</summary>
+<div class="qa-body"><strong>Short answer:</strong> It declares that a Pod is willing to be scheduled on a node carrying a specific taint — it removes a repulsion, it does not create attraction.
+<br><strong>Detailed explanation:</strong> Adding a toleration only makes the Scheduler *consider* the tainted node alongside every other untainted node; it never steers the Pod there specifically.
+<br><strong>Production example:</strong> An ML Pod tolerates <code>dedicated=ml:NoSchedule</code> but also needs a node affinity/selector to actually land on the GPU pool.
+<br><strong>Common mistake:</strong> Believing a toleration alone guarantees placement on the tainted node — this is the single most common first-time misunderstanding.</div></details>
+
+<details class="qa"><summary>2. What is the difference between the <code>Equal</code> and <code>Exists</code> toleration operators?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Equal (default) requires key, value, and effect to all match exactly; Exists matches any taint with the given key (and effect, if specified) regardless of value.
+<br><strong>Detailed explanation:</strong> Leaving <code>key</code> empty as well with Exists matches every taint on the node — a "tolerate everything" toleration.
+<br><strong>Production example:</strong> kube-proxy uses <code>operator: Exists</code> with no key so it runs on every node including tainted ones.
+<br><strong>Common mistake:</strong> Using Exists broadly on regular application workloads, accidentally defeating the purpose of node dedication taints.</div></details>
+
+<details class="qa"><summary>3. What is <code>tolerationSeconds</code> and when does it apply?</summary>
+<div class="qa-body"><strong>Short answer:</strong> It only applies to NoExecute taints, defining how long a Pod may keep running after the taint appears before being evicted.
+<br><strong>Detailed explanation:</strong> It directly tunes failover speed after a node goes NotReady/unreachable — too high delays rescheduling, too low risks premature eviction during brief blips.
+<br><strong>Production example:</strong> A log-shipper DaemonSet sets <code>tolerationSeconds: 30</code> on the not-ready taint to stop shipping quickly from a genuinely failed node instead of the 300s default.
+<br><strong>Common mistake:</strong> Setting a critical stateful workload's tolerationSeconds too low, causing premature eviction during transient network issues.</div></details>
+
+<details class="qa"><summary>4. Why do DaemonSets like kube-proxy and CNI plugins tolerate everything?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Because they must run on literally every node — including control-plane and dedicated pools — to provide cluster-wide infrastructure.
+<br><strong>Detailed explanation:</strong> A CNI plugin missing from even one node breaks networking for every Pod scheduled there; the DaemonSet controller also auto-injects tolerations for several built-in node conditions to reinforce this.
+<br><strong>Production example:</strong> log-shipper's DaemonSet spec includes a bare <code>operator: Exists</code> toleration with no key, ensuring cluster-wide coverage.
+<br><strong>Common mistake:</strong> Copy-pasting this "tolerate everything" pattern onto regular application Deployments, defeating dedication taints.</div></details>
+
+<details class="qa"><summary>5. Why is toleration + affinity the correct pairing for true node dedication?</summary>
+<div class="qa-body"><strong>Short answer:</strong> The toleration opens the door (removes the block); the affinity/nodeSelector walks the Pod through it (actually places it there).
+<br><strong>Detailed explanation:</strong> Without the affinity half, the tolerating Pod is merely eligible for the tainted node among all other candidates — it could still land anywhere else.
+<br><strong>Production example:</strong> ml-training-job carries both a toleration for <code>dedicated=ml:NoSchedule</code> and a required nodeAffinity for <code>node-pool=gpu-pool</code>.
+<br><strong>Common mistake:</strong> Adding only the toleration and being confused when Pods don't consistently land on the dedicated pool.</div></details>
+
+<details class="qa"><summary>6. What validates a Pod's toleration fields at admission time?</summary>
+<div class="qa-body"><strong>Short answer:</strong> The API Server validates shape only — key/operator/value/effect/tolerationSeconds structure — not semantic correctness against real node taints.
+<br><strong>Detailed explanation:</strong> A toleration referencing a taint key that doesn't exist anywhere in the cluster is still accepted; it simply has no effect until such a taint exists.
+<br><strong>Production example:</strong> A typo'd toleration key silently did nothing for months because the API Server never rejected it, and no matching taint ever existed.
+<br><strong>Common mistake:</strong> Assuming a syntactically valid toleration must be semantically meaningful in the current cluster.</div></details>
+
+<details class="qa"><summary>7. How does the eviction timer for NoExecute taints actually work internally?</summary>
+<div class="qa-body"><strong>Short answer:</strong> When a NoExecute taint appears, the eviction logic starts a per-Pod timer based on that Pod's <code>tolerationSeconds</code>, and kubelet terminates the Pod locally once it expires.
+<br><strong>Detailed explanation:</strong> Different Pods on the same node can have different tolerationSeconds, so eviction timing is computed independently per Pod, not once for the whole node.
+<br><strong>Production example:</strong> On a node going NotReady, Pod A (tolerationSeconds=0) was evicted immediately while Pod B (tolerationSeconds=300) kept running for 5 more minutes until the node recovered.
+<br><strong>Common mistake:</strong> Assuming all Pods on a node are evicted simultaneously the instant a NoExecute taint appears.</div></details>
+
+<details class="qa"><summary>8. What's the difference between omitting <code>effect</code> and specifying it in a toleration?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Omitting effect makes the toleration match the key/value combination against any effect; specifying it restricts the match to that exact effect only.
+<br><strong>Detailed explanation:</strong> A toleration for <code>NoSchedule</code> explicitly does not cancel a <code>NoExecute</code> taint with the same key/value — effect must line up unless intentionally left blank.
+<br><strong>Production example:</strong> A team tolerated only the NoSchedule effect of a taint, and was surprised when their Pods were evicted anyway once the same key/value taint was later reapplied with NoExecute.
+<br><strong>Common mistake:</strong> Assuming tolerating one effect for a key/value automatically covers all effects for that same key/value.</div></details>
+
+<details class="qa"><summary>9. Why is a toleration alone insufficient to reason about where a Pod will actually run?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Because tolerations only cancel repulsion — the actual placement decision still depends on affinity, resource fit, and every other Filter/Score criterion.
+<br><strong>Detailed explanation:</strong> A tolerating Pod remains eligible for every untainted node too, so without a targeting mechanism it could land anywhere satisfying its other constraints.
+<br><strong>Production example:</strong> A tolerating-only Pod (no affinity) occasionally landed on a general-purpose node instead of the intended dedicated pool, surprising the on-call engineer.
+<br><strong>Common mistake:</strong> Treating "has a toleration for the pool's taint" as proof the Pod will run in that pool.</div></details>
+
+<details class="qa"><summary>10. How would you audit which Pods tolerate a given taint across a namespace?</summary>
+<div class="qa-body"><strong>Short answer:</strong> <code>kubectl get pods -n &lt;ns&gt; -o custom-columns=NAME:.metadata.name,TOLERATIONS:.spec.tolerations</code>.
+<br><strong>Detailed explanation:</strong> This surfaces the raw toleration list per Pod for manual cross-referencing against the node taints returned by <code>kubectl get node &lt;name&gt; -o jsonpath='{.spec.taints}'</code>.
+<br><strong>Production example:</strong> A platform team audited kube-system to confirm every DaemonSet's auto-injected tolerations still matched current node taints after a taint-naming convention change.
+<br><strong>Common mistake:</strong> Trying to infer toleration coverage from Deployment YAML alone without checking the DaemonSet controller's auto-injected tolerations too.</div></details>
+
+<details class="qa"><summary>11–50. Additional rapid-fire questions</summary>
+<div class="qa-body">
+<strong>11.</strong> What four fields make up a toleration? — key, operator, value, and effect (plus optional tolerationSeconds for NoExecute).<br>
+<strong>12.</strong> What's the default operator if none is specified? — Equal.<br>
+<strong>13.</strong> Does a toleration ever cause a Pod to be scheduled where it otherwise wouldn't be? — No, it only removes a block; it never adds attraction.<br>
+<strong>14.</strong> Which Scheduler plugin evaluates tolerations against node taints? — The TaintToleration plugin, during the Filter phase.<br>
+<strong>15.</strong> What happens if a Pod's toleration key doesn't match any real taint? — Nothing — it's inert; the toleration simply has no taint to cancel.<br>
+<strong>16.</strong> Why does the DaemonSet controller auto-inject tolerations for certain node conditions? — So DaemonSets keep running everywhere by default, including on nodes under memory/disk pressure or not-ready.<br>
+<strong>17.</strong> What's the risk of setting <code>tolerationSeconds</code> too high on a customer-facing service? — Traffic keeps routing to a Pod on a dead node longer than necessary before failover occurs.<br>
+<strong>18.</strong> What's the risk of setting it too low? — Premature eviction during brief, recoverable network blips.<br>
+<strong>19.</strong> Can a Pod have multiple tolerations? — Yes, <code>spec.tolerations</code> is a list, one entry per taint it needs to cancel.<br>
+<strong>20.</strong> How do you view a Pod's tolerations directly? — <code>kubectl get pod &lt;name&gt; -o jsonpath='{.spec.tolerations}'</code>.<br>
+<strong>21.</strong> What's a realistic three-pattern summary of production toleration usage? — Node dedication (toleration + affinity), infrastructure DaemonSets (tolerate everything), and fast-failover tuning (short tolerationSeconds).<br>
+<strong>22.</strong> Why is toleration described as "the door" in the mental model callout? — Because the taint is the wall, and the toleration is what specifically opens a path through it for one Pod.<br>
+<strong>23.</strong> Does kubelet decide when to evict a Pod under a NoExecute taint? — No, it only executes the eviction once the controller's timer expires; it doesn't decide the timing itself.<br>
+<strong>24.</strong> What's the danger of a broad "operator: Exists" toleration with no key on a regular app Deployment? — It bypasses every dedication taint in the cluster, letting the workload land anywhere, defeating isolation intent.<br>
+<strong>25.</strong> How would you debug a Pod stuck Pending that you expect to tolerate a specific taint? — Compare the Pod's tolerations against the target node's taints field-by-field, and check FailedScheduling events.<br>
+<strong>26.</strong> What's the interaction between tolerations and Cluster Autoscaler node group selection? — CA must know which node groups a Pending Pod could tolerate before deciding which group to scale up.<br>
+<strong>27.</strong> Why is the "not-ready" built-in toleration relevant to StatefulSet failover speed? — Its tolerationSeconds setting (or lack thereof) directly determines how fast a StatefulSet reacts to a node going down.<br>
+<strong>28.</strong> Does a toleration for NoSchedule cancel a NoExecute taint with the same key/value? — No, effect must match (or be omitted) for the toleration to apply.<br>
+<strong>29.</strong> What operator would you use to tolerate a taint regardless of its value? — Exists.<br>
+<strong>30.</strong> Is there any way to make a toleration also express a scheduling preference? — No — that requires pairing it separately with a node affinity or nodeSelector.<br>
+<strong>31.</strong> What's the biggest first-time misconception new engineers have about tolerations? — Assuming a toleration alone places the Pod on the tainted node.<br>
+<strong>32.</strong> How do infrastructure DaemonSets avoid manually listing every possible node condition taint? — The DaemonSet controller auto-injects tolerations for several built-in conditions unless overridden.<br>
+<strong>33.</strong> What's a good naming-convention practice across an org for tolerations? — Keep toleration keys/values consistent with a documented taint naming convention so teams don't guess at meaning.<br>
+<strong>34.</strong> Why would you explicitly override the DaemonSet controller's default not-ready tolerationSeconds? — To make node-failure response faster (or slower) than the cluster default of 300s for that specific workload.<br>
+<strong>35.</strong> What's the relationship between toleration key/value/effect and a taint's key/value/effect? — They must correspond exactly (for Equal) or partially (for Exists) for the toleration to cancel that specific taint.<br>
+<strong>36.</strong> Can a toleration be added after a Pod is already running, to stop a pending eviction? — No — toleration changes require the Pod to be recreated with the new spec; you can't hot-patch a running Pod's tolerations.<br>
+<strong>37.</strong> What's a scenario where toleration alone (no affinity) is actually the right design? — Infrastructure DaemonSets that genuinely need to run everywhere, where "everywhere" is exactly the desired placement.<br>
+<strong>38.</strong> Why is a short tolerationSeconds appropriate for a log-shipper but not for a stateful database? — Log shipping tolerates fast disruption with no data-consistency risk; a database needs longer grace to avoid unnecessary failover churn.<br>
+<strong>39.</strong> What kubectl command cross-checks toleration vs taint fastest? — Running <code>kubectl get pod ... -o jsonpath='{.spec.tolerations}'</code> next to <code>kubectl get node ... -o jsonpath='{.spec.taints}'</code>.<br>
+<strong>40.</strong> Does a missing toleration ever cause a Pod that's already running to be evicted retroactively? — Only if a new NoExecute taint is subsequently applied to its node — the Pod's existing tolerations are then checked against it.<br>
+<strong>41.</strong> What's the failure mode of forgetting to add a toleration when moving a workload to a newly dedicated pool? — The Pod simply can't schedule there at all, staying Pending or landing elsewhere.<br>
+<strong>42.</strong> How does the built-in default toleration for not-ready/unreachable interact with custom short tolerationSeconds? — A Pod's own explicit tolerationSeconds overrides the cluster's implicit default for that specific taint.<br>
+<strong>43.</strong> Is toleration evaluation part of the Score phase or only Filter? — Primarily Filter (eligibility); it doesn't itself contribute scoring weight the way PreferNoSchedule taint handling does.<br>
+<strong>44.</strong> Why would a platform team want to keep toleration usage minimal on regular application teams' Deployments? — To preserve the isolation guarantees of dedication taints — indiscriminate tolerations dilute their purpose.<br>
+<strong>45.</strong> What's the operational value of auditing all tolerations in kube-system periodically? — Confirming infrastructure DaemonSets still match current taint conventions after naming or effect changes.<br>
+<strong>46.</strong> How does a toleration's tolerationSeconds field behave if the node recovers before the timer expires? — The eviction timer is cancelled since the NoExecute taint is removed once the node is healthy again.<br>
+<strong>47.</strong> What's the core one-line distinction for interviews between taint and toleration? — Taint = "keep out unless"; toleration = "the unless" — the permission slip that cancels a specific taint.<br>
+<strong>48.</strong> Why is it misleading to call tolerations a "scheduling preference"? — Because they express permission/eligibility, not preference — they never influence which eligible node is actually chosen.<br>
+<strong>49.</strong> What's a realistic interview follow-up scenario: "your pod isn't landing on the dedicated pool despite a toleration"? — Check whether a corresponding node affinity/selector exists — the toleration alone never guarantees placement.<br>
+<strong>50.</strong> What's the safest default posture for toleration usage across a large platform? — Reserve broad "tolerate everything" tolerations for genuine cluster-wide infrastructure only, and require explicit key/value/effect matches everywhere else.
+</div></details>
+
+<footer class="course-footer">Next up: Topic 35 — Topology Spread Constraints, for even distribution instead of binary attraction/repulsion.</footer>
+
+<script>
+  mermaid.initialize({ startOnLoad: true, theme: 'dark' });
+</script>
+
+</body>
+</html>

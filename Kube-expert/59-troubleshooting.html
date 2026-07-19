@@ -1,0 +1,279 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Topic 59: Troubleshooting — Kubernetes Expert Course</title>
+<link rel="stylesheet" href="styles.css">
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+</head>
+<body>
+
+<header class="course-header">
+  <div class="kicker">Topic 59 of 70</div>
+  <h1>Troubleshooting</h1>
+  <div class="subtitle">A general methodology for diagnosing Kubernetes failures fast: describe, logs, exec, events, node conditions — in that order.</div>
+</header>
+
+<nav class="topic-nav">
+  <a href="58-distributed-tracing.html">&larr; Distributed Tracing</a>
+  <a href="index.html">Course Index</a>
+  <a href="60-kubernetes-internals.html">Kubernetes Internals &rarr;</a>
+</nav>
+
+<h2 id="explanation">Explanation</h2>
+<p>Kubernetes troubleshooting is hard mainly because failures can originate at any layer of the stack — application
+code, container image, Pod spec, scheduler decision, node health, network policy, or the control plane itself — and
+the symptom (a Pod stuck Pending, or CrashLoopBackOff, or a Service not routing traffic) rarely names its own root
+cause. What separates an engineer who resolves an incident in five minutes from one who takes an hour is not more
+knowledge of individual failure modes, but a <strong>consistent, layered methodology</strong> applied every time,
+narrowing the search space systematically instead of guessing.</p>
+
+<p>The methodology that works reliably in production is: start with <code>kubectl get</code> to see current state at a
+glance, then <code>kubectl describe</code> on the failing object (this alone resolves the majority of issues — its
+Events section is a chronological, component-by-component trace of everything that happened to the object), then
+<code>kubectl logs</code> (and <code>--previous</code> if it's restarting) to see what the application itself reported,
+then <code>kubectl exec</code> to interactively probe a running container's environment if logs aren't enough, and
+finally check node-level conditions (<code>kubectl describe node</code>, disk/memory pressure, taints) if nothing at
+the Pod level explains the symptom. This order matters because each step is progressively more expensive and
+Pod-specific information is cheap to gather and usually sufficient.</p>
+
+<p>Kubernetes' declarative, event-driven architecture (see Topic 1) is precisely why this methodology works: every
+action taken by every component (scheduler binding a node, kubelet pulling an image, a probe failing) is recorded as
+an <strong>Event</strong> object, visible via <code>describe</code> or <code>get events</code>. Troubleshooting
+Kubernetes is largely the skill of reading this event trail and mapping each event to the specific component that
+emitted it — a skill this whole course has been building toward, since it requires genuinely understanding what each
+component (scheduler, kubelet, kube-proxy, CNI, CSI) is responsible for.</p>
+
+<p>Most production failures fall into a handful of categories: <strong>scheduling failures</strong> (insufficient
+resources, taints/affinity mismatches — Pod stuck Pending), <strong>image/registry failures</strong>
+(ImagePullBackOff — wrong image name, missing pull secret, registry unreachable), <strong>application crash loops</strong>
+(CrashLoopBackOff — bad config, missing dependency, unhandled exception on startup), <strong>readiness/liveness probe
+failures</strong> (app running but not marked healthy, or killed by an overly aggressive liveness probe),
+<strong>networking issues</strong> (Service not routing, NetworkPolicy blocking traffic, DNS failures via CoreDNS),
+and <strong>node-level issues</strong> (disk pressure, memory pressure, kubelet not reporting, causing evictions).</p>
+
+<p>This topic sits downstream of everything else in the course and upstream of nothing — it's the practical synthesis
+of architecture, controllers, networking, storage, and observability knowledge into a repeatable incident-response
+skill, and it's precisely where metrics (Prometheus/VictoriaMetrics), logs (Loki), and traces (Tempo) covered in
+recent topics get used together in anger: metrics tell you <em>when</em> and <em>roughly where</em>, logs tell you
+<em>what</em> the application said, and traces tell you <em>which downstream call</em> was actually slow or failing.</p>
+
+<h2 id="internal-working">Internal Working / Interactions</h2>
+<ul>
+  <li><strong>kubectl describe</strong> pulls the object plus its associated Events from the API server/etcd — the single richest troubleshooting signal for most Pod issues.</li>
+  <li><strong>kubectl logs</strong> reads from the kubelet on the node hosting the Pod, which serves the locally-rotated container log file (see Topic 55).</li>
+  <li><strong>kubectl exec</strong> opens an interactive stream through the API server to the kubelet to the container runtime, letting you run commands inside a live container.</li>
+  <li><strong>kubectl get events --sort-by=.lastTimestamp</strong> shows the full cluster-wide event stream, useful when you don't yet know which object is the actual root cause.</li>
+  <li><strong>Node conditions</strong> (Ready, MemoryPressure, DiskPressure, PIDPressure) are reported by kubelet and drive eviction/scheduling decisions — check these when the Pod-level story doesn't add up.</li>
+  <li><strong>Observability stack correlation</strong> — once Pod-level tools are exhausted, pivot to Grafana/Loki/Tempo for historical trends and cross-service context that live `kubectl` commands can't show.</li>
+</ul>
+
+<h2 id="architecture-diagram">Architecture Diagram</h2>
+<pre class="mermaid">
+flowchart TD
+    START["Symptom reported<br/>(alert, user report, dashboard)"] --> GET["kubectl get pods/svc/nodes<br/>(quick overall state)"]
+    GET --> DESC["kubectl describe &lt;object&gt;<br/>(read Events chronologically)"]
+    DESC -->|explains it| FIX["Root cause identified -> fix"]
+    DESC -->|inconclusive| LOGS["kubectl logs [--previous]<br/>(what did the app say?)"]
+    LOGS -->|explains it| FIX
+    LOGS -->|inconclusive| EXEC["kubectl exec<br/>(probe live container state)"]
+    EXEC -->|explains it| FIX
+    EXEC -->|inconclusive| NODE["kubectl describe node<br/>(conditions, taints, pressure)"]
+    NODE -->|explains it| FIX
+    NODE -->|inconclusive| OBS["Pivot to Grafana/Loki/Tempo<br/>(cross-service, historical view)"]
+    OBS --> FIX
+</pre>
+
+<h2 id="code-example">Code Example</h2>
+<pre><code># Common failure-mode manifests you'll intentionally break to practice this methodology.
+
+# 1. Scheduling failure: requests exceed any node's allocatable resources -> stuck Pending
+apiVersion: v1
+kind: Pod
+metadata:
+  name: oversized-pod
+spec:
+  containers:
+    - name: app
+      image: nginx:1.25
+      resources:
+        requests:
+          cpu: "32"          # deliberately larger than any real node -> "Insufficient cpu" event
+          memory: "128Gi"
+---
+# 2. Image pull failure: typo'd image tag -> ImagePullBackOff
+apiVersion: v1
+kind: Pod
+metadata:
+  name: bad-image-pod
+spec:
+  containers:
+    - name: app
+      image: nginx:this-tag-does-not-exist   # kubectl describe will show "ErrImagePull" / "ImagePullBackOff"
+---
+# 3. Liveness probe misconfigured too aggressively -> CrashLoopBackOff from repeated kills, not app bugs
+apiVersion: v1
+kind: Pod
+metadata:
+  name: flaky-liveness-pod
+spec:
+  containers:
+    - name: app
+      image: nginx:1.25
+      livenessProbe:
+        httpGet: { path: /, port: 80 }
+        initialDelaySeconds: 0     # too short - kills the container before nginx finishes starting
+        periodSeconds: 2
+        failureThreshold: 1        # one slow response = restart; too strict for real workloads
+</code></pre>
+
+<h2 id="kubectl-cli-commands">kubectl / CLI Commands</h2>
+<pre><code>kubectl get pods -A -o wide                                  # cluster-wide quick health scan
+kubectl describe pod &lt;pod&gt; -n &lt;ns&gt;                            # #1 tool: full Events trace for one object
+kubectl logs &lt;pod&gt; -n &lt;ns&gt; --previous --tail=200               # last crashed instance's final output
+kubectl exec -it &lt;pod&gt; -n &lt;ns&gt; -- sh                           # interactive shell to probe live state
+kubectl get events -A --sort-by=.lastTimestamp | tail -30       # cluster-wide recent event stream
+kubectl describe node &lt;node&gt;                                   # conditions, taints, allocatable vs allocated
+kubectl top pod -n &lt;ns&gt; ; kubectl top node                     # quick resource pressure check
+kubectl get pod &lt;pod&gt; -n &lt;ns&gt; -o yaml | less                  # full spec+status when describe isn't enough
+</code></pre>
+
+<h2 id="best-practices">Best Practices &amp; Common Pitfalls</h2>
+<div class="grid-2">
+<div>
+<h4>Best Practices</h4>
+<ul>
+  <li>Always run <code>describe</code> before <code>logs</code> — Events often explain the failure without needing app-level logs at all.</li>
+  <li>Check <code>--previous</code> logs on any CrashLoopBackOff — the current attempt's logs may be empty if it just restarted.</li>
+  <li>Correlate the failure timestamp against a Grafana dashboard before assuming it's isolated to one Pod.</li>
+  <li>Reproduce systematically (same manifest change, same failure) rather than randomly changing config until it works.</li>
+  <li>Document root causes in a runbook so recurring failure classes get faster next time.</li>
+</ul>
+</div>
+<div>
+<h4>Pitfalls</h4>
+<ul>
+  <li>Jumping straight to <code>kubectl exec</code> or restarting Pods before reading Events — losing the diagnostic trail.</li>
+  <li>Assuming CrashLoopBackOff is always an app bug — probe misconfiguration is a very common false-positive cause.</li>
+  <li>Ignoring node conditions and only ever looking at the Pod — some failures (DiskPressure evictions) are node-wide.</li>
+  <li>Not checking resource requests/limits when a Pod is OOMKilled or throttled — the symptom looks like an app bug but is a sizing issue.</li>
+</ul>
+</div>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="interview-questions">50 Interview Questions</h2>
+
+<details class="qa"><summary>1. What is the recommended order for the Kubernetes troubleshooting methodology described in this topic?</summary>
+<div class="qa-body"><strong>Short answer:</strong> <code>kubectl get</code> for overall state, then <code>describe</code>, then <code>logs</code> (with <code>--previous</code> if restarting), then <code>exec</code>, then node-level conditions.
+<br><strong>Detail:</strong> The order matters because each step is progressively more expensive to gather, and Pod-specific information is cheap and usually sufficient — so you exhaust cheap, high-signal steps before moving to more expensive ones.
+<br><strong>Production example:</strong> The architecture diagram in this topic models this exact flow as a flowchart, only pivoting to Grafana/Loki/Tempo after describe, logs, exec, and node checks are all inconclusive.
+<br><strong>Common mistake:</strong> Jumping straight to <code>kubectl exec</code> or restarting Pods before reading Events — this loses the diagnostic trail that <code>describe</code> would have surfaced instantly.</div></details>
+
+<details class="qa"><summary>2. Why does <code>kubectl describe</code> resolve the majority of issues on its own?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Its Events section is a chronological, component-by-component trace of everything that happened to the object.
+<br><strong>Detail:</strong> Because Kubernetes' architecture is event-driven, every action taken by every component — scheduler binding a node, kubelet pulling an image, a probe failing — is recorded as an Event object, all visible in one place via describe.
+<br><strong>Production example:</strong> Describing a Pod stuck Pending immediately shows an "Insufficient cpu" event from the scheduler, explaining the root cause without needing logs at all.
+<br><strong>Common mistake:</strong> Skipping describe and going directly to logs, missing scheduling or image-pull failures that never produce application logs because the container never started.</div></details>
+
+<details class="qa"><summary>3. Why is Kubernetes troubleshooting fundamentally about mapping events to the component that emitted them?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Because failures can originate at any layer — app code, image, Pod spec, scheduler, node health, network policy, or the control plane — and the symptom rarely names its own root cause.
+<br><strong>Detail:</strong> Effective troubleshooting requires understanding what each component (scheduler, kubelet, kube-proxy, CNI, CSI) is actually responsible for, so an event like "FailedScheduling" versus "Failed" (kubelet) points you toward a completely different layer to investigate.
+<br><strong>Production example:</strong> A Service not routing traffic could be a kube-proxy issue, a NetworkPolicy blocking it, or a CoreDNS failure — reading which component logged the relevant event narrows it immediately.
+<br><strong>Common mistake:</strong> Guessing at fixes based on the surface symptom (e.g. "Pod Pending") without identifying which specific component's decision caused it.</div></details>
+
+<details class="qa"><summary>4. What's the difference between checking current logs versus <code>--previous</code> logs, and when does it matter?</summary>
+<div class="qa-body"><strong>Short answer:</strong> <code>--previous</code> retrieves the logs of the last crashed instance of a container, which is essential for CrashLoopBackOff since the current attempt's logs may be empty right after a restart.
+<br><strong>Detail:</strong> When a container is in CrashLoopBackOff, kubectl logs without <code>--previous</code> may only show a freshly restarted, mostly-empty log; the actual failure output is in the terminated instance's logs.
+<br><strong>Production example:</strong> <code>kubectl logs &lt;pod&gt; -n &lt;ns&gt; --previous --tail=200</code> is listed as the specific command to see the last crashed instance's final output.
+<br><strong>Common mistake:</strong> Concluding "there are no logs, so we can't diagnose this" when the real issue is simply forgetting the <code>--previous</code> flag.</div></details>
+
+<details class="qa"><summary>5. What are the main categories of production failures this topic organizes troubleshooting around?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Scheduling failures, image/registry failures, application crash loops, readiness/liveness probe failures, networking issues, and node-level issues.
+<br><strong>Detail:</strong> Each category has a distinct signature (Pending, ImagePullBackOff, CrashLoopBackOff, probe-triggered restarts, Service/DNS/NetworkPolicy problems, and disk/memory pressure evictions) and a distinct place in the stack to investigate.
+<br><strong>Production example:</strong> The code example provides one manifest per category to intentionally reproduce during practice: an oversized-resource-request Pod, a bad-image-tag Pod, and an overly aggressive liveness probe Pod.
+<br><strong>Common mistake:</strong> Treating all failures as one undifferentiated "something's broken" problem instead of first identifying which of these categories the symptom fits.</div></details>
+
+<details class="qa"><summary>6. Why can an overly aggressive liveness probe cause CrashLoopBackOff even when the application has no bug?</summary>
+<div class="qa-body"><strong>Short answer:</strong> A probe with too short an <code>initialDelaySeconds</code> or too strict a <code>failureThreshold</code> can kill the container before the app finishes starting or on one slow response.
+<br><strong>Detail:</strong> This is explicitly called out as a false-positive cause of CrashLoopBackOff — the restart is caused by kubelet acting on probe failures, not by the application crashing on its own.
+<br><strong>Production example:</strong> The <code>flaky-liveness-pod</code> example sets <code>initialDelaySeconds: 0</code>, <code>periodSeconds: 2</code>, <code>failureThreshold: 1</code> against nginx, causing kubelet to kill the container before nginx finishes starting.
+<br><strong>Common mistake:</strong> Assuming CrashLoopBackOff is always an app bug and debugging application code first, instead of checking probe configuration.</div></details>
+
+<details class="qa"><summary>7. Why does a Pod requesting resources larger than any node's allocatable capacity get stuck Pending rather than erroring immediately?</summary>
+<div class="qa-body"><strong>Short answer:</strong> The scheduler can never find a node that satisfies the resource request, so the Pod simply stays unscheduled, logging an "Insufficient cpu"/"Insufficient memory" event on each scheduling attempt.
+<br><strong>Detail:</strong> This is a scheduling failure category — the Pod object itself is valid, but no node passes the scheduler's filtering step, so it waits indefinitely rather than being rejected outright.
+<br><strong>Production example:</strong> The <code>oversized-pod</code> example requests 32 CPU and 128Gi memory, deliberately larger than any real node, to reproduce this event.
+<br><strong>Common mistake:</strong> Assuming a Pending Pod means something is "broken" in the cluster rather than checking whether the requested resources simply don't fit anywhere.</div></details>
+
+<details class="qa"><summary>8. What does node condition monitoring add to Pod-level troubleshooting, and when should you check it?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Node conditions (Ready, MemoryPressure, DiskPressure, PIDPressure) reported by kubelet drive eviction/scheduling decisions and explain failures that aren't visible at the Pod level — check them when the Pod-level story doesn't add up.
+<br><strong>Detail:</strong> Some failures, like DiskPressure-triggered evictions, are node-wide and affect every Pod on that node simultaneously, which is easy to miss if you're only ever looking at one Pod at a time.
+<br><strong>Production example:</strong> <code>kubectl describe node &lt;node&gt;</code> reveals conditions, taints, and allocatable vs. allocated resources that explain why several unrelated Pods on the same node are being evicted.
+<br><strong>Common mistake:</strong> Ignoring node conditions and only ever looking at the Pod, missing node-wide issues like disk pressure evictions.</div></details>
+
+<details class="qa"><summary>9. When should you pivot from live <code>kubectl</code> commands to the observability stack (Grafana/Loki/Tempo)?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Once Pod-level tools (describe, logs, exec) and node conditions are exhausted and still inconclusive, pivot to Grafana/Loki/Tempo for historical trends and cross-service context.
+<br><strong>Detail:</strong> Live kubectl commands only show current or very recent state; the observability stack is needed for historical patterns or correlating behavior across multiple services, which is exactly what metrics, logs, and traces (covered in the recent topics) are built for.
+<br><strong>Production example:</strong> Correlating a Pod's failure timestamp against a Grafana dashboard before assuming the issue is isolated to one Pod is listed as a best practice.
+<br><strong>Common mistake:</strong> Never bothering to check historical dashboards and assuming a failure is a one-off, when the same pattern has actually been recurring for days.</div></details>
+
+<details class="qa"><summary>10. How do metrics, logs, and traces each contribute differently during an incident, according to this topic?</summary>
+<div class="qa-body"><strong>Short answer:</strong> Metrics tell you when and roughly where a problem occurred; logs tell you what the application said; traces tell you which downstream call was actually slow or failing.
+<br><strong>Detail:</strong> This topic is explicitly framed as the practical synthesis point where architecture, controllers, networking, storage, and observability knowledge from the rest of the course all come together into one repeatable incident-response skill.
+<br><strong>Production example:</strong> An alert fires from a metrics threshold, a Grafana dashboard narrows down which service is affected, Loki logs show the application's own error message, and a Tempo trace pinpoints the exact slow downstream call.
+<br><strong>Common mistake:</strong> Using only one of the three signals throughout an entire incident instead of pivoting between them as the investigation narrows.</div></details>
+
+<details class="qa"><summary>11–50. Additional rapid-fire questions</summary>
+<div class="qa-body">
+<strong>11.</strong> What's the very first command to run when investigating any incident, per this methodology? — <code>kubectl get pods/svc/nodes -o wide</code> for a quick overall state check.<br>
+<strong>12.</strong> What's the single richest troubleshooting signal for most Pod issues? — The Events section shown by <code>kubectl describe</code>.<br>
+<strong>13.</strong> What command shows the full cluster-wide event stream when you don't yet know which object is the root cause? — <code>kubectl get events -A --sort-by=.lastTimestamp</code>.<br>
+<strong>14.</strong> How do you get an interactive shell inside a live container for diagnosis? — <code>kubectl exec -it &lt;pod&gt; -n &lt;ns&gt; -- sh</code>.<br>
+<strong>15.</strong> What command shows a quick resource pressure check across Pods and Nodes? — <code>kubectl top pod -n &lt;ns&gt;</code> and <code>kubectl top node</code>.<br>
+<strong>16.</strong> When is <code>kubectl get pod -o yaml</code> useful over <code>describe</code>? — When you need the full spec plus status and describe's summarized view isn't detailed enough.<br>
+<strong>17.</strong> What does ImagePullBackOff typically indicate? — A wrong image name/tag, a missing image pull secret, or an unreachable registry.<br>
+<strong>18.</strong> What does CrashLoopBackOff typically indicate? — The application is crashing repeatedly on startup — bad config, missing dependency, unhandled exception, or (commonly) an aggressive liveness probe.<br>
+<strong>19.</strong> What network-related failure modes fall under "networking issues" in this topic? — Service not routing traffic, NetworkPolicy blocking traffic, and DNS failures via CoreDNS.<br>
+<strong>20.</strong> What node-level issues can cause Pod evictions? — Disk pressure, memory pressure, and kubelet not reporting.<br>
+<strong>21.</strong> Why is <code>kubectl describe</code> recommended before <code>kubectl logs</code>? — Events often explain the failure without needing app-level logs at all, and are cheaper to gather.<br>
+<strong>22.</strong> What is a common false-positive cause of CrashLoopBackOff besides an actual app bug? — Probe misconfiguration (too aggressive liveness probe) killing an otherwise-healthy container.<br>
+<strong>23.</strong> What symptom looks like an app bug but is actually a sizing issue? — A Pod being OOMKilled or throttled due to resource requests/limits not being checked.<br>
+<strong>24.</strong> Why should you reproduce failures systematically rather than randomly changing config? — Random changes make it impossible to know which change actually fixed (or caused) the issue, and waste time compared to a controlled repro.<br>
+<strong>25.</strong> Why document root causes in a runbook? — So recurring failure classes get diagnosed and fixed faster the next time they occur.<br>
+<strong>26.</strong> What information does the kubelet serve when you run <code>kubectl logs</code>? — The locally-rotated container log file on the node hosting the Pod.<br>
+<strong>27.</strong> What path does <code>kubectl exec</code> traffic take? — An interactive stream through the API server to the kubelet to the container runtime.<br>
+<strong>28.</strong> Why is a Pod's Pending state not itself an error message? — Because "Pending" just means unscheduled; the actual reason (insufficient resources, taint mismatch, etc.) is in the associated scheduling event, not the phase itself.<br>
+<strong>29.</strong> What four node conditions does kubelet report that drive scheduling/eviction decisions? — Ready, MemoryPressure, DiskPressure, and PIDPressure.<br>
+<strong>30.</strong> Why does this topic describe itself as sitting "downstream of everything else" in the course? — Because troubleshooting is the practical synthesis of architecture, controllers, networking, storage, and observability knowledge into one incident-response skill.<br>
+<strong>31.</strong> What would <code>kubectl describe pod</code> show for the oversized-pod example? — A scheduling event like "Insufficient cpu"/"Insufficient memory" since no node has 32 CPU / 128Gi allocatable.<br>
+<strong>32.</strong> What would <code>kubectl describe pod</code> show for the bad-image-pod example? — "ErrImagePull" / "ImagePullBackOff" events referencing the nonexistent tag.<br>
+<strong>33.</strong> Why does the flaky-liveness-pod example use <code>failureThreshold: 1</code> to illustrate a pitfall? — One single slow health check response is enough to trigger a restart, which is far too strict for real workloads.<br>
+<strong>34.</strong> What's the risk of setting <code>initialDelaySeconds: 0</code> on a liveness probe for a slow-starting app? — kubelet may probe before the app is ready and kill the container before it finishes starting.<br>
+<strong>35.</strong> What's the practical difference between a readiness probe failure and a liveness probe failure? — A failing readiness probe removes the Pod from Service endpoints without restarting it; a failing liveness probe causes kubelet to kill and restart the container.<br>
+<strong>36.</strong> Why check a Grafana dashboard before assuming a failure is isolated to one Pod? — To correlate the failure timestamp against broader trends and confirm whether other Pods/services were affected at the same time.<br>
+<strong>37.</strong> Why is understanding what each Kubernetes component is responsible for described as core to troubleshooting skill? — Because each event in the Events trail is emitted by a specific component, and correctly attributing it (scheduler vs kubelet vs kube-proxy vs CNI vs CSI) is what narrows down the root cause.<br>
+<strong>38.</strong> What's the risk of jumping straight to restarting a Pod without reading its Events first? — You lose the diagnostic trail — a restart can wipe or bury the exact evidence (events, previous logs) needed to root-cause the failure.<br>
+<strong>39.</strong> How does the architecture flowchart in this topic model escalation? — Each step (get, describe, logs, exec, node conditions) either resolves the issue or is inconclusive and escalates to the next, more expensive step, ending with a pivot to the observability stack.<br>
+<strong>40.</strong> Why is a Pod-level investigation described as "cheap" relative to node-level or observability-stack investigation? — Pod-specific data (its spec, status, Events, logs) is readily available via a single kubectl call, whereas node conditions and cross-service correlation require broader queries or external tools.<br>
+<strong>41.</strong> What would you check if a Service isn't routing traffic to any of its Pods? — Whether a NetworkPolicy is blocking it, whether kube-proxy rules are correct, and whether DNS (CoreDNS) is resolving the Service name at all.<br>
+<strong>42.</strong> How would DNS failures typically manifest as a symptom, per this topic's categorization? — As a "networking issue" — requests failing because CoreDNS isn't resolving service names, distinct from Service routing or NetworkPolicy problems.<br>
+<strong>43.</strong> Why might resource requests/limits be the actual root cause behind what looks like a flaky application? — Because OOMKills or CPU throttling produce symptoms indistinguishable from app bugs (crashes, slow responses) unless you specifically check requests/limits against actual usage.<br>
+<strong>44.</strong> What's the value of tagging which component emitted each Event, beyond just reading the message text? — It tells you which part of the stack (scheduler, kubelet, controller) to investigate further, rather than guessing based on the symptom alone.<br>
+<strong>45.</strong> Why is this methodology described as a skill built up across "this whole course" rather than a standalone checklist? — Because correctly interpreting each Event requires genuinely understanding what scheduler, kubelet, kube-proxy, CNI, and CSI each do — knowledge built by every prior topic.<br>
+<strong>46.</strong> What's the danger of skipping the node-conditions check entirely for a recurring, seemingly random Pod failure? — You could miss that multiple unrelated Pods are all being evicted due to the same underlying node-wide DiskPressure or MemoryPressure condition.<br>
+<strong>47.</strong> Why is <code>--sort-by=.lastTimestamp</code> useful on <code>kubectl get events</code>? — It orders the cluster-wide event stream chronologically, making it easier to spot which event happened right before the failure.<br>
+<strong>48.</strong> What's the first thing to check when a Pod is stuck Pending with no obvious resource issue? — Taint/toleration and node-affinity mismatches, which are the other main scheduling-failure cause besides insufficient resources.<br>
+<strong>49.</strong> Why is "reproduce systematically" listed as a best practice rather than just "fix it and move on"? — A one-off manual fix without a repeatable trigger can't confirm the root cause was actually identified, and the same failure class will likely recur.<br>
+<strong>50.</strong> When Pod-level, node-level, and current metrics all look fine but users still report an issue, what's the next step per this topic? — Pivot to Loki/Tempo for historical and cross-service correlation — the issue may be intermittent, downstream, or only visible in trace-level detail.
+</div></details>
+
+<footer class="course-footer">Next: Topic 60 — Kubernetes Internals, going deeper into the watch/informer machinery this troubleshooting flow relies on.</footer>
+
+<script>
+  mermaid.initialize({ startOnLoad: true, theme: 'dark' });
+</script>
+
+</body>
+</html>
